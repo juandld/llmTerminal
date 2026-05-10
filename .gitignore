@@ -1,2 +1,8 @@
 .DS_Store
 
+
+# llmTerminal additions
+node_modules/
+*.bak
+*.bak-*
+web/uploads/
