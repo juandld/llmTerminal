@@ -1,0 +1,10 @@
+# Python bytecode cache (sync-config.py + add-project.py)
+__pycache__/
+*.pyc
+
+# Editor / OS noise
+.DS_Store
+*.swp
+
+# Runtime / state (not source)
+*.bak*
