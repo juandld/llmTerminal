@@ -1,0 +1,51 @@
+{
+  "$schema": "Single source of truth for llmTerminal browser projects. Edit and run scripts/sync-config.py to regenerate systemd / nginx / claude.json / noVNC / server.js.",
+  "projects": [
+    {
+      "slug": "camohero",
+      "name": "camoHero",
+      "project_path": "/home/claude-user/projects/camoHero",
+      "display": 99,
+      "vnc_port": 5900,
+      "novnc_port": 6080,
+      "cdp_port": 9222,
+      "color": "#2ECC71"
+    },
+    {
+      "slug": "crankhero",
+      "name": "crankHero",
+      "project_path": "/home/claude-user/projects/crankHero",
+      "display": 100,
+      "vnc_port": 5901,
+      "novnc_port": 6081,
+      "cdp_port": 9223,
+      "color": "#E74C3C"
+    },
+    {
+      "slug": "narrativehero",
+      "name": "narrativeHero",
+      "project_path": "/home/claude-user/projects/narrativeHero",
+      "display": 101,
+      "vnc_port": 5902,
+      "novnc_port": 6082,
+      "cdp_port": 9224,
+      "color": "#3498DB"
+    },
+    {
+      "slug": "llmterminal",
+      "name": "llmTerminal",
+      "project_path": "/home/claude-user/projects/llmTerminal",
+      "display": 102,
+      "vnc_port": 5903,
+      "novnc_port": 6083,
+      "cdp_port": 9225,
+      "color": "#F1C40F"
+    }
+  ],
+  "reserved_colors": {
+    "datahero": "#9B59B6",
+    "oshero": "#F39C12",
+    "langhero": "#1ABC9C",
+    "mediahero": "#E91E63"
+  }
+}

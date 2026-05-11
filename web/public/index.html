@@ -82,19 +82,76 @@
   .main{flex:1;display:flex;flex-direction:column;min-width:0}
   .topbar{display:flex;align-items:center;gap:10px;padding:8px 14px;border-bottom:1px solid var(--border);background:var(--surface);flex-shrink:0}
   .menu-btn{background:none;border:none;color:var(--dim);cursor:pointer;font-size:18px;display:none}
-  @media (max-width:768px){.menu-btn{display:inline-flex}}
+  @media (max-width:768px){.menu-btn{display:inline-flex;align-items:center;justify-content:center}}
   .btn-icon{font-size:15px;line-height:1;margin-right:0}
   .btn-label{margin-left:6px}
   .files-btn .btn-icon,.files-btn .btn-label{display:inline-block}
   .files-btn .badge-count{margin-left:4px}
   @media (max-width:768px){.btn-label{display:none}.btn-icon{margin-right:0}}
-  .badge{background:var(--border);padding:2px 10px;border-radius:10px;font-size:11px;color:var(--accent)}
-  .dot-status{margin-left:auto;display:flex;align-items:center;gap:5px;font-size:11px;color:var(--dim)}
-  .dot-status .dot{width:6px;height:6px;border-radius:50%;background:var(--dim)}
-  .dot-status.active .dot{background:var(--green)}
+  .badge{background:var(--border);padding:2px 10px;border-radius:10px;font-size:11px;color:var(--accent);white-space:nowrap}
+  .dot-status{margin-left:auto;display:flex;align-items:center;gap:6px;font-size:11px;color:var(--dim);padding:3px 10px;border-radius:20px;border:1px solid transparent;transition:all .3s;flex-shrink:0}
+  .dot-status .dot{width:8px;height:8px;border-radius:50%;background:var(--dim);flex-shrink:0;transition:all .3s}
+  .dot-status.active{color:var(--green);border-color:rgba(78,204,163,.2)}
+  .dot-status.active .dot{background:var(--green);box-shadow:0 0 6px var(--green)}
+  .dot-status.thinking{color:var(--yellow);border-color:rgba(255,211,105,.25);background:rgba(255,211,105,.06)}
+  .dot-status.thinking .dot{background:var(--yellow);box-shadow:0 0 8px var(--yellow);animation:pulse 1s infinite}
+  .dot-status.error{color:var(--accent2);border-color:rgba(233,69,96,.25)}
+  .dot-status.error .dot{background:var(--accent2);box-shadow:0 0 6px var(--accent2)}
   .queue-count{font-size:11px;color:var(--yellow);margin-left:auto;margin-right:8px}
-  .dot-status.thinking .dot{background:var(--yellow);animation:pulse 1s infinite}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+  @media(max-width:768px){
+    .topbar{gap:6px;padding:4px 12px 4px 4px;min-height:48px;align-items:center}
+    .menu-btn{width:40px;height:40px;min-width:40px;font-size:20px;display:grid;place-items:center;-webkit-tap-highlight-color:transparent;flex-shrink:0}
+    .badge{padding:0 8px;font-size:12px;height:40px;display:inline-flex;align-items:center;border-radius:0;background:none;color:var(--accent);font-weight:600;flex-shrink:0}
+    .dot-status{margin-left:auto;padding:0;font-size:0;border:none;width:14px;height:14px;min-height:0;border-radius:50%;display:block;flex-shrink:0;margin-right:6px}
+    .dot-status .dot{width:14px;height:14px;box-shadow:none}
+    .dot-status #dsText{display:none}
+  }
+
+  /* Browser button */
+  .browser-btn{background:var(--surface2);color:var(--dim);border:1px solid var(--border);padding:4px 10px;border-radius:8px;font-size:13px;cursor:pointer;font-family:var(--mono);display:inline-flex;align-items:center;gap:4px;text-decoration:none;transition:all .2s}
+  .browser-btn:hover{color:var(--accent);border-color:var(--accent)}
+  .browser-btn.live{color:var(--green);border-color:var(--green)}
+  .browser-btn.live .browser-dot{background:var(--green);animation:pulse 2s infinite}
+  .browser-btn .browser-dot{width:6px;height:6px;border-radius:50%;background:var(--dim);flex-shrink:0}
+  .browser-btn .browser-url{max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px}
+  .browser-btn.off{display:none}
+  @media (max-width:768px){.browser-btn.live{height:auto;width:auto;min-height:40px;padding:4px 12px;display:inline-flex;align-items:center;gap:5px;border-radius:20px;border:1px solid var(--green);background:rgba(78,204,163,.1);font-size:13px;position:relative;flex-shrink:1;min-width:0;max-width:50vw}.browser-btn.live .browser-url{display:inline;max-width:80px;font-size:11px;color:var(--green)}.browser-btn .browser-dot{position:static;width:6px;height:6px}}
+
+  /* Overflow menu for mobile */
+  /* Browser button activity: navigating=yellow-pulse, active=green, idle=blue, dormant=grey */
+  .browser-btn.navigating .browser-dot { background: #f1c40f; box-shadow: 0 0 8px #f1c40f; animation: pulse 1s ease-in-out infinite; }
+  .browser-btn.active .browser-dot     { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .browser-btn.idle .browser-dot       { background: #3498DB; box-shadow: 0 0 5px rgba(52,152,219,.6); }
+  .browser-btn.dormant .browser-dot    { background: #666; box-shadow: none; }
+  .browser-btn.off .browser-dot        { background: transparent; border: 1px dashed #444; box-shadow: none; }
+  .topbar-overflow-menu .om-dot.navigating { background: #f1c40f; box-shadow: 0 0 6px #f1c40f; animation: pulse 1s ease-in-out infinite; }
+  .topbar-overflow-menu .om-dot.active     { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .topbar-overflow-menu .om-dot.idle       { background: #3498DB; box-shadow: 0 0 5px rgba(52,152,219,.6); }
+  .topbar-overflow-menu .om-dot.dormant    { background: #666; }
+  .topbar-overflow-btn.nav-navigating .overflow-dot { background: #f1c40f; box-shadow: 0 0 6px #f1c40f; animation: pulse 1s ease-in-out infinite; }
+  .topbar-overflow-btn.nav-active .overflow-dot     { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .topbar-overflow-btn.nav-idle .overflow-dot       { background: #3498DB; box-shadow: 0 0 5px rgba(52,152,219,.6); }
+  .topbar-overflow-btn.nav-dormant .overflow-dot    { background: #666; box-shadow: none; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+  .topbar-overflow{position:relative;display:none}
+  .topbar-overflow-btn{background:var(--surface2);color:var(--dim);border:1px solid var(--border);padding:0;border-radius:10px;font-size:16px;cursor:pointer;font-family:var(--mono);height:36px;width:36px;display:grid;place-items:center;position:relative}
+  @media(max-width:768px){.topbar-overflow-btn{height:40px;width:40px;border-radius:10px;font-size:16px}}
+  .topbar-overflow-btn:hover{color:var(--accent);border-color:var(--accent)}
+  .topbar-overflow-btn .overflow-dot{position:absolute;top:5px;right:5px;width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 6px var(--green);display:none}
+  .topbar-overflow-btn.has-browser .overflow-dot{display:block}
+  .topbar-overflow-menu{position:absolute;top:100%;right:0;margin-top:6px;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:6px;min-width:200px;box-shadow:0 8px 24px rgba(0,0,0,.5);z-index:20;display:none;flex-direction:column;gap:2px}
+  .topbar-overflow-menu.open{display:flex}
+  .topbar-overflow-menu button,.topbar-overflow-menu a{background:transparent;border:none;color:var(--text);padding:10px 14px;text-align:left;font-family:var(--mono);font-size:13px;cursor:pointer;border-radius:6px;display:flex;align-items:center;gap:8px;text-decoration:none;min-height:44px;width:100%;box-sizing:border-box}
+  .topbar-overflow-menu button:hover,.topbar-overflow-menu button:active,.topbar-overflow-menu a:hover,.topbar-overflow-menu a:active{background:var(--border)}
+  .topbar-overflow-menu .om-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+  .topbar-overflow-menu .om-dot.live{background:var(--green);box-shadow:0 0 6px var(--green)}
+  .topbar-overflow-menu .om-url{margin-left:auto;font-size:10px;color:var(--dim);max-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  @media (max-width:768px){
+    .topbar-overflow{display:inline-flex}
+    .topbar-collapsible{display:none!important}
+  }
 
   .chat{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:14px;-webkit-overflow-scrolling:touch;overscroll-behavior:contain}
   .msg{max-width:92%;line-height:1.6;font-size:13px;word-break:break-word}
@@ -285,6 +342,7 @@
   .model-sel.dirty{color:var(--accent);border-color:var(--accent)}
   @media (max-width:768px){.model-sel{min-height:44px;padding:6px 10px;font-size:12px}}
   .app-btn{text-decoration:none;background:var(--surface2);border:1px solid var(--border);padding:4px 10px;border-radius:8px;font-size:11px;color:var(--dim)}
+  @media(max-width:768px){.model-sel,.app-btn{display:none!important}}
   .files-btn .badge-count{position:absolute;top:-4px;right:-4px;background:var(--accent);color:#000;font-size:9px;font-weight:700;padding:1px 5px;border-radius:8px;min-width:14px;text-align:center}
 
   @media(max-width:768px){
@@ -325,13 +383,8 @@
     .bubble pre{font-size:12px;padding:8px}
     .bubble code{font-size:12px}
 
-    /* Topbar: space out menu and app buttons for fat fingers */
-    .topbar{padding:6px 10px;gap:6px}
-    .menu-btn{min-width:44px;min-height:44px;font-size:22px;display:grid;place-items:center;-webkit-tap-highlight-color:transparent}
-    .app-btn{min-height:44px;display:inline-flex;align-items:center;padding:6px 14px;font-size:12px}
+    /* Topbar: handled in consolidated mobile block above */
     .files-btn{min-height:44px;padding:6px 12px;font-size:12px}
-    .badge{padding:3px 10px;font-size:12px}
-    .dot-status{font-size:12px}
 
     /* Input bar: bigger for thumbs + safe area */
     .input-bar{padding:8px 10px;padding-bottom:calc(8px + env(safe-area-inset-bottom, 0px));gap:6px}
@@ -425,6 +478,7 @@
   .msg.email-draft .draft-btn.force.sent{background:#4caf50;color:#000;border-color:#4caf50}
   .msg.email-draft .draft-btn.force.failed{border-color:#c0392b;color:#ff7d6e}
   .msg.email-draft .draft-btn.primary:hover,.msg.email-draft .draft-btn.primary:active{opacity:.85}
+
 </style>
 </head>
 <body>
@@ -460,15 +514,27 @@
     <button class="menu-btn" onclick="toggleSB()" title="Sessions">&#9776;</button>
     <span class="badge" id="badge">-</span>
     <a href="/" class="app-btn">App</a>
-    <button class="files-btn" id="filesBtn" onclick="toggleDrawer()"><span class="btn-icon">◳</span><span class="btn-label">Files</span><span class="badge-count" id="filesBadge" style="display:none">0</span></button>
+    <a class="browser-btn off" id="browserBtn" title="No browser active" target="_blank" rel="noopener noreferrer" onclick="return handleBrowserClick(event)"><span class="browser-dot"></span><span class="btn-icon">🌐</span><span class="browser-url" id="browserUrl"></span></a>
+    <button class="files-btn topbar-collapsible" id="filesBtn" onclick="toggleDrawer()"><span class="btn-icon">◳</span><span class="btn-label">Files</span><span class="badge-count" id="filesBadge" style="display:none">0</span></button>
     <select id="modelSel" class="model-sel" title="Claude model for this session">
       <option value="">Default</option>
       <option value="opus">Opus 4.7</option>
       <option value="sonnet">Sonnet 4.6</option>
       <option value="haiku">Haiku 4.5</option>
     </select>
-    <button class="topbar-btn" id="searchBtn" title="Search (Cmd+F)" onclick="toggleChatSearch()"><span class="btn-icon">⌕</span><span class="btn-label">Search</span></button>
-    <button class="topbar-btn" id="summaryBtn" title="Session summary" onclick="toggleSummary()"><span class="btn-icon">Σ</span><span class="btn-label">Summary</span></button>
+    <button class="topbar-btn topbar-collapsible" id="searchBtn" title="Search (Cmd+F)" onclick="toggleChatSearch()"><span class="btn-icon">⌕</span><span class="btn-label">Search</span></button>
+    <button class="topbar-btn topbar-collapsible" id="summaryBtn" title="Session summary" onclick="toggleSummary()"><span class="btn-icon">Σ</span><span class="btn-label">Summary</span></button>
+    <div class="topbar-overflow" id="topbarOverflow">
+      <button class="topbar-overflow-btn" id="overflowBtn" onclick="toggleOverflowMenu()" title="More options"><span class="overflow-dot"></span>⋮</button>
+      <div class="topbar-overflow-menu" id="overflowMenu">
+        <a id="omBrowserBtn" target="_blank" rel="noopener" style="display:none" onclick="closeOverflowMenu()"><span class="om-dot" id="omBrowserDot"></span><span>🌐 Browser</span><span class="om-url" id="omBrowserUrl"></span></a>
+        <button onclick="toggleDrawer();closeOverflowMenu()">◳ Files<span class="badge-count" id="filesBadgeMobile" style="display:none;margin-left:auto;background:var(--accent);color:#000;font-size:9px;padding:1px 5px;border-radius:8px">0</span></button>
+        <button onclick="toggleChatSearch();closeOverflowMenu()">⌕ Search</button>
+        <button onclick="toggleSummary();closeOverflowMenu()">Σ Summary</button>
+        <a href="/" onclick="closeOverflowMenu()" style="color:var(--dim)">↗ App</a>
+        <div style="padding:6px 14px;display:flex;align-items:center;gap:8px;min-height:44px"><span style="color:var(--dim);font-size:13px">Model</span><select id="omModelSel" style="flex:1;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:8px 10px;font-family:var(--mono);font-size:13px;outline:none;min-height:36px"><option value="">Default</option><option value="opus">Opus 4.7</option><option value="sonnet">Sonnet 4.6</option><option value="haiku">Haiku 4.5</option></select></div>
+      </div>
+    </div>
     <div class="dot-status" id="ds"><div class="dot"></div><span id="dsText">ready</span></div>
   </div>
   <div style="flex:1;display:flex;overflow:hidden">
@@ -595,6 +661,18 @@ if (modelSel) {
     if (ws && ws.readyState === 1) {
       ws.send(JSON.stringify({ type: "set_model", model: m }));
     }
+    // Sync mobile model selector
+    const omSel = document.getElementById("omModelSel");
+    if (omSel) omSel.value = m;
+  });
+}
+// Mobile overflow model selector — sync back to desktop
+const omModelSel = document.getElementById("omModelSel");
+if (omModelSel) {
+  try { omModelSel.value = localStorage.getItem("llmt_default_model") || ""; } catch {}
+  omModelSel.addEventListener("change", () => {
+    const m = omModelSel.value || "";
+    if (modelSel) { modelSel.value = m; modelSel.dispatchEvent(new Event("change")); }
   });
 }
 
@@ -988,6 +1066,7 @@ function connect(project,sessionId){
         location.hash = session.id;
         loadSessions();
         refreshPreviews(false);
+        startBrowserPoll();
         break;
       case "history":
         // Diff-based rendering: only append messages newer than what's already on screen
@@ -1120,7 +1199,12 @@ case "session":
       case "permissions_state":
         grantedPerms=new Set(msg.permissions||[]);
         break;
-      case "done":
+      case "interrupted":
+        setBusy(false);
+        removeThinking();
+        addSystemNote("Stopped.");
+        break;
+            case "done":
         removeThinking();
         if(msg.result && !document.querySelector(".msg.assistant:last-child")){
           addAssistant(msg.result, {live:true});
@@ -1508,6 +1592,7 @@ async function refreshPreviews(showNewInline){
     const badge=document.getElementById("filesBadge");
     if(sessionPreviews.length>0){badge.textContent=sessionPreviews.length;badge.style.display="";}
     else{badge.style.display="none";}
+    syncMobileFilesBadge();
     // Show new previews inline in chat
     if(showNewInline){
       for(const p of sessionPreviews){
@@ -1925,6 +2010,15 @@ function fmt(text){
   return h;
 }
 
+function addSystemNote(text){
+  const d=document.createElement('div');
+  d.className='msg system-note';
+  d.textContent=text;
+  d.style.cssText='align-self:center;font-size:11px;color:var(--dim);font-style:italic;padding:4px 12px;opacity:.7';
+  chat.appendChild(d);
+  scrollToBottomIfSticky && scrollToBottomIfSticky();
+}
+
 function setBusy(b){
   busy=b;sendBtn.disabled=b||!isSynced;sendBtn.style.display=b?"none":"";stopBtn.style.display=b?"":"none";
   if(!b){
@@ -1944,6 +2038,106 @@ function setBusy(b){
   }
 }
 function setStatus(t,s){dsText.textContent=t;ds.className="dot-status "+s}
+
+// ── Browser status polling ──
+let _browserUrl = null;
+let _browserPollTimer = null;
+const browserBtn = document.getElementById("browserBtn");
+const browserUrlEl = document.getElementById("browserUrl");
+
+async function pollBrowserStatus(){
+  if(!session || !session.project) return;
+  try {
+    const r = await fetch(apiUrl("/api/browser-status?project="+encodeURIComponent(session.project)));
+    const d = await r.json();
+    const omBtn = document.getElementById("omBrowserBtn");
+    const omDot = document.getElementById("omBrowserDot");
+    const omUrl = document.getElementById("omBrowserUrl");
+    const overflowBtn = document.getElementById("overflowBtn");
+    if(d.running && d.url){
+      _browserUrl = d.url;
+      const vncUrl = "/vnc/" + session.project.toLowerCase() + "/";
+      const act = d.activity || 'idle';  // navigating|active|idle|dormant
+      const idleSec = d.idleSec || 0;
+      const ago = idleSec < 60 ? idleSec + 's' : idleSec < 3600 ? Math.round(idleSec/60) + 'm' : Math.round(idleSec/3600) + 'h';
+
+      // Desktop button
+      browserBtn.href = vncUrl;
+      browserBtn.classList.remove("off", "live", "navigating", "active", "idle", "dormant");
+      browserBtn.classList.add(act);
+      browserBtn.title = (d.title || d.url) + ' — ' + act + ' (last change ' + ago + ' ago)';
+      try { browserUrlEl.textContent = new URL(d.url).hostname; } catch { browserUrlEl.textContent = ""; }
+
+      // Mobile overflow browser item
+      if(omBtn){ omBtn.href = vncUrl; omBtn.style.display = ""; }
+      if(omDot) { omDot.classList.remove("live","navigating","active","idle","dormant"); omDot.classList.add(act); }
+      if(omUrl){ try { omUrl.textContent = new URL(d.url).hostname; } catch { omUrl.textContent = ""; } }
+      if(overflowBtn) {
+        overflowBtn.classList.add("has-browser");
+        overflowBtn.classList.remove("nav-navigating","nav-active","nav-idle","nav-dormant");
+        overflowBtn.classList.add("nav-" + act);
+      }
+    } else {
+      _setBrowserOff(omBtn, omDot, omUrl, overflowBtn);
+    }
+  } catch {
+    const omBtn = document.getElementById("omBrowserBtn");
+    const omDot = document.getElementById("omBrowserDot");
+    const omUrl = document.getElementById("omBrowserUrl");
+    const overflowBtn = document.getElementById("overflowBtn");
+    _setBrowserOff(omBtn, omDot, omUrl, overflowBtn);
+  }
+}
+function _setBrowserOff(omBtn, omDot, omUrl, overflowBtn){
+  _browserUrl = null;
+  browserBtn.removeAttribute("href");
+  browserBtn.classList.add("off");
+  browserBtn.classList.remove("live");
+  browserBtn.title = "No browser active";
+  browserUrlEl.textContent = "";
+  if(omBtn){ omBtn.removeAttribute("href"); omBtn.style.display = "none"; }
+  if(omDot) omDot.classList.remove("live");
+  if(omUrl) omUrl.textContent = "";
+  if(overflowBtn) overflowBtn.classList.remove("has-browser");
+}
+function handleBrowserClick(e){
+  if(!_browserUrl){ e.preventDefault(); return false; }
+  return true;
+}
+function startBrowserPoll(){
+  stopBrowserPoll();
+  pollBrowserStatus();
+  _browserPollTimer = setInterval(pollBrowserStatus, 8000);
+}
+function stopBrowserPoll(){
+  if(_browserPollTimer){ clearInterval(_browserPollTimer); _browserPollTimer=null; }
+}
+
+// ── Overflow menu ──
+function toggleOverflowMenu(){
+  const menu = document.getElementById("overflowMenu");
+  menu.classList.toggle("open");
+  if(menu.classList.contains("open")){
+    setTimeout(()=>{
+      const closer = (e)=>{ if(!e.target.closest("#topbarOverflow")) closeOverflowMenu(); };
+      document.addEventListener("click", closer, {once:true});
+      document.addEventListener("touchstart", closer, {once:true, passive:true});
+    }, 50);
+  }
+}
+function closeOverflowMenu(){
+  document.getElementById("overflowMenu").classList.remove("open");
+}
+// Sync mobile files badge with desktop badge
+function syncMobileFilesBadge(){
+  const desktop = document.getElementById("filesBadge");
+  const mobile = document.getElementById("filesBadgeMobile");
+  if(desktop && mobile){
+    mobile.style.display = desktop.style.display;
+    mobile.textContent = desktop.textContent;
+  }
+}
+
 function toggleSB(){
   const sb=document.getElementById("sidebar");
   sb.classList.toggle("show");
