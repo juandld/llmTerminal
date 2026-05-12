@@ -580,7 +580,7 @@ function connect(project,sessionId){
   badge.textContent=project;
 
   ws.onopen=()=>{
-    setStatus("syncing...","thinking");inp.focus();
+    setStatus("syncing...","thinking");
     lastServerMsgTs=Date.now();
     isSynced=false;
     // Outbox will be flushed when `ready` arrives
@@ -948,10 +948,8 @@ function addVoiceNoteUser(blob,duration){
   const row=mk("div","vn-row");
   row.appendChild(playBtn);row.appendChild(wave);row.appendChild(dur);
   vn.appendChild(row);
-  // Transcript area (loading initially)
-  const transcript=mk("div","vn-transcript vn-loading");
-  transcript.textContent="Transcribing…";
-  vn.appendChild(transcript);
+  // Note: no visible transcript in chat (user request).
+  // The transcript is still produced server-side and sent as the prompt to Claude.
   d.appendChild(vn);
   chat.appendChild(d);scrollToBottomForce();
   return d;
@@ -1073,7 +1071,7 @@ function addQuestion(text){
   }
   chat.appendChild(d);
   scrollToBottomForce();
-  inp.focus();
+  if(window.innerWidth>768)inp.focus();
   inp.setAttribute("placeholder","Answer the question above...");
 }
 
@@ -1611,7 +1609,7 @@ function addSystemNote(text){
 function setBusy(b){
   busy=b;sendBtn.disabled=b||!isSynced;sendBtn.style.display=b?"none":"";stopBtn.style.display=b?"":"none";
   if(!b){
-    inp.focus();
+    if(window.innerWidth>768)inp.focus();
     // Drain queue
     if(messageQueue.length>0){
       const next=messageQueue.shift();
@@ -1987,21 +1985,57 @@ function stopVoiceRecording(){
   }
   endVoiceUI();
 }
+let voiceMeterCtx=null, voiceMeterAnalyser=null, voiceMeterRAF=null;
 function startVoiceUI(){
   const btn=document.getElementById("micBtn");
   if(btn){btn.classList.add("recording");btn.textContent="⏹";}
-  // Show recording timer overlay
   let timer=document.getElementById("voiceTimer");
   if(!timer){
     timer=mk("div","voice-timer");timer.id="voiceTimer";
+    const info=mk("div","voice-info");
     const dot=mk("span","voice-dot");
     const time=mk("span","voice-time");time.id="voiceTime";time.textContent="0:00";
-    const cancel=mk("button","voice-cancel");cancel.textContent="✕";
+    // Live waveform: 20 vertical bars animated from AudioContext analyser
+    const wave=mk("div","voice-wave");wave.id="voiceWave";
+    for(let i=0;i<20;i++){const b=mk("div","voice-wave-bar");wave.appendChild(b);}
+    info.appendChild(dot);info.appendChild(time);info.appendChild(wave);
+    const actions=mk("div","voice-actions");
+    const cancel=mk("button","voice-cancel");cancel.textContent="✕ Cancel";
     cancel.onclick=(e)=>{e.stopPropagation();cancelVoiceRecording();};
-    timer.appendChild(dot);timer.appendChild(time);timer.appendChild(cancel);
-    document.querySelector(".input-bar").appendChild(timer);
+    const send=mk("button","voice-send");send.textContent="Send ▶";
+    send.onclick=(e)=>{e.stopPropagation();stopVoiceRecording();};
+    actions.appendChild(cancel);actions.appendChild(send);
+    timer.appendChild(info);timer.appendChild(actions);
+    document.body.appendChild(timer);
   }
   timer.style.display="flex";
+  // Request fullscreen to dismiss browser chrome (Arc, Safari, etc.)
+  try{if(document.documentElement.requestFullscreen)document.documentElement.requestFullscreen().catch(()=>{});}catch{}
+
+  // Start drawing the live waveform from the active audio stream
+  try{
+    if(voiceRec && voiceRec.stream){
+      voiceMeterCtx = new (window.AudioContext||window.webkitAudioContext)();
+      const src = voiceMeterCtx.createMediaStreamSource(voiceRec.stream);
+      voiceMeterAnalyser = voiceMeterCtx.createAnalyser();
+      voiceMeterAnalyser.fftSize = 64;
+      src.connect(voiceMeterAnalyser);
+      const data = new Uint8Array(voiceMeterAnalyser.frequencyBinCount);
+      const bars = document.querySelectorAll("#voiceWave .voice-wave-bar");
+      function draw(){
+        voiceMeterAnalyser.getByteFrequencyData(data);
+        for(let i=0;i<bars.length;i++){
+          // map data[i] (0-255) to bar height 4-22px
+          const v = data[i] || 0;
+          const h = Math.max(3, Math.floor((v/255)*22));
+          bars[i].style.height = h+"px";
+        }
+        voiceMeterRAF = requestAnimationFrame(draw);
+      }
+      draw();
+    }
+  }catch(e){ console.warn("voice meter init failed:", e.message); }
+
   voiceTimerInterval=setInterval(()=>{
     const el=document.getElementById("voiceTime");
     if(!el)return;
@@ -2016,6 +2050,10 @@ function endVoiceUI(){
   const timer=document.getElementById("voiceTimer");
   if(timer)timer.style.display="none";
   if(voiceTimerInterval){clearInterval(voiceTimerInterval);voiceTimerInterval=null;}
+  if(voiceMeterRAF){cancelAnimationFrame(voiceMeterRAF);voiceMeterRAF=null;}
+  if(voiceMeterCtx){try{voiceMeterCtx.close();}catch{}; voiceMeterCtx=null; voiceMeterAnalyser=null;}
+  // Exit fullscreen if we entered it for recording
+  try{if(document.fullscreenElement)document.exitFullscreen().catch(()=>{});}catch{}
 }
 function cancelVoiceRecording(){
   if(voiceRec&&voiceRec.state==="recording"){
@@ -2036,14 +2074,9 @@ async function sendVoiceNote(blob){
     const r=await fetch("./voice-note",{method:"POST",headers:{"Content-Type":blob.type||"audio/webm"},body:blob});
     if(!r.ok) throw new Error("upload failed: "+r.status);
     const data=await r.json();
-    // Update the voice note bubble with transcript
-    const transcriptEl=msgEl.querySelector(".vn-transcript");
-    if(transcriptEl&&data.transcript){
-      transcriptEl.textContent=data.transcript;
-      transcriptEl.classList.remove("vn-loading");
-    } else if(transcriptEl&&data.error){
-      transcriptEl.textContent="⚠ "+data.error;
-      transcriptEl.classList.add("vn-error");
+    // Transcript no longer rendered in the chat; only used as the prompt below.
+    if(data.error){
+      console.error("[voice-note] transcribe error:", data.error);
     }
     // Update audio src to server URL (for persistence across reloads)
     const audioEl=msgEl.querySelector("audio");
@@ -2067,8 +2100,8 @@ async function sendVoiceNote(blob){
     }
   }catch(err){
     console.error("voice note upload failed:",err);
-    const transcriptEl=msgEl.querySelector(".vn-transcript");
-    if(transcriptEl){transcriptEl.textContent="⚠ Upload failed";transcriptEl.classList.add("vn-error");}
+    console.error("[voice-note] upload failed");
+    // (no transcript element to update — keep chat clean; failure is logged to console)
   }
 }
 

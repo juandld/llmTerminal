@@ -11,6 +11,45 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
 
 app.use(express.json());
+
+// Force revalidation of JS/CSS so mobile browsers don't serve stale code
+app.use((req, res, next) => {
+  if (/\.(js|css|html)$/.test(req.path)) {
+    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+  }
+  next();
+});
+
+
+// Rewrite index.html on the fly to add ?v=<mtime> cache-busters on script/link tags.
+// This makes every file change a new URL, defeating mobile browser disk cache.
+function rewriteCacheBust(html, publicDir) {
+  return html.replace(
+    /(<(?:script|link)[^>]*?(?:src|href)=")([^"?]+\.(?:js|css))(")/g,
+    (m, pre, file, post) => {
+      try {
+        const fs2 = require("fs");
+        const st = fs2.statSync(path.join(publicDir, file));
+        return pre + file + "?v=" + Math.floor(st.mtimeMs) + post;
+      } catch { return m; }
+    }
+  );
+}
+app.get("/", (req, res) => {
+  const pubDir = path.join(__dirname, "public");
+  const idx = path.join(pubDir, "index.html");
+  try {
+    const html = fs.readFileSync(idx, "utf8");
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    res.send(rewriteCacheBust(html, pubDir));
+  } catch (e) {
+    res.status(500).send("index error: " + e.message);
+  }
+});
+
 app.use(express.static(path.join(__dirname, "public")));
 
 const PROJECTS_DIR = "/home/claude-user/projects";
