@@ -95,6 +95,19 @@ function saveMessage(sessionId, msg) {
     arr.push(msg);
     fs.writeFileSync(p, JSON.stringify(arr));
   } catch (e) { console.error("[saveMessage] JSON mirror failed:", e.message); }
+
+  // Track last message role on the session so the sidebar can color-code "whose turn"
+  try {
+    const sessions = loadSessions();
+    const s = sessions.find(x => x.id === sessionId);
+    if (s && msg.role && msg.role !== s.lastMessageRole) {
+      s.lastMessageRole = msg.role;
+      if (msg.role === "email_sent") s.manualDone = Date.now();
+      // If user posts a NEW message (role=user), clear manualDone — chat became active again
+      if (msg.role === "user") delete s.manualDone;
+      saveSessions(sessions);
+    }
+  } catch {}
 }
 function deleteMessages(sessionId) {
   if (db) {
@@ -197,6 +210,41 @@ app.delete("/api/sessions/:id", (req, res) => {
   res.json({ ok: true });
 });
 
+
+app.post("/api/sessions/bulk-archive-done", express.json(), (req, res) => {
+  const olderThanDays = Number(req.body?.olderThanDays || 7);
+  const cutoff = Date.now() - olderThanDays * 86400 * 1000;
+  const sessions = loadSessions();
+  let n = 0;
+  for (const s of sessions) {
+    if (s.archived) continue;
+    if (!s.manualDone && s.lastMessageRole !== "email_sent") continue;
+    const ts = s.manualDone || s.lastActive || 0;
+    if (ts > cutoff) continue;
+    s.archived = true;
+    n++;
+  }
+  if (n > 0) saveSessions(sessions);
+  res.json({ ok: true, archived: n });
+});
+
+app.post("/api/sessions/:id/state", express.json(), (req, res) => {
+  const id = req.params.id;
+  const manualDone = !!req.body?.manualDone;
+  const sessions = loadSessions();
+  const s = sessions.find(x => x.id === id);
+  if (!s) return res.status(404).json({ ok: false, error: "not found" });
+  if (manualDone) {
+    s.manualDone = Date.now();
+  } else {
+    delete s.manualDone;
+  }
+  saveSessions(sessions);
+  res.json({ ok: true, manualDone: s.manualDone || null });
+});
+
+
+
 // ---- TTS proxy to OpenAI with disk cache ----
 const TTS_CACHE_DIR = path.join(DATA_DIR, "tts-cache");
 fs.mkdirSync(TTS_CACHE_DIR, { recursive: true });
@@ -242,6 +290,62 @@ app.post("/tts", async (req, res) => {
     res.status(500).json({ error: String(err && err.message || err) });
   }
 });
+
+// ---- Voice note upload + Whisper transcription ----
+const VOICE_DIR = path.join(DATA_DIR, "voice-notes");
+fs.mkdirSync(VOICE_DIR, { recursive: true });
+
+app.post("/voice-note", express.raw({ type: ["audio/*", "application/octet-stream"], limit: "25mb" }), async (req, res) => {
+  try {
+    if (!req.body || req.body.length === 0) return res.status(400).json({ error: "no audio data" });
+    const ext = (req.headers["content-type"] || "").includes("webm") ? ".webm"
+              : (req.headers["content-type"] || "").includes("mp4") ? ".m4a"
+              : (req.headers["content-type"] || "").includes("ogg") ? ".ogg" : ".webm";
+    const name = "vn_" + Date.now() + "_" + crypto.randomBytes(4).toString("hex") + ext;
+    const filePath = path.join(VOICE_DIR, name);
+    fs.writeFileSync(filePath, req.body);
+    console.log(`[voice-note] saved ${req.body.length}B -> ${name}`);
+
+    // Transcribe with OpenAI Whisper
+    const key = process.env.OPENAI_API_KEY;
+    if (!key) {
+      console.error("[voice-note] OPENAI_API_KEY not set");
+      return res.json({ audioUrl: "/voice-notes/" + name, transcript: null, error: "OPENAI_API_KEY not set" });
+    }
+    const t0 = Date.now();
+    const boundary = "----VNBoundary" + crypto.randomBytes(8).toString("hex");
+    const fileContent = fs.readFileSync(filePath);
+    const parts = [
+      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${name}"\r\nContent-Type: audio/${ext.slice(1)}\r\n\r\n`,
+      fileContent,
+      `\r\n--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\nwhisper-1`,
+      `\r\n--${boundary}--\r\n`
+    ];
+    const body = Buffer.concat(parts.map(p => typeof p === "string" ? Buffer.from(p) : p));
+    const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+      method: "POST",
+      headers: {
+        "Authorization": "Bearer " + key,
+        "Content-Type": "multipart/form-data; boundary=" + boundary,
+      },
+      body
+    });
+    if (!r.ok) {
+      const errText = await r.text();
+      console.error("[voice-note] whisper error", r.status, errText.slice(0, 500));
+      return res.json({ audioUrl: "/voice-notes/" + name, transcript: null, error: "transcription failed" });
+    }
+    const result = await r.json();
+    console.log(`[voice-note] transcribed in ${Date.now()-t0}ms: "${(result.text || "").slice(0, 80)}..."`);
+    res.json({ audioUrl: "/voice-notes/" + name, transcript: result.text || "" });
+  } catch (err) {
+    console.error("[voice-note] error:", err);
+    res.status(500).json({ error: String(err && err.message || err) });
+  }
+});
+
+// Serve voice note audio files
+app.use("/voice-notes", express.static(VOICE_DIR));
 
 // ---- Per-session granted permissions (persisted to disk) ----
 const PERMISSIONS_DIR = path.join(DATA_DIR, "permissions");

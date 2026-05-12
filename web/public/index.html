@@ -39,6 +39,7 @@
     <button class="menu-btn" onclick="toggleSB()" title="Sessions">&#9776;</button>
     <span class="badge" id="badge">-</span>
     <a href="/" class="app-btn">App</a>
+    <button class="attention-btn hidden" id="attentionBtn" onclick="nextAttentionSession()" title="Next chat needing attention"><span class="att-icon">🔔</span><span class="att-count">0</span></button>
     <a class="browser-btn off" id="browserBtn" title="No browser active" target="_blank" rel="noopener noreferrer" onclick="return handleBrowserClick(event)"><span class="browser-dot"></span><span class="btn-icon">🌐</span><span class="browser-url" id="browserUrl"></span></a>
     <button class="files-btn topbar-collapsible" id="filesBtn" onclick="toggleDrawer()"><span class="btn-icon">◳</span><span class="btn-label">Files</span><span class="badge-count" id="filesBadge" style="display:none">0</span></button>
     <select id="modelSel" class="model-sel" title="Claude model for this session">

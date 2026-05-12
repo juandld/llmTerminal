@@ -203,56 +203,98 @@ function recencyBucket(ts) {
 }
 const BUCKET_ORDER = ["Today", "Yesterday", "This week", "This month", "Older"];
 const RECENT_BUCKETS = new Set(["Today", "Yesterday", "This week"]);
+function showSessionInfo_state(_x){} // marker
 function showSessionInfo(x, anchorEl) {
-  document.querySelectorAll(".sb-info-popup").forEach(p => p.remove());
-  const pop = mk("div", "sb-info-popup");
-  const title = mk("div", "pop-title"); title.textContent = x.title || "(no title)";
-  pop.appendChild(title);
-  const rows = [
-    ["Project", x.project || "?"],
-    ["Messages", String(x.messageCount || 0)],
-    ["Created", x.created ? new Date(x.created).toLocaleString() : "?"],
-    ["Last active", x.lastActive ? new Date(x.lastActive).toLocaleString() : "?"],
-    ["Status", x.archived ? "Archived (>30d inactive)" : "Active"],
-    ["Session ID", (x.id || "").slice(0, 8) + "\u2026"],
-  ];
-  rows.forEach(([k, v]) => {
-    const row = mk("div", "pop-row");
-    const ek = mk("span", ""); ek.textContent = k;
-    const ev = mk("b", ""); ev.textContent = v;
-    row.appendChild(ek); row.appendChild(ev);
-    pop.appendChild(row);
-  });
-  const close = mk("button", "pop-close"); close.textContent = "Close";
-  close.onclick = () => pop.remove();
-  pop.appendChild(close);
-  document.body.appendChild(pop);
-  if (anchorEl) {
-    const r = anchorEl.getBoundingClientRect();
-    let left = r.right + 12;
-    let top = r.top;
-    if (left + 360 > window.innerWidth) {
-      left = Math.max(12, (window.innerWidth - pop.offsetWidth) / 2);
-      top = r.bottom + 8;
-    }
-    if (top + pop.offsetHeight > window.innerHeight) top = Math.max(12, window.innerHeight - pop.offsetHeight - 12);
-    pop.style.left = left + "px";
-    pop.style.top = top + "px";
-  } else {
-    pop.style.left = "50%"; pop.style.top = "20%";
-    pop.style.transform = "translateX(-50%)";
+  // Native confirm + action menu — simple for mobile
+  const state = computeSessionState(x);
+  const isDone = state === "done";
+  const action = confirm(
+    (x.title || "(untitled)") + "\n\n" +
+    "Project: " + (x.project || "?") + "\n" +
+    "Messages: " + (x.messageCount || 0) + "\n" +
+    "State: " + (state || "?") + "\n\n" +
+    (isDone
+      ? "Tap OK to mark this chat ACTIVE again (cancel to leave as DONE)."
+      : "Tap OK to mark this chat DONE (cancel to leave it active).")
+  );
+  if (action) {
+    fetch(apiUrl("/api/sessions/" + x.id + "/state"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ manualDone: !isDone }),
+    }).then(() => loadSessions()).catch(()=>{});
   }
-  setTimeout(() => {
-    document.addEventListener("click", function close1(e) {
-      if (!pop.contains(e.target)) { pop.remove(); document.removeEventListener("click", close1); }
-    });
-  }, 0);
 }
+
+// Compute chat state from session metadata. 5 states for triage:
+//   blocked   — agent waiting on user (question / permission_denied) — RED, urgent
+//   decision  — action item (email_draft) — YELLOW, your turn
+//   responded — agent answered, no action needed — GREEN, read at leisure
+//   working   — agent mid-task — GREY, leave alone
+//   done      — logical end (email sent / manually marked / 24h+ idle responded) — MUTED, archive-ready
+function computeSessionState(s) {
+  if (!s) return "";
+  if (s.manualDone) return "done";
+  const role = s.lastMessageRole || "";
+  const ageMin = (Date.now() - (s.lastActive || 0)) / 60000;
+  if (role === "email_sent") return "done";
+  if (role === "question" || role === "permission_denied") return "blocked";
+  if (role === "email_draft") return "decision";
+  if (role === "user" || role === "tool_activity" || role === "tool_result" || role === "permission_granted") return "working";
+  if (role === "assistant") return ageMin > 24*60 ? "done" : "responded";
+  return "";
+}
+const STATE_ICONS = {
+  blocked:   "❗",       // ❗
+  decision:  "⚡",       // ⚡
+  responded: "✓",       // ✓
+  working:   "⏳",       // ⏳
+  done:      "✅",       // ✅
+};
+const STATE_PRIORITY = { blocked: 0, decision: 1, responded: 2, working: 3, done: 4 };
+
+
+// Round-robin through sessions that need attention. Tap = jump to next.
+function attentionSessionsList() {
+  return (_allSessions || [])
+    .filter(s => !s.archived)
+    .map(s => ({ s, st: computeSessionState(s) }))
+    .filter(({st}) => st === "blocked" || st === "decision")
+    .sort((a, b) => {
+      if (STATE_PRIORITY[a.st] !== STATE_PRIORITY[b.st]) return STATE_PRIORITY[a.st] - STATE_PRIORITY[b.st];
+      return (b.s.lastActive || 0) - (a.s.lastActive || 0);
+    })
+    .map(({s}) => s);
+}
+function nextAttentionSession() {
+  const list = attentionSessionsList();
+  if (!list.length) return;
+  const curIdx = list.findIndex(s => s.id === (session && session.id));
+  const next = list[(curIdx + 1) % list.length];
+  if (next) resumeSession(next);
+}
+function refreshAttentionCounter() {
+  const btn = document.getElementById("attentionBtn");
+  if (!btn) return;
+  const n = attentionSessionsList().length;
+  btn.querySelector(".att-count").textContent = String(n);
+  btn.classList.toggle("hidden", n === 0);
+}
+
 function makeSbItem(x, currentProject) {
   const d = document.createElement("div");
-  d.className = "sb-item" + (session?.id === x.id ? " active" : "") + (x.archived ? " sb-archived" : "");
+  // 5-state triage class
+  const state = computeSessionState(x);
+  const stateClass = state ? "state-" + state : "";
+  d.className = "sb-item " + stateClass + (session?.id === x.id ? " active" : "") + (x.archived ? " sb-archived" : "");
+  d.dataset.state = state;
   const ti = mk("div", "ti");
   const row1 = mk("div", "row1");
+  if (state && STATE_ICONS[state]) {
+    const ic = mk("span", "sb-ic sb-ic-" + state);
+    ic.textContent = STATE_ICONS[state];
+    row1.appendChild(ic);
+  }
   const ttl = mk("div", "ttl"); ttl.textContent = x.title || "(untitled)";
   row1.appendChild(ttl);
   ti.appendChild(row1);
@@ -352,20 +394,48 @@ function _renderSidebar() {
     sbList.appendChild(empty);
     return;
   }
+
+  // Partition by state into three groups
+  const attentionItems = [];  // blocked, decision — top section
+  const progressItems  = [];  // responded, working — per-project groups
+  const doneItems      = [];  // done — collapsed at bottom
+  active.forEach(s => {
+    const st = computeSessionState(s);
+    if (st === "blocked" || st === "decision") attentionItems.push(s);
+    else if (st === "done") doneItems.push(s);
+    else progressItems.push(s);
+  });
+
+  // ─── Section 1: NEEDS YOU (flat, state-priority sorted) ───
+  if (attentionItems.length) {
+    attentionItems.sort((a, b) => {
+      const sa = computeSessionState(a), sb = computeSessionState(b);
+      if (STATE_PRIORITY[sa] !== STATE_PRIORITY[sb]) return STATE_PRIORITY[sa] - STATE_PRIORITY[sb];
+      return (b.lastActive || 0) - (a.lastActive || 0);
+    });
+    const h = mk("div", "sb-section-header sb-needs-you");
+    h.textContent = "\u{1F6A8} NEEDS YOU (" + attentionItems.length + ")";
+    sbList.appendChild(h);
+    attentionItems.forEach(x => sbList.appendChild(makeSbItem(x, "ALL")));
+  }
+
+  // ─── Section 2: in-progress chats grouped by project ───
   const byProj = {};
-  active.forEach(x => { (byProj[x.project] = byProj[x.project] || []).push(x); });
-  // Include every available project — even ones with zero sessions — so the
-  // user can tap a project header to set it as active for "+ New in X".
-  // When searching, only show projects that have at least one matching session.
+  progressItems.forEach(x => { (byProj[x.project] = byProj[x.project] || []).push(x); });
   const seedKeys = q ? Object.keys(byProj) : Array.from(new Set([..._availableProjects, ...Object.keys(byProj)]));
   const projOrder = seedKeys.sort((a, b) => {
     const aMax = Math.max(...((byProj[a] || []).map(x => x.lastActive || 0)), 0);
     const bMax = Math.max(...((byProj[b] || []).map(x => x.lastActive || 0)), 0);
     if (aMax !== bMax) return bMax - aMax;
-    return a.localeCompare(b);  // empty groups: alphabetical fallback
+    return a.localeCompare(b);
   });
   const forceExpand = !!q;
   projOrder.forEach(pname => renderProjectGroup(pname, byProj[pname] || [], sbList, forceExpand));
+
+  // ─── Section 3: DONE (collapsed by default, with summary + bulk archive) ───
+  if (doneItems.length) renderDoneSection(doneItems);
+
+  // ─── Section 4: archived (existing behavior preserved) ───
   if (archived.length) {
     const toggle = mk("div", "sb-archive-toggle");
     toggle.textContent = (_showArchived ? "\u25BC Hide" : "\u25B6 Show") + " archived (" + archived.length + ")";
@@ -379,7 +449,66 @@ function _renderSidebar() {
       sbList.appendChild(wrap);
     }
   }
+
+  refreshAttentionCounter();
 }
+
+let _doneExpanded = false;
+try { _doneExpanded = localStorage.getItem("llmt_done_expanded") === "1"; } catch {}
+
+function renderDoneSection(items) {
+  items.sort((a, b) => (b.lastActive || 0) - (a.lastActive || 0));
+  const now = Date.now();
+  const DAY = 86400000;
+  const today = items.filter(x => now - (x.lastActive || 0) < DAY).length;
+  const older = items.length - today;
+  const archivable = items.filter(x => now - (x.manualDone || x.lastActive || 0) > 7 * DAY).length;
+
+  const wrap = mk("div", "sb-done-section");
+  const header = mk("div", "sb-section-header sb-done-header" + (_doneExpanded ? " open" : ""));
+  const chevron = mk("span", "sb-done-toggle");
+  chevron.textContent = _doneExpanded ? "\u25BC" : "\u25B6";
+  const label = mk("span", "sb-done-label");
+  const summary = "\u2705 Done (" + items.length
+    + (today ? " · " + today + " today" : "")
+    + (older ? " · " + older + " older" : "")
+    + ")";
+  label.textContent = summary;
+  header.appendChild(chevron);
+  header.appendChild(label);
+
+  if (archivable) {
+    const archBtn = mk("button", "sb-done-archive-btn");
+    archBtn.textContent = "Archive " + archivable + " (>7d)";
+    archBtn.onclick = (e) => {
+      e.stopPropagation();
+      if (!confirm("Archive " + archivable + " done chats older than 7 days?")) return;
+      fetch(apiUrl("/api/sessions/bulk-archive-done"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ olderThanDays: 7 }),
+      }).then(r => r.json()).then(() => loadSessions()).catch(()=>{});
+    };
+    header.appendChild(archBtn);
+  }
+
+  wrap.appendChild(header);
+  const list = mk("div", "sb-done-list");
+  if (!_doneExpanded) list.style.display = "none";
+  items.forEach(x => list.appendChild(makeSbItem(x, "ALL")));
+  wrap.appendChild(list);
+
+  header.onclick = (e) => {
+    if (e.target.classList.contains("sb-done-archive-btn")) return;
+    _doneExpanded = !_doneExpanded;
+    try { localStorage.setItem("llmt_done_expanded", _doneExpanded ? "1" : "0"); } catch {}
+    list.style.display = _doneExpanded ? "" : "none";
+    chevron.textContent = _doneExpanded ? "\u25BC" : "\u25B6";
+    header.classList.toggle("open", _doneExpanded);
+  };
+  sbList.appendChild(wrap);
+}
+
 
 function newSession(project){
   // Always show picker if no project given so the user picks explicitly
@@ -788,6 +917,44 @@ function addUser(text,imagePreviews){
     imagePreviews.forEach(src=>{const img=document.createElement("img");img.src=src;d.appendChild(img)});
   }
   chat.appendChild(d);scrollToBottomForce();
+}
+function addVoiceNoteUser(blob,duration){
+  const d=mk("div","msg user voice-note-msg");
+  const vn=mk("div","vn-bubble");
+  // Audio player
+  const audio=document.createElement("audio");
+  audio.src=URL.createObjectURL(blob);
+  audio.preload="metadata";
+  // Custom play button + waveform bar + duration
+  const playBtn=mk("button","vn-play");playBtn.textContent="▶";
+  playBtn.onclick=()=>{
+    if(audio.paused){audio.play();playBtn.textContent="⏸";}
+    else{audio.pause();playBtn.textContent="▶";}
+  };
+  audio.onended=()=>{playBtn.textContent="▶";};
+  audio.onpause=()=>{playBtn.textContent="▶";};
+  audio.onplay=()=>{playBtn.textContent="⏸";};
+  const wave=mk("div","vn-wave");
+  // Simple visual bars
+  for(let i=0;i<20;i++){const bar=mk("div","vn-bar");bar.style.height=Math.max(4,Math.random()*16)+"px";wave.appendChild(bar);}
+  const dur=mk("span","vn-duration");
+  dur.textContent=Math.floor(duration/60)+":"+(duration%60<10?"0":"")+(duration%60);
+  // Progress on wave
+  audio.ontimeupdate=()=>{
+    if(!audio.duration)return;
+    const pct=audio.currentTime/audio.duration*100;
+    wave.style.background=`linear-gradient(90deg,var(--accent) ${pct}%,var(--surface2) ${pct}%)`;
+  };
+  const row=mk("div","vn-row");
+  row.appendChild(playBtn);row.appendChild(wave);row.appendChild(dur);
+  vn.appendChild(row);
+  // Transcript area (loading initially)
+  const transcript=mk("div","vn-transcript vn-loading");
+  transcript.textContent="Transcribing…";
+  vn.appendChild(transcript);
+  d.appendChild(vn);
+  chat.appendChild(d);scrollToBottomForce();
+  return d;
 }
 function addAssistant(text, opts){
   const d=mk("div","msg assistant");
@@ -1426,8 +1593,8 @@ function fmt(text){
   });
   h=h.replace(/`([^`]+)`/g,'<code>$1</code>');
   h=h.replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>');
-  h=h.replace(/\[([^\]]+)\]\(([^)]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
-  h=h.replace(/(^|[^"=])(https?:\/\/[^\s<]+)/g,'$1<a href="$2" target="_blank" rel="noopener">$2</a>');
+  h=h.replace(/\[([^\]]+)\]\(([^)]+)\)/g,'<span class="link-island"><a href="$2" target="_blank" rel="noopener">$1</a></span>');
+  h=h.replace(/(^|[^"=])(https?:\/\/[^\s<]+)/g,'$1<span class="link-island"><a href="$2" target="_blank" rel="noopener">$2</a></span>');
   h=h.replace(/\n/g,'<br>');
   return h;
 }
@@ -1780,50 +1947,129 @@ function notifyDone(resultText){
   }catch{}
 }
 
-// Voice input via browser SpeechRecognition
-let voiceRec=null, voiceActive=false;
+// Voice note recording via MediaRecorder (Telegram-style)
+let voiceRec=null, voiceActive=false, voiceChunks=[], voiceStartTime=0, voiceTimerInterval=null;
 function toggleVoiceInput(){
-  const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
-  if(!SR){alert("Voice input not supported in this browser. Try Chrome, Edge, or Safari.");return}
-  if(voiceActive){
-    try{voiceRec&&voiceRec.stop()}catch{}
-    return;
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){
+    alert("Voice recording not supported in this browser.");return;
   }
-  voiceRec=new SR();
-  voiceRec.continuous=true;
-  voiceRec.interimResults=true;
-  voiceRec.lang=navigator.language||"en-US";
-  const startValue=inp.value;
-  let finalTranscript="";
-  voiceRec.onresult=(e)=>{
-    let interim="";
-    for(let i=e.resultIndex;i<e.results.length;i++){
-      const t=e.results[i][0].transcript;
-      if(e.results[i].isFinal)finalTranscript+=t;
-      else interim+=t;
-    }
-    inp.value=(startValue?startValue+" ":"")+finalTranscript+interim;
-    inp.style.height="44px";inp.style.height=Math.min(inp.scrollHeight,140)+"px";
-  };
-  voiceRec.onend=()=>{
-    voiceActive=false;
-    const btn=document.getElementById("micBtn");
-    if(btn)btn.classList.remove("recording");
-  };
-  voiceRec.onerror=(e)=>{
-    voiceActive=false;
-    const btn=document.getElementById("micBtn");
-    if(btn)btn.classList.remove("recording");
-    if(e.error==="not-allowed"||e.error==="service-not-allowed"){
-      alert("Microphone access denied. Allow it in your browser settings.");
-    }
-  };
-  try{
-    voiceRec.start();
+  if(voiceActive){ stopVoiceRecording(); return; }
+  navigator.mediaDevices.getUserMedia({audio:true}).then(stream=>{
+    const mimeType=MediaRecorder.isTypeSupported("audio/webm;codecs=opus")?"audio/webm;codecs=opus"
+      :MediaRecorder.isTypeSupported("audio/mp4")?"audio/mp4":"";
+    voiceRec=new MediaRecorder(stream, mimeType?{mimeType}:{});
+    voiceChunks=[];
+    voiceRec.ondataavailable=(e)=>{ if(e.data.size>0) voiceChunks.push(e.data); };
+    voiceRec.onstop=()=>{
+      stream.getTracks().forEach(t=>t.stop());
+      const blob=new Blob(voiceChunks,{type:voiceRec.mimeType||"audio/webm"});
+      voiceChunks=[];
+      if(blob.size<1000){ console.log("voice note too short, discarding"); return; }
+      sendVoiceNote(blob);
+    };
+    voiceRec.onerror=(e)=>{
+      console.error("MediaRecorder error:",e);
+      stream.getTracks().forEach(t=>t.stop());
+      endVoiceUI();
+    };
+    voiceRec.start(250); // collect in 250ms chunks
     voiceActive=true;
-    const btn=document.getElementById("micBtn");
-    if(btn)btn.classList.add("recording");
-  }catch(e){console.error("voice rec failed:",e)}
+    voiceStartTime=Date.now();
+    startVoiceUI();
+  }).catch(err=>{
+    console.error("mic access denied:",err);
+    if(err.name==="NotAllowedError") alert("Microphone access denied. Allow it in your browser settings.");
+  });
+}
+function stopVoiceRecording(){
+  if(voiceRec&&voiceRec.state==="recording"){
+    try{voiceRec.stop()}catch{}
+  }
+  endVoiceUI();
+}
+function startVoiceUI(){
+  const btn=document.getElementById("micBtn");
+  if(btn){btn.classList.add("recording");btn.textContent="⏹";}
+  // Show recording timer overlay
+  let timer=document.getElementById("voiceTimer");
+  if(!timer){
+    timer=mk("div","voice-timer");timer.id="voiceTimer";
+    const dot=mk("span","voice-dot");
+    const time=mk("span","voice-time");time.id="voiceTime";time.textContent="0:00";
+    const cancel=mk("button","voice-cancel");cancel.textContent="✕";
+    cancel.onclick=(e)=>{e.stopPropagation();cancelVoiceRecording();};
+    timer.appendChild(dot);timer.appendChild(time);timer.appendChild(cancel);
+    document.querySelector(".input-bar").appendChild(timer);
+  }
+  timer.style.display="flex";
+  voiceTimerInterval=setInterval(()=>{
+    const el=document.getElementById("voiceTime");
+    if(!el)return;
+    const s=Math.floor((Date.now()-voiceStartTime)/1000);
+    el.textContent=Math.floor(s/60)+":"+(s%60<10?"0":"")+(s%60);
+  },500);
+}
+function endVoiceUI(){
+  voiceActive=false;
+  const btn=document.getElementById("micBtn");
+  if(btn){btn.classList.remove("recording");btn.textContent="♫";}
+  const timer=document.getElementById("voiceTimer");
+  if(timer)timer.style.display="none";
+  if(voiceTimerInterval){clearInterval(voiceTimerInterval);voiceTimerInterval=null;}
+}
+function cancelVoiceRecording(){
+  if(voiceRec&&voiceRec.state==="recording"){
+    voiceRec.ondataavailable=null; // discard data
+    voiceRec.onstop=()=>{
+      voiceRec.stream&&voiceRec.stream.getTracks().forEach(t=>t.stop());
+    };
+    try{voiceRec.stop()}catch{}
+  }
+  endVoiceUI();
+}
+async function sendVoiceNote(blob){
+  const duration=Math.floor((Date.now()-voiceStartTime)/1000);
+  // Show voice note in chat immediately
+  const msgEl=addVoiceNoteUser(blob,duration);
+  // Upload + transcribe
+  try{
+    const r=await fetch("./voice-note",{method:"POST",headers:{"Content-Type":blob.type||"audio/webm"},body:blob});
+    if(!r.ok) throw new Error("upload failed: "+r.status);
+    const data=await r.json();
+    // Update the voice note bubble with transcript
+    const transcriptEl=msgEl.querySelector(".vn-transcript");
+    if(transcriptEl&&data.transcript){
+      transcriptEl.textContent=data.transcript;
+      transcriptEl.classList.remove("vn-loading");
+    } else if(transcriptEl&&data.error){
+      transcriptEl.textContent="⚠ "+data.error;
+      transcriptEl.classList.add("vn-error");
+    }
+    // Update audio src to server URL (for persistence across reloads)
+    const audioEl=msgEl.querySelector("audio");
+    if(audioEl&&data.audioUrl) audioEl.src=data.audioUrl;
+    // Send transcript as prompt to Claude
+    if(data.transcript){
+      requestNotifPermission();
+      const prompt=data.transcript;
+      if(busy){
+        // Queue it like a regular message when busy
+        messageQueue.push({text:prompt,images:[],previews:[]});
+        renderQueueCount();
+      } else {
+        const clientId=genMsgId();
+        outbox.push({id:clientId,text:prompt,images:[],ts:Date.now()});saveOutbox();
+        if(ws&&ws.readyState===1){
+          ws.send(JSON.stringify({type:"prompt",client_id:clientId,text:prompt,images:[]}));
+          setBusy(true);
+        }
+      }
+    }
+  }catch(err){
+    console.error("voice note upload failed:",err);
+    const transcriptEl=msgEl.querySelector(".vn-transcript");
+    if(transcriptEl){transcriptEl.textContent="⚠ Upload failed";transcriptEl.classList.add("vn-error");}
+  }
 }
 
 // Visual viewport: keep chat scrolled to bottom when keyboard opens
