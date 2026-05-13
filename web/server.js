@@ -139,10 +139,17 @@ function saveMessage(sessionId, msg) {
   try {
     const sessions = loadSessions();
     const s = sessions.find(x => x.id === sessionId);
-    if (s && msg.role && msg.role !== s.lastMessageRole) {
+    if (s && msg.role) {
       s.lastMessageRole = msg.role;
+      s.lastActive = Date.now();
+      // Short activity snippet for sidebar preview
+      const text = (msg.text || "").replace(/\s+/g, " ").trim();
+      if (msg.role === "assistant" && text) s.lastSnippet = text.slice(0, 80);
+      else if (msg.role === "user" && text) s.lastSnippet = "You: " + text.slice(0, 60);
+      else if (msg.role === "tool_use") s.lastSnippet = "Running: " + (msg.tool_name || "tool");
+      else if (msg.role === "question") s.lastSnippet = "Question waiting";
+      else if (msg.role === "permission_denied") s.lastSnippet = "Permission needed";
       if (msg.role === "email_sent") s.manualDone = Date.now();
-      // If user posts a NEW message (role=user), clear manualDone — chat became active again
       if (msg.role === "user") delete s.manualDone;
       saveSessions(sessions);
     }
@@ -332,14 +339,126 @@ app.post("/tts", async (req, res) => {
 
 // ---- Voice note upload + Whisper transcription ----
 const VOICE_DIR = path.join(DATA_DIR, "voice-notes");
+const QUEUE_DIR = path.join(DATA_DIR, "queue");
+fs.mkdirSync(QUEUE_DIR, { recursive: true });
+
+function queueFile(sessionId) {
+  return path.join(QUEUE_DIR, sessionId + ".jsonl");
+}
+function queueAppend(sessionId, item) {
+  // item = { text, ts, source }  (source = 'voice-note' | 'prompt' | etc.)
+  if (!item.ts) item.ts = Date.now();
+  try {
+    fs.appendFileSync(queueFile(sessionId), JSON.stringify(item) + "\n");
+    console.log("[queue] +1 for", sessionId, "(" + item.source + ")", item.text.slice(0, 60));
+    return true;
+  } catch (e) {
+    console.error("[queue] append failed:", e.message);
+    return false;
+  }
+}
+function queueLoad(sessionId) {
+  try {
+    const raw = fs.readFileSync(queueFile(sessionId), "utf8").trim();
+    if (!raw) return [];
+    return raw.split("\n").filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  } catch { return []; }
+}
+function queueSaveAll(sessionId, items) {
+  try {
+    if (!items.length) {
+      try { fs.unlinkSync(queueFile(sessionId)); } catch {}
+      return;
+    }
+    fs.writeFileSync(queueFile(sessionId), items.map(JSON.stringify).join("\n") + "\n");
+  } catch (e) { console.error("[queue] save failed:", e.message); }
+}
+function queuePopNext(sessionId) {
+  const items = queueLoad(sessionId);
+  if (!items.length) return null;
+  const next = items.shift();
+  queueSaveAll(sessionId, items);
+  console.log("[queue] -1 for", sessionId, "(", items.length, "remaining):", next.text.slice(0, 60));
+  return next;
+}
+
 fs.mkdirSync(VOICE_DIR, { recursive: true });
+
+// Classify voice note transcript and auto-create orchestrator task if it's a new idea/direction
+async function classifyAndCapture(transcript, title, sessionId, audioUrl) {
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) return;
+  const r = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: { "Authorization": "Bearer " + key, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      max_tokens: 200,
+      messages: [
+        { role: "system", content: `You classify voice note transcripts. Decide if this is:
+1. "reply" — a response to an ongoing conversation, a direct instruction to the current chat, a status update, OR meta-commentary about the chat itself
+2. "idea" — a NEW concept, feature idea, architectural direction, bug report, or something that should be tracked as an independent task
+
+IMPORTANT — these are ALWAYS "reply", never "idea":
+- Requests to continue, complete, or clarify a previous response ("finish explaining", "complete the response", "clarify if...")
+- Confirmations or follow-ups to something already discussed ("yes do that", "confirm X is included")
+- References to what the AI just said or did ("the truncated response", "what you described")
+- Meta-conversation about the chat session itself
+- Vague fragments without a clear actionable outcome
+
+Only classify as "idea" when the transcript describes something NEW to build, fix, change, or investigate — independent of the current conversation. When in doubt, classify as "reply".
+
+If "idea", also extract:
+- title: 5-10 word task title (must describe a concrete action, not a conversation continuation)
+- description: 1-2 sentence summary of what needs to happen
+- project: which project this relates to (narrativehero, crankhero, datahero, llmterminal, mediahero, oshero, or unknown)
+- priority: low, normal, high, or urgent
+
+Respond as JSON: {"type":"reply"} or {"type":"idea","title":"...","description":"...","project":"...","priority":"..."}` },
+        { role: "user", content: transcript.slice(0, 2000) }
+      ]
+    })
+  });
+  if (!r.ok) return;
+  const data = await r.json();
+  const content = (data.choices?.[0]?.message?.content || "").trim();
+  let parsed;
+  try { parsed = JSON.parse(content); } catch { return; }
+  if (parsed.type !== "idea") return;
+
+  // Create task in orchestrator
+  console.log(`[auto-capture] new idea detected: "${parsed.title}" (project: ${parsed.project})`);
+  try {
+    const orchRes = await fetch(ORCH_BASE + "/queue/create", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        title: parsed.title || title,
+        description: (parsed.description || "") + "\n\n[Auto-captured from voice note" + (sessionId ? " in session " + sessionId : "") + "]\nAudio: " + audioUrl + "\n\nOriginal transcript:\n" + transcript.slice(0, 3000),
+        project_id: parsed.project || "unknown",
+        priority: parsed.priority || "normal",
+        owner: "operator"
+      })
+    });
+    if (orchRes.ok) {
+      const task = await orchRes.json();
+      console.log(`[auto-capture] created task ${task.task_id || "?"}: "${parsed.title}"`);
+    } else {
+      console.warn("[auto-capture] orchestrator rejected:", orchRes.status);
+    }
+  } catch (e) {
+    console.warn("[auto-capture] orchestrator unreachable:", e.message);
+  }
+}
 
 app.post("/voice-note", express.raw({ type: ["audio/*", "application/octet-stream"], limit: "25mb" }), async (req, res) => {
   try {
     if (!req.body || req.body.length === 0) return res.status(400).json({ error: "no audio data" });
-    const ext = (req.headers["content-type"] || "").includes("webm") ? ".webm"
-              : (req.headers["content-type"] || "").includes("mp4") ? ".m4a"
-              : (req.headers["content-type"] || "").includes("ogg") ? ".ogg" : ".webm";
+    const ct = (req.headers["content-type"] || "").toLowerCase();
+    const ext = ct.includes("webm") ? ".webm"
+              : ct.includes("mp4") || ct.includes("m4a") || ct.includes("aac") || ct.includes("x-m4a") ? ".m4a"
+              : ct.includes("ogg") ? ".ogg"
+              : ct.includes("wav") ? ".wav" : ".m4a"; // default m4a — Safari/iOS most common
     const name = "vn_" + Date.now() + "_" + crypto.randomBytes(4).toString("hex") + ext;
     const filePath = path.join(VOICE_DIR, name);
     fs.writeFileSync(filePath, req.body);
@@ -355,7 +474,7 @@ app.post("/voice-note", express.raw({ type: ["audio/*", "application/octet-strea
     const boundary = "----VNBoundary" + crypto.randomBytes(8).toString("hex");
     const fileContent = fs.readFileSync(filePath);
     const parts = [
-      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${name}"\r\nContent-Type: audio/${ext.slice(1)}\r\n\r\n`,
+      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${name}"\r\nContent-Type: ${ext === ".m4a" ? "audio/mp4" : "audio/" + ext.slice(1)}\r\n\r\n`,
       fileContent,
       `\r\n--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\nwhisper-1`,
       `\r\n--${boundary}--\r\n`
@@ -376,7 +495,47 @@ app.post("/voice-note", express.raw({ type: ["audio/*", "application/octet-strea
     }
     const result = await r.json();
     console.log(`[voice-note] transcribed in ${Date.now()-t0}ms: "${(result.text || "").slice(0, 80)}..."`);
-    res.json({ audioUrl: "/voice-notes/" + name, transcript: result.text || "" });
+    // If sessionId provided, write the transcript directly to that session's persistent queue.
+    // This guarantees the prompt is recorded server-side even if the client crashes / refreshes
+    // before sending it.
+    const sid = (req.query && req.query.session) || "";
+    if (sid && result.text) {
+      queueAppend(sid, { text: result.text, source: "voice-note", audioUrl: "/voice-notes/" + name });
+      // Try to drain immediately if the session isn't currently running anything
+      try { tryDrainQueue(sid); } catch (e) { console.error("[queue] drain attempt failed:", e.message); }
+    }
+    // Generate a short title from the transcript
+    let title = "";
+    const transcript = result.text || "";
+    if (transcript.length > 10) {
+      try {
+        const tr = await fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: { "Authorization": "Bearer " + key, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: "gpt-4o-mini",
+            max_tokens: 30,
+            messages: [
+              { role: "system", content: "Generate a 3-7 word title summarizing this voice note. No quotes, no punctuation at the end. Just the title." },
+              { role: "user", content: transcript.slice(0, 1000) }
+            ]
+          })
+        });
+        if (tr.ok) {
+          const tj = await tr.json();
+          title = (tj.choices?.[0]?.message?.content || "").trim();
+          console.log(`[voice-note] title: "${title}"`);
+        }
+      } catch (e) { console.warn("[voice-note] title gen failed:", e.message); }
+    }
+    // Async: classify if this voice note contains a new idea/task
+    // Don't block the response — fire and forget
+    if (transcript.length > 30) {
+      classifyAndCapture(transcript, title, sid, "/voice-notes/" + name).catch(e =>
+        console.warn("[voice-note] classify failed:", e.message)
+      );
+    }
+    res.json({ audioUrl: "/voice-notes/" + name, transcript, title });
   } catch (err) {
     console.error("[voice-note] error:", err);
     res.status(500).json({ error: String(err && err.message || err) });
@@ -385,6 +544,131 @@ app.post("/voice-note", express.raw({ type: ["audio/*", "application/octet-strea
 
 // Serve voice note audio files
 app.use("/voice-notes", express.static(VOICE_DIR));
+
+// ---- Orchestrator task board proxy (narrativeHero :8000) ----
+const ORCH_BASE = "http://localhost:8000/api/orchestrator";
+
+// Drafts-only policy: send_gmail_email.py refuses to run without this token.
+// We read it once at startup and inject into the spawn env for /api/email-draft/send only.
+let LLMT_SEND_TOKEN = "";
+try {
+  LLMT_SEND_TOKEN = require("fs").readFileSync("/home/claude-user/.camohero-send/llmt-token", "utf8").trim();
+} catch (e) {
+  console.error("[email-draft] WARNING: cannot read send-auth token:", e.message);
+}
+
+// Create a new task — proxies to narrativeHero orchestrator queue/create
+app.post("/api/tasks", express.json(), async (req, res) => {
+  try {
+    const body = req.body || {};
+    if (!body.title) return res.status(400).json({ error: "title required" });
+    const r = await fetch(ORCH_BASE + "/queue/create", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) return res.status(r.status).json({ error: "orchestrator create failed", status: r.status });
+    const data = await r.json();
+    res.json(data);
+  } catch (err) {
+    res.status(502).json({ error: "orchestrator unreachable", detail: String(err.message || err) });
+  }
+});
+
+app.get("/api/tasks", async (req, res) => {
+  try {
+    const qs = new URLSearchParams();
+    if (req.query.status) qs.set("status", req.query.status);
+    if (req.query.project_id) qs.set("project_id", req.query.project_id);
+    qs.set("limit", req.query.limit || "100");
+    const r = await fetch(ORCH_BASE + "/queue/items?" + qs);
+    if (!r.ok) return res.status(r.status).json({ error: "orchestrator error" });
+    res.json(await r.json());
+  } catch (err) {
+    res.status(502).json({ error: "orchestrator unreachable", detail: String(err.message || err) });
+  }
+});
+
+app.get("/api/tasks/summary", async (_req, res) => {
+  try {
+    const r = await fetch(ORCH_BASE + "/queue/summary");
+    if (!r.ok) return res.status(r.status).json({ error: "orchestrator error" });
+    res.json(await r.json());
+  } catch (err) {
+    res.status(502).json({ error: "orchestrator unreachable", detail: String(err.message || err) });
+  }
+});
+
+app.post("/api/tasks/:id/transition", express.json(), async (req, res) => {
+  try {
+    const r = await fetch(ORCH_BASE + "/queue/items/" + req.params.id + "/transition", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(req.body)
+    });
+    if (!r.ok) return res.status(r.status).json({ error: "transition failed" });
+    res.json(await r.json());
+  } catch (err) {
+    res.status(502).json({ error: "orchestrator unreachable", detail: String(err.message || err) });
+  }
+});
+
+// ---- Auto-retry blocked tasks every 5 minutes ----
+// Tasks with runner_exit=127 or similar transient failures get requeued automatically
+async function autoRetryBlockedTasks() {
+  try {
+    const r = await fetch(ORCH_BASE + "/queue/items?status=blocked&limit=50");
+    if (!r.ok) return;
+    const data = await r.json();
+    const retryable = (data.items || []).filter(t => {
+      const reason = (t.blocked_reason || "").toLowerCase();
+      // Auto-retry: runner failures, timeouts, transient errors
+      return reason.includes("runner_exit") || reason.includes("timeout") || reason.includes("transient");
+    });
+    for (const t of retryable) {
+      try {
+        await fetch(ORCH_BASE + "/queue/items/" + t.task_id + "/retry", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ detail: "Auto-retried by llmTerminal supervisor" })
+        });
+        console.log("[auto-retry] requeued:", t.task_id, t.title.slice(0, 40));
+      } catch {}
+    }
+    if (retryable.length) console.log("[auto-retry] requeued " + retryable.length + " blocked tasks");
+  } catch (e) {
+    console.warn("[auto-retry] failed:", e.message);
+  }
+}
+// Auto-verify email drafts by cross-referencing with sent log
+async function autoVerifyEmails() {
+  try {
+    const sessions = loadSessions();
+    const emailSessions = sessions.filter(s => !s.manualDone && s.lastMessageRole === "email_draft");
+    if (!emailSessions.length) return;
+    const sentEntries = [];
+    try {
+      const lines = fs.readFileSync(SENT_LOG_PATH, "utf8").trim().split("\n");
+      const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+      for (const line of lines) {
+        try { const e = JSON.parse(line); if (new Date(e.sent_at).getTime() > cutoff) sentEntries.push(e); } catch {}
+      }
+    } catch { return; }
+    let done = 0;
+    for (const s of emailSessions) {
+      const match = sentEntries.find(e =>
+        (e.sessionId && e.sessionId === s.id) ||
+        (s.title && e.subject && s.title.toLowerCase().includes(e.subject.toLowerCase().slice(0, 30)))
+      );
+      if (match) { s.emailOpened = match.sent_at; s.manualDone = Date.now(); done++; }
+    }
+    if (done) { saveSessions(sessions); console.log("[email-verify] " + done + " email sessions auto-marked done"); }
+  } catch (e) { console.warn("[email-verify]", e.message); }
+}
+
+// Run on startup after 30s, then every 5 minutes
+setTimeout(() => { autoRetryBlockedTasks(); autoVerifyEmails(); }, 30000);
+setInterval(() => { autoRetryBlockedTasks(); autoVerifyEmails(); }, 5 * 60 * 1000);
 
 // ---- Per-session granted permissions (persisted to disk) ----
 const PERMISSIONS_DIR = path.join(DATA_DIR, "permissions");
@@ -517,7 +801,7 @@ app.post("/api/email-draft/send", express.json(), (req, res) => {
   const proc = spawn("/usr/bin/python3", args, {
     cwd: "/home/claude-user/projects/camoHero",
     uid: 1000, gid: 1000,
-    env: { HOME: "/home/claude-user", PATH: process.env.PATH, LANG: "en_US.UTF-8" },
+    env: { HOME: "/home/claude-user", PATH: process.env.PATH, LANG: "en_US.UTF-8", LLMT_SEND_TOKEN },
     stdio: ["ignore", "pipe", "pipe"],
     detached: true,
   });
@@ -551,8 +835,9 @@ app.post("/api/email-draft/send", express.json(), (req, res) => {
 // Serves camoHero project files and upload attachments for preview/iframe rendering.
 // Path must be under an explicit allowlist — never traverses outside.
 const FILE_SERVE_ALLOWLIST = [
-  '/home/claude-user/projects/camoHero/',
+  '/home/claude-user/projects/',           // any project dir (camoHero, crankHero, llmTerminal, etc.)
   '/home/claude-user/.llm-terminal/uploads/',
+  '/home/claude-user/.llm-terminal/voice-notes/',  // serve voice notes for inline audio playback
 ];
 const FILE_SERVE_MIME = {
   '.pdf': 'application/pdf', '.html': 'text/html; charset=utf-8', '.htm': 'text/html; charset=utf-8',
@@ -620,6 +905,16 @@ app.post("/api/email-draft/log-intent", express.json(), (req, res) => {
   };
   try {
     fs.appendFileSync(SENT_LOG_PATH, JSON.stringify(entry) + "\n");
+    // Auto-mark session as done — user opened email externally
+    if (sessionId) {
+      const sessions = loadSessions();
+      const s = sessions.find(x => x.id === sessionId);
+      if (s) {
+        s.emailOpened = Date.now();
+        s.manualDone = Date.now();
+        saveSessions(sessions);
+      }
+    }
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -727,8 +1022,8 @@ function autoDetectBashFiles(stdout, sessionId) {
   const found = new Set();
   // Explicit PREVIEW: lines take priority
   for (const m of stdout.matchAll(/^PREVIEW:(.+)$/gm)) found.add(m[1].trim());
-  // Scan for absolute camoHero paths with known extensions
-  for (const m of stdout.matchAll(/\/home\/claude-user\/projects\/camoHero\/[^\s\\)\]>,.;]+/g)) {
+  // Scan for absolute paths under any project dir with known extensions
+  for (const m of stdout.matchAll(/\/home\/claude-user\/projects\/[a-zA-Z0-9_-]+\/[^\s\\)\]>,.;]+/g)) {
     const p = m[0].replace(/[\)\]>,.;]+$/, '');
     const ext = require('path').extname(p).toLowerCase();
     if (EXT_TEXT.has(ext) || EXT_BIN.has(ext)) found.add(p);
@@ -760,6 +1055,142 @@ function autoDetectBashFiles(stdout, sessionId) {
     req.on('error', e => console.error('[bash-preview] failed:', e.message));
     req.write(body); req.end();
   }
+}
+
+
+// ── End-of-run observer (Tier 2 "supervisor pattern") ──
+// After each agent run completes, fire a cheap Haiku call to read the recent
+// messages and identify anything David asked for that the agent didn't address.
+// Creates tasks with status "review" on the narrativeHero orchestrator queue.
+// Fire-and-forget, doesn't block the user's chat. Skipped if too soon since last run.
+const _observerLastRun = {};  // sessionId -> ts of last observer fire
+const OBSERVER_COOLDOWN_MS = 30000;  // don't re-observe a session within 30s
+const OBSERVER_MIN_MESSAGES = 4;     // skip if conversation is trivial
+const OBSERVER_MODEL = "haiku";
+
+function spawnObserver(sessionId, projectName) {
+  try {
+    if (!sessionId) return;
+    const now = Date.now();
+    if (_observerLastRun[sessionId] && (now - _observerLastRun[sessionId]) < OBSERVER_COOLDOWN_MS) return;
+    _observerLastRun[sessionId] = now;
+
+    // Load the most recent N messages for context
+    const all = loadMessages(sessionId);
+    if (all.length < OBSERVER_MIN_MESSAGES) return;
+    const recent = all.slice(-25);  // bound prompt size
+
+    // Build a compact conversation log
+    const lines = recent.map(m => {
+      const r = (m.role || "").toUpperCase();
+      const t = m.text || m.summary || "";
+      if (!t || r === "TOOL_ACTIVITY") return null;
+      return `${r}: ${String(t).slice(0, 600)}`;
+    }).filter(Boolean).join("\n\n");
+    if (lines.length < 50) return;
+
+    const prompt = `You are observing a chat between David (user) and an agent. Read the recent messages and identify any items David ASKED FOR that the agent did NOT clearly address or complete. Skip items the agent finished.
+
+Output JSON ONLY (no prose, no markdown fences). If everything was addressed, output {"tasks":[]}. Otherwise:
+{"tasks":[{"title":"short imperative","description":"more context, why it matters, what exact request from David","priority":"normal"}]}
+
+Rules:
+- Title: 5-12 words, imperative ("Add ...", "Fix ...", "Investigate ...")
+- Description: include David's actual wording where possible
+- Skip ideas the agent ALREADY DID
+- Skip generic suggestions — only things David specifically asked for
+- Max 3 tasks; pick the most concrete unfinished ones
+
+Recent conversation:
+${lines}`;
+
+    console.log("[observer] firing for", sessionId, "(", recent.length, "msgs )");
+    // Fire-and-forget: spawn a detached claude -p with Haiku, disabled tools, no file I/O
+    const args = [
+      "-p", prompt,
+      "--model", OBSERVER_MODEL,
+      "--output-format", "json",
+      "--dangerously-skip-permissions",
+      "--disallowedTools", "Bash", "Read", "Write", "Edit", "Glob", "Grep", "Agent", "NotebookEdit", "MultiEdit", "WebFetch", "WebSearch",
+    ];
+    const proc = spawn("/usr/bin/claude", args, {
+      env: { HOME: "/home/claude-user", PATH: process.env.PATH, LANG: "en_US.UTF-8" },
+      uid: 1000, gid: 1000,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "", err = "";
+    proc.stdout.on("data", c => out += c);
+    proc.stderr.on("data", c => err += c);
+    const timer = setTimeout(() => { try { proc.kill("SIGTERM"); } catch {} }, 45000);
+    proc.on("close", async () => {
+      clearTimeout(timer);
+      try {
+        const wrap = JSON.parse(out);
+        const text = (wrap.result || wrap.text || out).toString();
+        // Strip optional code fences
+        const json = text.replace(/^```(?:json)?\s*|\s*```$/g, "").trim();
+        const parsed = JSON.parse(json);
+        const tasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
+        if (!tasks.length) { console.log("[observer]", sessionId, "→ no unaddressed items"); return; }
+        // POST each task to our own endpoint
+        for (const t of tasks.slice(0, 3)) {
+          if (!t.title) continue;
+          try {
+            const r = await fetch("http://127.0.0.1:7683/api/tasks", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                title: String(t.title).slice(0, 140),
+                description: String(t.description || "").slice(0, 2000) + "\n\n— observed from session " + sessionId,
+                project_id: (projectName || "").toLowerCase(),
+                priority: t.priority || "normal",
+              }),
+            });
+            const data = await r.json();
+            console.log("[observer] +task:", t.title.slice(0, 60), "id=" + (data.item?.task_id || "?"));
+          } catch (e) {
+            console.error("[observer] task POST failed:", e.message);
+          }
+        }
+      } catch (e) {
+        console.warn("[observer] parse failed for", sessionId, "—", e.message, "raw:", out.slice(0, 300));
+      }
+    });
+    proc.on("error", e => console.error("[observer] spawn error:", e.message));
+  } catch (e) {
+    console.error("[observer] outer error:", e.message);
+  }
+}
+
+// Drain the next queued prompt for a session. Called when:
+//   - an active claude run finishes (in sendToSession's onDone)
+//   - a fresh voice-note transcript arrives and we want to fire it ASAP
+//   - a WS reconnects with pending items
+function tryDrainQueue(sessionId) {
+  if (!sessionId) return;
+  // Find the WS client(s) for this session
+  let target = null;
+  for (const c of wss.clients) {
+    if (c._llmSessionId === sessionId && c.readyState === 1 && typeof c._sendToSession === "function") {
+      target = c; break;
+    }
+  }
+  if (!target) return; // no live client — queue stays put, will drain on next connect
+  if (target._activeProcRef && target._activeProcRef.proc) return; // still busy, wait for onDone
+  const next = queuePopNext(sessionId);
+  if (!next) return;
+  console.log("[queue] firing for", sessionId, ":", next.text.slice(0, 60));
+  // Save the user message + render in chat (mimics what the normal prompt handler does)
+  const sessions = loadSessions();
+  const session = sessions.find(s => s.id === sessionId);
+  if (!session) { console.error("[queue] session not found:", sessionId); return; }
+  session.messageCount = (session.messageCount || 0) + 1;
+  session.lastActive = Date.now();
+  saveSessions(sessions);
+  saveMessage(sessionId, { role: "user", text: next.text, ts: next.ts || Date.now(), source: next.source });
+  try { target.send(JSON.stringify({ type: "queued_prompt_firing", text: next.text, source: next.source })); } catch {}
+  try { target.send(JSON.stringify({ type: "thinking" })); } catch {}
+  target._sendToSession(next.text, false);
 }
 
 // ---- killExistingClaudeFor ----
@@ -974,6 +1405,7 @@ wss.on("connection", (ws, req) => {
   }
 
   let activeProc = null;
+  ws._activeProcRef = { get proc() { return activeProc; } };
 
   ws._llmSessionId = session.id; // tag for watchdog push
   ensurePermissionsLoaded(session.id);
@@ -995,6 +1427,11 @@ wss.on("connection", (ws, req) => {
   ws.send(JSON.stringify({ type: "status", status: "connected" }));
   // Signal that all initial sync payloads (session, history, permissions_state, status) have been sent
   ws.send(JSON.stringify({ type: "ready" }));
+  // If anything was queued while this session was offline, fire the next one now
+  setTimeout(() => { try { tryDrainQueue(session.id); } catch {} }, 200);
+  // Tell client current queue depth so it can show "N queued"
+  const _qd = queueLoad(session.id).length;
+  if (_qd > 0) try { ws.send(JSON.stringify({ type: "queue_state", queueDepth: _qd })); } catch {}
 
   // Heartbeat: ping client every 20s
   const pingInterval = setInterval(() => {
@@ -1003,6 +1440,7 @@ wss.on("connection", (ws, req) => {
   }, 20000);
 
   // Hoisted so permission_grant can call it for auto-retry
+  ws._sendToSession = function(promptText, isRetry) { return sendToSession(promptText, isRetry); };
   function sendToSession(promptText, isRetry) {
     const cwd = path.join(PROJECTS_DIR, session.project);
     // No system prompt injection — file previews are auto-created server-side
@@ -1089,6 +1527,19 @@ wss.on("connection", (ws, req) => {
                 }
               }
             }
+            // Also scan EVERY tool_result text for project-dir file paths — catches
+            // playwright:browser_take_screenshot, Read on a generated file, etc.
+            // Even untracked tool_use ids land here.
+            if (block.type === "tool_result" && !block.is_error) {
+              try {
+                const txt = Array.isArray(block.content) ? (block.content[0]?.text || "") : String(block.content || "");
+                if (txt && /\/home\/claude-user\/projects\//.test(txt)) {
+                  autoDetectBashFiles(txt, session.id);
+                }
+              } catch {}
+              // Sentinel for the original if (don't re-process the close brace below)
+              const _scanned = true;
+            }
             // Email draft: forward structured payload to client as a special message
             if (block.type === "tool_result" && block.tool_use_id && pendingDrafts.has(block.tool_use_id)) {
               pendingDrafts.delete(block.tool_use_id);
@@ -1145,6 +1596,10 @@ wss.on("connection", (ws, req) => {
           try { ws.send(JSON.stringify({ type: "tool_result", name: data.tool_name || "", content: data.content || "" })); } catch {}
         }
         if (data.type === "result") {
+          // After clearing activeProc below, try to drain the next queued prompt
+          setTimeout(() => { try { tryDrainQueue(session.id); } catch (e) { console.error("[queue] drain after result failed:", e.message); } }, 50);
+          // Fire-and-forget observer: read recent messages, identify unaddressed asks, register as tasks
+          setTimeout(() => { try { spawnObserver(session.id, session.project); } catch (e) { console.error("[observer] hook failed:", e.message); } }, 500);
           if (!session.claudeSessionId && data.session_id) {
             session.claudeSessionId = data.session_id;
             saveSessions(loadSessions().map(s => s.id === session.id ? session : s));
@@ -1246,7 +1701,10 @@ wss.on("connection", (ws, req) => {
           }
         }
         if (activeProc) {
-          ws.send(JSON.stringify({ type: "error", message: "Still processing previous message. Use Stop first." }));
+          // Already running — write the new prompt to the persistent queue.
+          // It will auto-fire when the current run completes (see onDone).
+          queueAppend(session.id, { text: msg.text || "", source: "prompt", client_id: msg.client_id });
+          try { ws.send(JSON.stringify({ type: "queued", client_id: msg.client_id, queueDepth: queueLoad(session.id).length })); } catch {}
           return;
         }
 
@@ -1301,6 +1759,14 @@ wss.on("connection", (ws, req) => {
         saveSessions(loadSessions().map(s => s.id === session.id ? session : s));
         try { ws.send(JSON.stringify({ type: "model_set", model: session.model })); } catch {}
         console.log("[model] session", session.id, "->", session.model || "default");
+        break;
+      }
+      case "link_task": {
+        const taskId = String(msg.task_id || "").trim();
+        session.linked_task = taskId || null;
+        saveSessions(loadSessions().map(s => s.id === session.id ? session : s));
+        try { ws.send(JSON.stringify({ type: "task_linked", task_id: session.linked_task })); } catch {}
+        console.log("[task-link] session", session.id, "->", session.linked_task || "none");
         break;
       }
       case "permission_grant": {
