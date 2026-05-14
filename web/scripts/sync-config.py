@@ -124,8 +124,8 @@ ExecStart={CHROME_BIN} \\
   --no-default-browser-check \\
   --disable-features=Translate \\
   --disable-blink-features=AutomationControlled \\
-  --start-maximized \\
-  --window-size=1280,800
+  --window-position=40,40 \\
+  --window-size=1200,720
 Restart=on-failure
 RestartSec=5
 
@@ -164,6 +164,7 @@ def update_nginx(projects, dry):
     block_lines = []
     for p in projects:
         block_lines.append(f"""    location /vnc/{p['slug']}/ {{
+        if ($http_cf_access_authenticated_user_email != "david@crankwheel.com") {{ return 403; }}
         proxy_pass http://127.0.0.1:{p['novnc_port']}/;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
