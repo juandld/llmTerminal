@@ -63,7 +63,8 @@ function setInputFromHistory(text){
 }
 let thinkingEl=null;
 let pendingImages=[]; // {data: base64, mimeType: string, preview: dataUrl}
-let messageQueue=[]; // queued messages to send when Claude is idle
+let messageQueue=[]; // queued messages to send when Claude is idle (client-side fast path)
+let _serverQueueDepth=0;  // server-persistent queue depth
 
 const chat=document.getElementById("chat"), inp=document.getElementById("inp");
 const sendBtn=document.getElementById("sendBtn"), stopBtn=document.getElementById("stopBtn");
@@ -101,6 +102,30 @@ if (omModelSel) {
 let _allSessions = [];
 let _searchQuery = "";
 try { _searchQuery = localStorage.getItem("llmt_sb_search") || ""; } catch {}
+// Server-side content search: session IDs whose message bodies match _searchQuery.
+let _contentMatchIds = new Set();
+let _contentMatchQuery = "";
+let _contentSearchTimer = null;
+function _runContentSearch(q) {
+  if (_contentSearchTimer) clearTimeout(_contentSearchTimer);
+  const trimmed = (q || "").trim();
+  if (!trimmed || trimmed.length < 2) {
+    _contentMatchIds = new Set();
+    _contentMatchQuery = trimmed;
+    return;
+  }
+  _contentSearchTimer = setTimeout(async () => {
+    try {
+      const r = await fetch(apiUrl("/api/search?q=" + encodeURIComponent(trimmed)));
+      const data = await r.json();
+      // Drop stale responses if user kept typing.
+      if (trimmed !== (_searchQuery || "").trim()) return;
+      _contentMatchIds = new Set(data.sessionIds || []);
+      _contentMatchQuery = trimmed;
+      _renderSidebar();
+    } catch (e) { console.error("content search failed:", e); }
+  }, 220);
+}
 let _availableProjects = [];
 function _defaultProject() {
   try { const lp = localStorage.getItem("llmt_project"); if (lp && lp !== "ALL") return lp; } catch {}
@@ -130,8 +155,11 @@ async function init(){
     sbSearchEl.addEventListener("input", () => {
       _searchQuery = sbSearchEl.value || "";
       try { localStorage.setItem("llmt_sb_search", _searchQuery); } catch {}
+      _runContentSearch(_searchQuery);
       _renderSidebar();
     });
+    // Kick off content search at load so a persisted query produces hits without typing.
+    if (_searchQuery) _runContentSearch(_searchQuery);
   }
   // New-session button: tap = create in last project, long-press = picker
   const newBtn = document.getElementById("newSessionBtn");
@@ -234,15 +262,50 @@ function showSessionInfo(x, anchorEl) {
 //   done      — logical end (email sent / manually marked / 24h+ idle responded) — MUTED, archive-ready
 function computeSessionState(s) {
   if (!s) return "";
-  if (s.manualDone) return "done";
   const role = s.lastMessageRole || "";
   const ageMin = (Date.now() - (s.lastActive || 0)) / 60000;
+  // Email reply (Phase B reactivation) — pulls the session back to "decision":
+  // you need to read the reply and decide what to do.
+  if (role === "email_reply") return s.manualDone ? "done" : "decision";
+  // Email sent: only done when actually opened in Gmail or confirmed sent
   if (role === "email_sent") return "done";
-  if (role === "question" || role === "permission_denied") return "blocked";
+  if (role === "email_draft" && s.emailOpened) return "done";
   if (role === "email_draft") return "decision";
+  // Non-email: manualDone means done
+  if (s.manualDone) return "done";
+  if (role === "question" || role === "permission_denied") return "blocked";
   if (role === "user" || role === "tool_activity" || role === "tool_result" || role === "permission_granted") return "working";
-  if (role === "assistant") return ageMin > 24*60 ? "done" : "responded";
+  // Responded: if you've opened the session after the assistant's last message
+  // and let it sit ≥30 min, it auto-flips to done. Otherwise stays "responded"
+  // until the 3-day fallback. Reply detection bumps lastActive past lastViewed,
+  // pulling it back to a needs-attention state automatically.
+  if (role === "assistant") {
+    const seenAfterReply = (s.lastViewed || 0) > (s.lastActive || 0);
+    if (seenAfterReply && ageMin > 30) return "done";
+    if (ageMin > 3*24*60) return "done";
+    return "responded";
+  }
   return "";
+}
+function markSessionViewed(sessionId) {
+  if (!sessionId) return;
+  fetch(apiUrl("/api/sessions/" + sessionId + "/viewed"), { method: "POST" })
+    .then(() => { /* server bumped lastViewed; sidebar refresh next loadSessions catches it */ })
+    .catch(() => {});
+  // Optimistic local update so the sidebar reflects immediately.
+  const local = _allSessions.find(x => x.id === sessionId);
+  if (local) { local.lastViewed = Date.now(); _renderSidebar(); }
+}
+function markSessionDone(sessionId) {
+  if (!sessionId) return;
+  fetch(apiUrl("/api/sessions/" + sessionId + "/state"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ manualDone: true }),
+  }).then(() => loadSessions()).catch(() => {});
+  // Optimistic — flip locally so it drops out of NEEDS YOU immediately.
+  const local = _allSessions.find(x => x.id === sessionId);
+  if (local) { local.manualDone = Date.now(); _renderSidebar(); }
 }
 const STATE_ICONS = {
   blocked:   "❗",       // ❗
@@ -259,7 +322,7 @@ function attentionSessionsList() {
   return (_allSessions || [])
     .filter(s => !s.archived)
     .map(s => ({ s, st: computeSessionState(s) }))
-    .filter(({st}) => st === "blocked" || st === "decision")
+    .filter(({st}) => st === "blocked" || st === "decision" || st === "responded")
     .sort((a, b) => {
       if (STATE_PRIORITY[a.st] !== STATE_PRIORITY[b.st]) return STATE_PRIORITY[a.st] - STATE_PRIORITY[b.st];
       return (b.s.lastActive || 0) - (a.s.lastActive || 0);
@@ -271,14 +334,56 @@ function nextAttentionSession() {
   if (!list.length) return;
   const curIdx = list.findIndex(s => s.id === (session && session.id));
   const next = list[(curIdx + 1) % list.length];
-  if (next) resumeSession(next);
+  if (next) {
+    resumeSession(next);
+    showAttentionBanner(next);
+  }
+}
+function showAttentionBanner(s) {
+  let banner = document.getElementById("attBanner");
+  if (!banner) {
+    banner = mk("div", "att-banner"); banner.id = "attBanner";
+    const chatEl = document.getElementById("chat");
+    chatEl.parentNode.insertBefore(banner, chatEl);
+  }
+  const state = computeSessionState(s);
+  const icon = STATE_ICONS[state] || "";
+  const snippet = s.lastSnippet || "";
+  const project = s.project || "";
+  banner.innerHTML = "";
+  const left = mk("div","att-banner-left");
+  left.innerHTML = '<span class="att-banner-icon">' + icon + '</span> <strong>' + esc(s.title || "Untitled") + '</strong>';
+  if (project) left.innerHTML += ' <span class="att-banner-proj">' + esc(project) + '</span>';
+  banner.appendChild(left);
+  if (snippet) {
+    const snipEl = mk("div","att-banner-snippet");
+    snipEl.textContent = snippet;
+    banner.appendChild(snipEl);
+  }
+  banner.style.display = "flex";
+  // Auto-hide after 5s
+  if (banner._timer) clearTimeout(banner._timer);
+  banner._timer = setTimeout(() => { banner.style.display = "none"; }, 5000);
+  banner.onclick = () => { banner.style.display = "none"; };
 }
 function refreshAttentionCounter() {
-  const btn = document.getElementById("attentionBtn");
-  if (!btn) return;
-  const n = attentionSessionsList().length;
-  btn.querySelector(".att-count").textContent = String(n);
-  btn.classList.toggle("hidden", n === 0);
+  // Update topbar attention button (desktop)
+  const topAtt = document.getElementById("topbarAtt");
+  if (topAtt) {
+    const list = attentionSessionsList();
+    const n = list.length;
+    const icon = document.getElementById("topbarAttIcon");
+    const text = document.getElementById("topbarAttText");
+    if (n === 0) {
+      if (icon) icon.textContent = "✅";
+      if (text) text.textContent = "";
+      topAtt.classList.remove("has-attention");
+    } else {
+      if (icon) icon.textContent = "🔔 " + n;
+      if (text) text.textContent = "";
+      topAtt.classList.add("has-attention");
+    }
+  }
 }
 
 function makeSbItem(x, currentProject) {
@@ -308,7 +413,20 @@ function makeSbItem(x, currentProject) {
     const mc = mk("span", ""); mc.textContent = "\u00b7 " + x.messageCount + " msg"; row2.appendChild(mc);
   }
   ti.appendChild(row2);
+  // Activity snippet — what's happening in this chat
+  if (x.lastSnippet) {
+    const snip = mk("div", "sb-snippet");
+    snip.textContent = x.lastSnippet;
+    ti.appendChild(snip);
+  }
   d.appendChild(ti);
+  // \u2713 button: mark a "responded" session done without waiting for the 30-min timer.
+  // Only shown when state==responded \u2014 hidden for blocked/decision/working/done.
+  if (state === "responded") {
+    const okb = mk("button", "sb-done-btn"); okb.textContent = "\u2713"; okb.title = "Mark done";
+    okb.onclick = (e) => { e.stopPropagation(); markSessionDone(x.id); };
+    d.appendChild(okb);
+  }
   const xb = mk("button", "x"); xb.textContent = "\u00d7";
   d.appendChild(xb);
   ti.onclick = () => resumeSession(x);
@@ -383,14 +501,24 @@ async function loadSessions() {
 function _renderSidebar() {
   _updateNewSessionLabel();
   sbList.innerHTML = "";
-  const q = (_searchQuery || "").trim().toLowerCase();
-  const matches = (x) => !q || (x.title || "").toLowerCase().includes(q) || (x.project || "").toLowerCase().includes(q);
+  const qRaw = (_searchQuery || "").trim();
+  const q = qRaw.toLowerCase();
+  const contentHit = (x) => _contentMatchIds && _contentMatchIds.has(x.id);
+  const matches = (x) =>
+    !q ||
+    (x.title   || "").toLowerCase().includes(q) ||
+    (x.project || "").toLowerCase().includes(q) ||
+    (x.lastSnippet || "").toLowerCase().includes(q) ||
+    contentHit(x);
   const filtered = _allSessions.filter(matches);
   const active = filtered.filter(x => !x.archived);
   const archived = filtered.filter(x => x.archived);
   if (!filtered.length && q) {
     const empty = mk("div", "sb-empty");
-    empty.textContent = "No sessions match \"" + _searchQuery + "\"";
+    const stillRunning = _contentMatchQuery !== qRaw;
+    empty.textContent = stillRunning
+      ? "Searching message bodies for \"" + qRaw + "\"…"
+      : "No sessions match \"" + qRaw + "\"";
     sbList.appendChild(empty);
     return;
   }
@@ -615,6 +743,7 @@ function connect(project,sessionId){
         localStorage.setItem("llmt_session", session.id);
         localStorage.setItem("llmt_project", session.project);
         location.hash = session.id;
+        markSessionViewed(session.id);
         loadSessions();
         refreshPreviews(false);
         startBrowserPoll();
@@ -644,7 +773,7 @@ function connect(project,sessionId){
         (msg.messages||[]).forEach(m=>{
           const ts=m.ts||0;
           if(!chatIsEmpty && ts && ts<=lastRenderedTs) return; // already rendered
-          if(m.role==="user") addUser(m.text);
+          if(m.role==="user"&&m.source!=="voice-note") addUser(m.text);
           else if(m.role==="question") addQuestion(m.text);
           else if(m.role==="permission_denied") addPermissionCardFromHistory({tool_name:m.tool_name,tool_input:m.tool_input,message:m.message});
           else if(m.role==="assistant") addAssistant(m.text);
@@ -723,6 +852,26 @@ function connect(project,sessionId){
       case "email_draft":
         removeThinking();
         addEmailDraft(msg);
+        break;
+            case "queued":
+        // Server confirmed it queued our prompt while busy. Treat as ack so outbox drops it.
+        if (msg.client_id) {
+          outbox = outbox.filter(x => x.id !== msg.client_id);
+          saveOutbox();
+        }
+        _serverQueueDepth = msg.queueDepth || 0;
+        renderQueueCount();
+        break;
+      case "queue_state":
+        _serverQueueDepth = msg.queueDepth || 0;
+        renderQueueCount();
+        break;
+      case "queued_prompt_firing":
+        // Voice notes already have a card in chat — don't duplicate as text
+        if(msg.source!=="voice-note") addUser(msg.text || "", null);
+        _serverQueueDepth = Math.max(0, (_serverQueueDepth || 0) - 1);
+        renderQueueCount();
+        setBusy(true);
         break;
       case "permission_denied":
         addPermissionCard(msg);
@@ -918,14 +1067,20 @@ function addUser(text,imagePreviews){
   }
   chat.appendChild(d);scrollToBottomForce();
 }
-function addVoiceNoteUser(blob,duration){
+function addVoiceNoteUser(blob,duration,imagePreviews){
   const d=mk("div","msg user voice-note-msg");
+  // Show attached images above the voice note
+  if(imagePreviews&&imagePreviews.length){
+    imagePreviews.forEach(src=>{const img=document.createElement("img");img.src=src;d.appendChild(img)});
+  }
   const vn=mk("div","vn-bubble");
+  // Title (populated after transcription)
+  const title=mk("div","vn-title");title.textContent="Voice note";
+  vn.appendChild(title);
   // Audio player
   const audio=document.createElement("audio");
   audio.src=URL.createObjectURL(blob);
   audio.preload="metadata";
-  // Custom play button + waveform bar + duration
   const playBtn=mk("button","vn-play");playBtn.textContent="▶";
   playBtn.onclick=()=>{
     if(audio.paused){audio.play();playBtn.textContent="⏸";}
@@ -935,11 +1090,9 @@ function addVoiceNoteUser(blob,duration){
   audio.onpause=()=>{playBtn.textContent="▶";};
   audio.onplay=()=>{playBtn.textContent="⏸";};
   const wave=mk("div","vn-wave");
-  // Simple visual bars
   for(let i=0;i<20;i++){const bar=mk("div","vn-bar");bar.style.height=Math.max(4,Math.random()*16)+"px";wave.appendChild(bar);}
   const dur=mk("span","vn-duration");
   dur.textContent=Math.floor(duration/60)+":"+(duration%60<10?"0":"")+(duration%60);
-  // Progress on wave
   audio.ontimeupdate=()=>{
     if(!audio.duration)return;
     const pct=audio.currentTime/audio.duration*100;
@@ -948,8 +1101,19 @@ function addVoiceNoteUser(blob,duration){
   const row=mk("div","vn-row");
   row.appendChild(playBtn);row.appendChild(wave);row.appendChild(dur);
   vn.appendChild(row);
-  // Note: no visible transcript in chat (user request).
-  // The transcript is still produced server-side and sent as the prompt to Claude.
+  // Status line — always visible, shows what's happening right now
+  const status=mk("div","vn-status");status.textContent="Uploading…";
+  vn.appendChild(status);
+  // Collapsible transcript (fully hidden until ready)
+  const toggle=mk("button","vn-toggle");
+  toggle.textContent="Show transcript";
+  const transcript=mk("div","vn-transcript");
+  toggle.onclick=()=>{
+    const open=transcript.classList.toggle("vn-open");
+    toggle.textContent=open?"Hide transcript":"Show transcript";
+  };
+  vn.appendChild(toggle);
+  vn.appendChild(transcript);
   d.appendChild(vn);
   chat.appendChild(d);scrollToBottomForce();
   return d;
@@ -1356,7 +1520,7 @@ function renderDrawer(){
   let filtered=sessionPreviews;
   if(fileFilter!=="all") filtered=filtered.filter(p=>p.type===fileFilter);
   if(query) filtered=filtered.filter(p=>matchesSearch(p,query));
-  countEl.textContent=filtered.length+" file"+(filtered.length!==1?"s":"");
+  countEl.textContent=filtered.length+"/"+sessionPreviews.length+" files (filter="+(fileFilter||"all")+")";
   if(!filtered.length){list.innerHTML='<div class="drawer-empty">'+(query?"No matches":"No files in this session")+'</div>';return;}
   list.innerHTML="";
   // Sort newest first
@@ -1437,6 +1601,10 @@ function toggleDrawer(){
   const dw=document.getElementById("drawer");
   dw.classList.toggle("hidden");
   try{localStorage.setItem("llmt_drawer_open",String(!dw.classList.contains("hidden")))}catch{}
+  // If opening the drawer, refresh previews so user sees latest files
+  if(!dw.classList.contains("hidden")){
+    try{refreshPreviews(false);}catch{}
+  }
 }
 
 // ── Audio Review Tool ──
@@ -1540,6 +1708,7 @@ function addTool(name,body){
 function addSystem(text){const d=mk("div","msg system");d.textContent=text;chat.appendChild(d)}
 function addQueued(text){const d=mk("div","msg system");d.textContent="Queued: "+text.slice(0,60)+(text.length>60?"...":"");chat.appendChild(d);scrollToBottomIfSticky()}
 function renderQueueCount(){
+  const _totalQueue = (messageQueue ? _totalQueue : 0) + (_serverQueueDepth || 0);
   let el=document.getElementById("queueCount");
   if(!el){el=mk("span","queue-count");el.id="queueCount";document.querySelector(".topbar").appendChild(el)}
   el.textContent=messageQueue.length?messageQueue.length+" queued":"";
@@ -1953,14 +2122,13 @@ function toggleVoiceInput(){
   }
   if(voiceActive){ stopVoiceRecording(); return; }
   navigator.mediaDevices.getUserMedia({audio:true}).then(stream=>{
-    const mimeType=MediaRecorder.isTypeSupported("audio/webm;codecs=opus")?"audio/webm;codecs=opus"
-      :MediaRecorder.isTypeSupported("audio/mp4")?"audio/mp4":"";
-    voiceRec=new MediaRecorder(stream, mimeType?{mimeType}:{});
+    // Don't specify mimeType — let the browser pick (Safari/iOS breaks with explicit codecs)
+    voiceRec=new MediaRecorder(stream);
     voiceChunks=[];
-    voiceRec.ondataavailable=(e)=>{ if(e.data.size>0) voiceChunks.push(e.data); };
+    voiceRec.ondataavailable=(e)=>{ if(e.data) voiceChunks.push(e.data); };
     voiceRec.onstop=()=>{
       stream.getTracks().forEach(t=>t.stop());
-      const blob=new Blob(voiceChunks,{type:voiceRec.mimeType||"audio/webm"});
+      const blob=new Blob(voiceChunks,{type:voiceRec.mimeType||"audio/mp4"});
       voiceChunks=[];
       if(blob.size<1000){ console.log("voice note too short, discarding"); return; }
       sendVoiceNote(blob);
@@ -1970,7 +2138,7 @@ function toggleVoiceInput(){
       stream.getTracks().forEach(t=>t.stop());
       endVoiceUI();
     };
-    voiceRec.start(250); // collect in 250ms chunks
+    voiceRec.start(); // no timeslice — Safari/iOS breaks with it
     voiceActive=true;
     voiceStartTime=Date.now();
     startVoiceUI();
@@ -1987,30 +2155,55 @@ function stopVoiceRecording(){
 }
 let voiceMeterCtx=null, voiceMeterAnalyser=null, voiceMeterRAF=null;
 function startVoiceUI(){
+  const isMobile=window.innerWidth<=768;
   const btn=document.getElementById("micBtn");
-  if(btn){btn.classList.add("recording");btn.textContent="⏹";}
-  let timer=document.getElementById("voiceTimer");
-  if(!timer){
-    timer=mk("div","voice-timer");timer.id="voiceTimer";
-    const info=mk("div","voice-info");
-    const dot=mk("span","voice-dot");
-    const time=mk("span","voice-time");time.id="voiceTime";time.textContent="0:00";
-    // Live waveform: 20 vertical bars animated from AudioContext analyser
-    const wave=mk("div","voice-wave");wave.id="voiceWave";
-    for(let i=0;i<20;i++){const b=mk("div","voice-wave-bar");wave.appendChild(b);}
-    info.appendChild(dot);info.appendChild(time);info.appendChild(wave);
-    const actions=mk("div","voice-actions");
-    const cancel=mk("button","voice-cancel");cancel.textContent="✕ Cancel";
-    cancel.onclick=(e)=>{e.stopPropagation();cancelVoiceRecording();};
-    const send=mk("button","voice-send");send.textContent="Send ▶";
-    send.onclick=(e)=>{e.stopPropagation();stopVoiceRecording();};
-    actions.appendChild(cancel);actions.appendChild(send);
-    timer.appendChild(info);timer.appendChild(actions);
-    document.body.appendChild(timer);
+  const attachBtn=document.getElementById("attachBtn");
+  // Mic button becomes send (↑), Send button becomes cancel (✕), attach hides
+  if(btn){btn.classList.add("recording");btn.textContent="↑";}
+  if(sendBtn){sendBtn._oldText=sendBtn.textContent;sendBtn.textContent="✕";sendBtn.classList.add("voice-cancel-mode");sendBtn.onclick=cancelVoiceRecording;}
+  if(attachBtn){attachBtn.style.visibility="hidden";attachBtn.style.pointerEvents="none";}
+  // Desktop: replace textarea with inline recording strip + cancel
+  if(inp)inp.dataset.prevValue=inp.value;
+  if(!isMobile){
+    if(inp)inp.style.display="none";
+    let ri=document.getElementById("voiceInline");
+    if(!ri){
+      ri=mk("div","voice-inline");ri.id="voiceInline";
+      const dot=mk("span","voice-dot");
+      const time=mk("span","voice-time");time.id="voiceTime";time.textContent="0:00";
+      const wave=mk("div","voice-wave voice-wave-sm");wave.id="voiceWave";
+      for(let i=0;i<16;i++){const b=mk("div","voice-wave-bar");b.style.setProperty("--i",i);wave.appendChild(b);}
+      ri.appendChild(dot);ri.appendChild(time);ri.appendChild(wave);
+      const bar=document.querySelector(".input-bar");
+      bar.insertBefore(ri,bar.firstChild);
+    }
+    ri.style.display="flex";
+  } else {
+    if(inp){inp.value="";inp.readOnly=true;inp.placeholder="⏺ Recording...";}
   }
-  timer.style.display="flex";
-  // Request fullscreen to dismiss browser chrome (Arc, Safari, etc.)
-  try{if(document.documentElement.requestFullscreen)document.documentElement.requestFullscreen().catch(()=>{});}catch{}
+  if(isMobile){
+    // Mobile: also show full-screen overlay with big buttons
+    let timer=document.getElementById("voiceTimer");
+    if(!timer){
+      timer=mk("div","voice-timer");timer.id="voiceTimer";
+      const info=mk("div","voice-info");
+      const dot2=mk("span","voice-dot");
+      const time2=mk("span","voice-time");time2.id="voiceTimeMobile";time2.textContent="0:00";
+      const wave2=mk("div","voice-wave");wave2.id="voiceWaveMobile";
+      for(let i=0;i<20;i++){const b=mk("div","voice-wave-bar");b.style.setProperty("--i",i);wave2.appendChild(b);}
+      info.appendChild(dot2);info.appendChild(time2);info.appendChild(wave2);
+      const actions=mk("div","voice-actions");
+      const cancel=mk("button","voice-cancel");cancel.textContent="✕ Cancel";
+      cancel.onclick=(e)=>{e.stopPropagation();cancelVoiceRecording();};
+      const send=mk("button","voice-send");send.textContent="Send ↑";
+      send.onclick=(e)=>{e.stopPropagation();stopVoiceRecording();};
+      actions.appendChild(cancel);actions.appendChild(send);
+      timer.appendChild(info);timer.appendChild(actions);
+      document.body.appendChild(timer);
+    }
+    timer.style.display="flex";
+    try{if(document.documentElement.requestFullscreen)document.documentElement.requestFullscreen().catch(()=>{});}catch{}
+  }
 
   // Start drawing the live waveform from the active audio stream
   try{
@@ -2021,11 +2214,11 @@ function startVoiceUI(){
       voiceMeterAnalyser.fftSize = 64;
       src.connect(voiceMeterAnalyser);
       const data = new Uint8Array(voiceMeterAnalyser.frequencyBinCount);
-      const bars = document.querySelectorAll("#voiceWave .voice-wave-bar");
+      const bars = document.querySelectorAll("#voiceWave .voice-wave-bar, #voiceWaveMobile .voice-wave-bar");
+      bars.forEach(b=>b.classList.add("live"));
       function draw(){
         voiceMeterAnalyser.getByteFrequencyData(data);
         for(let i=0;i<bars.length;i++){
-          // map data[i] (0-255) to bar height 4-22px
           const v = data[i] || 0;
           const h = Math.max(3, Math.floor((v/255)*22));
           bars[i].style.height = h+"px";
@@ -2037,22 +2230,27 @@ function startVoiceUI(){
   }catch(e){ console.warn("voice meter init failed:", e.message); }
 
   voiceTimerInterval=setInterval(()=>{
-    const el=document.getElementById("voiceTime");
-    if(!el)return;
     const s=Math.floor((Date.now()-voiceStartTime)/1000);
-    el.textContent=Math.floor(s/60)+":"+(s%60<10?"0":"")+(s%60);
+    const txt=Math.floor(s/60)+":"+(s%60<10?"0":"")+(s%60);
+    const el=document.getElementById("voiceTime");if(el)el.textContent=txt;
+    const el2=document.getElementById("voiceTimeMobile");if(el2)el2.textContent=txt;
   },500);
 }
 function endVoiceUI(){
   voiceActive=false;
   const btn=document.getElementById("micBtn");
-  if(btn){btn.classList.remove("recording");btn.textContent="♫";}
+  if(btn){btn.classList.remove("recording");btn.textContent="🎙";}
+  if(sendBtn){sendBtn.textContent=sendBtn._oldText||"Send";sendBtn.classList.remove("voice-cancel-mode");sendBtn.onclick=send;}
+  const attachBtn=document.getElementById("attachBtn");
+  if(attachBtn){attachBtn.style.visibility="";attachBtn.style.pointerEvents="";}
+  if(inp){inp.style.display="";inp.readOnly=false;inp.value=inp.dataset.prevValue||"";inp.placeholder="Message Claude...";}
+  const ri=document.getElementById("voiceInline");
+  if(ri)ri.style.display="none";
   const timer=document.getElementById("voiceTimer");
   if(timer)timer.style.display="none";
   if(voiceTimerInterval){clearInterval(voiceTimerInterval);voiceTimerInterval=null;}
   if(voiceMeterRAF){cancelAnimationFrame(voiceMeterRAF);voiceMeterRAF=null;}
   if(voiceMeterCtx){try{voiceMeterCtx.close();}catch{}; voiceMeterCtx=null; voiceMeterAnalyser=null;}
-  // Exit fullscreen if we entered it for recording
   try{if(document.fullscreenElement)document.exitFullscreen().catch(()=>{});}catch{}
 }
 function cancelVoiceRecording(){
@@ -2067,41 +2265,80 @@ function cancelVoiceRecording(){
 }
 async function sendVoiceNote(blob){
   const duration=Math.floor((Date.now()-voiceStartTime)/1000);
-  // Show voice note in chat immediately
-  const msgEl=addVoiceNoteUser(blob,duration);
-  // Upload + transcribe
+  // Capture any pending images to send with this voice note
+  const vnImages=pendingImages.map(i=>({data:i.data,mimeType:i.mimeType}));
+  const vnPreviews=pendingImages.map(i=>i.preview);
+  const msgEl=addVoiceNoteUser(blob,duration,vnPreviews);
+  if(vnImages.length) clearImages();
+  const statusEl=msgEl.querySelector(".vn-status");
+  const setVnStatus=(txt,cls)=>{
+    if(statusEl){statusEl.textContent=txt;statusEl.className="vn-status"+(cls?" "+cls:"");}
+  };
   try{
-    const r=await fetch("./voice-note",{method:"POST",headers:{"Content-Type":blob.type||"audio/webm"},body:blob});
-    if(!r.ok) throw new Error("upload failed: "+r.status);
-    const data=await r.json();
-    // Transcript no longer rendered in the chat; only used as the prompt below.
-    if(data.error){
-      console.error("[voice-note] transcribe error:", data.error);
+    setVnStatus("Uploading…","vn-s-active");
+    const sid=(session&&session.id)||"";
+    // Track upload progress via XMLHttpRequest for real upload %
+    const data=await new Promise((resolve,reject)=>{
+      const xhr=new XMLHttpRequest();
+      xhr.open("POST","./voice-note"+(sid?"?session="+encodeURIComponent(sid):""));
+      xhr.setRequestHeader("Content-Type",blob.type||"audio/mp4");
+      xhr.upload.onprogress=(e)=>{
+        if(e.lengthComputable){
+          const pct=Math.round(e.loaded/e.total*100);
+          setVnStatus("Uploading… "+pct+"%","vn-s-active");
+          if(pct>=100) setVnStatus("Transcribing…","vn-s-active");
+        }
+      };
+      xhr.upload.onload=()=>{ setVnStatus("Transcribing…","vn-s-active"); };
+      xhr.onload=()=>{
+        if(xhr.status>=400) return reject(new Error("upload failed: "+xhr.status));
+        try{resolve(JSON.parse(xhr.responseText))}catch(e){reject(e)}
+      };
+      xhr.onerror=()=>reject(new Error("network error"));
+      xhr.send(blob);
+    });
+    if(data.error) console.error("[voice-note] error:", data.error);
+    // Update title
+    const titleEl=msgEl.querySelector(".vn-title");
+    if(titleEl&&data.title) titleEl.textContent=data.title;
+    // Update transcript (hidden until user taps toggle)
+    const transcriptEl=msgEl.querySelector(".vn-transcript");
+    const toggleEl=msgEl.querySelector(".vn-toggle");
+    if(transcriptEl&&data.transcript){
+      transcriptEl.textContent=data.transcript;
+      if(toggleEl) toggleEl.classList.add("vn-ready");
+    } else if(transcriptEl&&data.error){
+      transcriptEl.textContent="⚠ "+data.error;
+      transcriptEl.classList.add("vn-error");
+      if(toggleEl) toggleEl.classList.add("vn-ready");
     }
-    // Update audio src to server URL (for persistence across reloads)
+    // Update audio src to server URL
     const audioEl=msgEl.querySelector("audio");
     if(audioEl&&data.audioUrl) audioEl.src=data.audioUrl;
-    // Send transcript as prompt to Claude
-    if(data.transcript){
-      requestNotifPermission();
-      const prompt=data.transcript;
-      if(busy){
-        // Queue it like a regular message when busy
-        messageQueue.push({text:prompt,images:[],previews:[]});
-        renderQueueCount();
-      } else {
-        const clientId=genMsgId();
-        outbox.push({id:clientId,text:prompt,images:[],ts:Date.now()});saveOutbox();
-        if(ws&&ws.readyState===1){
-          ws.send(JSON.stringify({type:"prompt",client_id:clientId,text:prompt,images:[]}));
-          setBusy(true);
-        }
+    // Server already queued the transcript — only send from client if images attached
+    if(data.transcript&&vnImages.length){
+      const clientId=genMsgId();
+      outbox.push({id:clientId,text:data.transcript,images:vnImages,ts:Date.now()});saveOutbox();
+      if(ws&&ws.readyState===1){
+        ws.send(JSON.stringify({type:"prompt",client_id:clientId,text:data.transcript,images:vnImages}));
+        setBusy(true);
       }
     }
+    // Status — upload succeeded, server handles the rest
+    if(data.transcript){
+      setVnStatus("Queued","vn-s-done");
+      setTimeout(()=>{if(statusEl)statusEl.style.display="none";},2000);
+    } else if(data.error){
+      setVnStatus("⚠ "+data.error,"vn-s-error");
+    } else {
+      setVnStatus("Sent","vn-s-done");
+      setTimeout(()=>{if(statusEl)statusEl.style.display="none";},2000);
+    }
   }catch(err){
-    console.error("voice note upload failed:",err);
-    console.error("[voice-note] upload failed");
-    // (no transcript element to update — keep chat clean; failure is logged to console)
+    console.error("[voice-note] upload failed:",err);
+    setVnStatus("⚠ Upload failed — tap to retry","vn-s-error");
+    // Tap to retry
+    msgEl.onclick=()=>{msgEl.onclick=null;sendVoiceNote(blob);};
   }
 }
 
@@ -2163,6 +2400,17 @@ document.addEventListener("keydown",(e)=>{
     const bar=document.getElementById("chatSearchBar");
     if(bar.classList.contains("hidden"))toggleChatSearch();
     else document.getElementById("chatSearchInput").focus();
+    return;
+  }
+  // Voice note keyboard: Space to record/send, Escape to cancel
+  if(e.key===" "&&!voiceActive&&document.activeElement!==inp&&!e.metaKey&&!e.ctrlKey){
+    e.preventDefault();toggleVoiceInput();return;
+  }
+  if(e.key===" "&&voiceActive){
+    e.preventDefault();stopVoiceRecording();return;
+  }
+  if(e.key==="Escape"&&voiceActive){
+    e.preventDefault();cancelVoiceRecording();return;
   }
 });
 inp.addEventListener("keydown",(e)=>{
@@ -2253,6 +2501,275 @@ function showBubbleMenu(ev, el){
     document.addEventListener("touchstart", closer, {once:true, passive:true});
   }, 50);
 }
+
+// ── Task Board (orchestrator proxy) ──
+let taskCache=[], taskFilter="actionable";
+function toggleTaskBoard(){
+  const tb=document.getElementById("taskBoard");
+  tb.classList.toggle("hidden");
+  if(!tb.classList.contains("hidden")) loadTasks();
+}
+function setTaskFilter(f){
+  taskFilter=f;
+  document.querySelectorAll("#taskFilters button").forEach(b=>b.classList.toggle("active",b.dataset.tf===f));
+  renderTasks();
+}
+async function loadTasks(){
+  try{
+    const r=await fetch("./api/tasks?limit=100");
+    if(!r.ok) throw new Error(""+r.status);
+    const data=await r.json();
+    taskCache=data.items||[];
+    renderTasks();
+    updateTaskBadge();
+  }catch(err){
+    document.getElementById("taskList").innerHTML='<div class="drawer-empty">Failed to load tasks</div>';
+    console.error("[tasks]",err);
+  }
+}
+function renderTasks(){
+  const list=document.getElementById("taskList");
+  const actionable=["blocked","review","new"];
+  const active=["in_progress","queued","triaged"];
+  let items=taskCache;
+  if(taskFilter==="actionable") items=items.filter(t=>actionable.includes(t.status));
+  else if(taskFilter==="active") items=items.filter(t=>active.includes(t.status)||actionable.includes(t.status));
+  // Group by project
+  const groups={};
+  items.forEach(t=>{
+    const p=t.target_project||t.project_id||"other";
+    if(!groups[p])groups[p]=[];
+    groups[p].push(t);
+  });
+  if(!items.length){
+    list.innerHTML='<div class="drawer-empty">No tasks match filter</div>';
+    document.getElementById("taskCount").textContent="";
+    return;
+  }
+  document.getElementById("taskCount").textContent=items.length;
+  let html="";
+  for(const [proj,tasks] of Object.entries(groups).sort()){
+    html+='<div class="tk-group"><div class="tk-proj">'+esc(proj)+'</div>';
+    tasks.forEach(t=>{
+      const statusCls="tk-s-"+t.status;
+      const pri=t.priority==="urgent"?"!!! ":t.priority==="high"?"!! ":"";
+      html+='<div class="tk-item '+statusCls+'" data-tid="'+t.task_id+'">';
+      html+='<div class="tk-title" onclick="loadTaskIntoChat(this.parentNode)">'+esc(pri+t.title)+'</div>';
+      html+='<div class="tk-meta"><span class="tk-status">'+esc(t.status)+'</span>';
+      if(t.blocked_reason) html+='<span class="tk-blocked">'+esc(t.blocked_reason.slice(0,40))+'</span>';
+      html+='<span class="tk-date">'+new Date(t.created_at).toLocaleDateString()+'</span></div>';
+      // Action buttons based on status
+      html+='<div class="tk-actions">';
+      if(t.status==="blocked") html+='<button class="tk-btn tk-btn-retry" onclick="taskAction(\''+t.task_id+'\',\'retry\')">↻ Retry</button>';
+      if(t.status==="blocked") html+='<button class="tk-btn tk-btn-close" onclick="taskAction(\''+t.task_id+'\',\'close\')">✕ Close</button>';
+      if(t.status==="review") html+='<button class="tk-btn tk-btn-approve" onclick="taskAction(\''+t.task_id+'\',\'merge\')">✓ Approve</button>';
+      if(t.status==="review") html+='<button class="tk-btn tk-btn-close" onclick="taskAction(\''+t.task_id+'\',\'close\')">✕ Close</button>';
+      if(t.status==="new") html+='<button class="tk-btn tk-btn-retry" onclick="taskAction(\''+t.task_id+'\',\'queue\')">▶ Queue</button>';
+      if(t.status==="new") html+='<button class="tk-btn tk-btn-close" onclick="taskAction(\''+t.task_id+'\',\'close\')">✕ Close</button>';
+      if(t.status==="in_progress") html+='<button class="tk-btn" onclick="loadTaskIntoChat(this.closest(\'.tk-item\'))">💬 Open</button>';
+      html+='</div>';
+      html+='</div>';
+    });
+    html+='</div>';
+  }
+  list.innerHTML=html;
+}
+function updateTaskBadge(){
+  const actionable=taskCache.filter(t=>["blocked","review","new"].includes(t.status));
+  const n=actionable.length;
+  ["tasksBadge","tasksBadgeMobile"].forEach(id=>{
+    const el=document.getElementById(id);
+    if(el){el.textContent=n;el.style.display=n?"":"none";}
+  });
+}
+function loadTaskIntoChat(el){
+  const tid=el.dataset.tid;
+  const t=taskCache.find(t=>t.task_id===tid);
+  if(!t) return;
+  const desc=(t.description||"").slice(0,500);
+  const text="[Task: "+t.title+"]\nProject: "+(t.target_project||t.project_id)+"\nStatus: "+t.status
+    +(t.blocked_reason?"\nBlocked: "+t.blocked_reason:"")
+    +(desc?"\n\n"+desc:"")
+    +"\n\nWhat should we do with this?";
+  inp.value=text;
+  inp.style.height="44px";inp.style.height=Math.min(inp.scrollHeight,140)+"px";
+  localStorage.setItem("llmt_draft",inp.value);
+  // Link this session to the task
+  if(ws&&ws.readyState===1) ws.send(JSON.stringify({type:"link_task",task_id:tid}));
+  toggleTaskBoard();
+  if(window.innerWidth>768) inp.focus();
+}
+// ── Floating Action Button (FAB) — round-robin + quick actions ──
+(function(){
+  const fab=document.getElementById("fab");
+  if(!fab)return;
+  const fabCount=document.getElementById("fabCount");
+  let isDragging=false, dragStartX=0, dragStartY=0, fabX=0, fabY=0, pressTimer=null;
+  // Restore position
+  try{const p=JSON.parse(localStorage.getItem("llmt_fab_pos"));if(p){fab.style.right="auto";fab.style.left=p.x+"px";fab.style.top=p.y+"px";fab.style.bottom="auto";}}catch{}
+
+  function updateFabCount(){
+    const n=attentionSessionsList().length;
+    fabCount.textContent=n;
+    fab.classList.toggle("fab-zero",n===0);
+  }
+  // Expose for polling
+  window._updateFabCount=updateFabCount;
+  setTimeout(updateFabCount,1500);
+
+  // Tap = next attention session
+  fab.addEventListener("click",(e)=>{
+    if(isDragging)return;
+    nextAttentionSession();
+  });
+
+  // Drag support (touch)
+  fab.addEventListener("touchstart",(e)=>{
+    if(e.touches.length!==1)return;
+    const t=e.touches[0];
+    dragStartX=t.clientX;dragStartY=t.clientY;
+    const r=fab.getBoundingClientRect();
+    fabX=r.left;fabY=r.top;
+    isDragging=false;
+    pressTimer=setTimeout(()=>{showFabMenu();pressTimer=null;},500);
+  },{passive:true});
+  fab.addEventListener("touchmove",(e)=>{
+    if(e.touches.length!==1)return;
+    const t=e.touches[0];
+    const dx=t.clientX-dragStartX,dy=t.clientY-dragStartY;
+    if(Math.abs(dx)>5||Math.abs(dy)>5){
+      isDragging=true;
+      if(pressTimer){clearTimeout(pressTimer);pressTimer=null;}
+      fab.classList.add("fab-dragging");
+      fab.style.right="auto";fab.style.bottom="auto";
+      fab.style.left=Math.max(0,Math.min(window.innerWidth-60,fabX+dx))+"px";
+      fab.style.top=Math.max(0,Math.min(window.innerHeight-60,fabY+dy))+"px";
+    }
+  },{passive:true});
+  fab.addEventListener("touchend",(e)=>{
+    if(pressTimer){clearTimeout(pressTimer);pressTimer=null;}
+    fab.classList.remove("fab-dragging");
+    if(isDragging){
+      // Save position
+      try{localStorage.setItem("llmt_fab_pos",JSON.stringify({x:parseInt(fab.style.left),y:parseInt(fab.style.top)}));}catch{}
+      setTimeout(()=>{isDragging=false;},50);
+    }
+  },{passive:true});
+
+  // Long-press (mouse)
+  fab.addEventListener("mousedown",(e)=>{
+    pressTimer=setTimeout(()=>{
+      const r=fab.getBoundingClientRect();
+      showFabMenu();
+      pressTimer=null;
+    },500);
+  });
+  fab.addEventListener("mouseup",()=>{if(pressTimer){clearTimeout(pressTimer);pressTimer=null;}});
+
+  // FAB context menu
+  function showFabMenu(){
+    const fabRect=fab.getBoundingClientRect();
+    // "First gear" — Mark done — sits just BELOW the FAB
+    let downMenu=document.getElementById("fabMenuDown");
+    if(!downMenu){downMenu=mk("div","fab-menu fab-menu-down");downMenu.id="fabMenuDown";document.body.appendChild(downMenu);}
+    downMenu.innerHTML='<button class="fab-menu-item" data-act="mark-done">✅ Done</button>';
+    downMenu.style.right=(window.innerWidth-fabRect.right)+"px";
+    downMenu.style.top=(fabRect.bottom+6)+"px";
+    downMenu.style.display="block";
+    // "Upper gears" — sessions needing input — stack ABOVE the FAB
+    let upMenu=document.getElementById("fabMenuUp");
+    if(!upMenu){upMenu=mk("div","fab-menu fab-menu-up");upMenu.id="fabMenuUp";document.body.appendChild(upMenu);}
+    const list=attentionSessionsList();
+    let html="";
+    if(list.length===0) html='<div class="fab-menu-item" style="color:var(--dim)">All clear</div>';
+    list.slice(0,8).forEach(s=>{
+      const st=computeSessionState(s);
+      const icon=STATE_ICONS[st]||"";
+      html+='<button class="fab-menu-item" data-sid="'+s.id+'">'+icon+' '+esc((s.title||"Untitled").slice(0,30))+'</button>';
+    });
+    upMenu.innerHTML=html;
+    upMenu.style.right=(window.innerWidth-fabRect.right)+"px";
+    upMenu.style.bottom=(window.innerHeight-fabRect.top+6)+"px";
+    upMenu.style.display="block";
+    // Shared click handler
+    const handler=(e)=>{
+      const btn=e.target.closest("[data-sid],[data-act]");
+      if(btn&&btn.dataset.sid){
+        const s=_allSessions.find(s=>s.id===btn.dataset.sid);
+        if(s){resumeSession(s);showAttentionBanner(s);}
+      }
+      if(btn&&btn.dataset.act==="mark-done"&&session){
+        fetch(apiUrl("/api/sessions/"+session.id+"/state"),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({manualDone:true})}).then(()=>{
+          loadSessions().then(()=>{
+            if(window._updateFabCount)window._updateFabCount();
+            nextAttentionSession();
+          });
+        });
+      }
+      closeFabMenus();
+    };
+    upMenu.onclick=handler;
+    downMenu.onclick=handler;
+    setTimeout(()=>{
+      const closer=(e)=>{if(!e.target.closest(".fab-menu")&&!e.target.closest(".fab"))closeFabMenus();};
+      document.addEventListener("click",closer,{once:true});
+      document.addEventListener("touchstart",closer,{once:true,passive:true});
+    },50);
+  }
+  function closeFabMenus(){
+    const up=document.getElementById("fabMenuUp"),down=document.getElementById("fabMenuDown");
+    if(up)up.style.display="none";
+    if(down)down.style.display="none";
+  }
+})();
+
+async function retryAllBlocked(){
+  const blocked=taskCache.filter(t=>t.status==="blocked");
+  if(!blocked.length){alert("No blocked tasks");return;}
+  let ok=0;
+  for(const t of blocked){
+    try{
+      const r=await fetch("./api/tasks/"+t.task_id+"/transition",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({status:"queued",detail:"Bulk retry from task board"})});
+      if(r.ok) ok++;
+    }catch{}
+  }
+  console.log("[tasks] retried "+ok+"/"+blocked.length+" blocked tasks");
+  loadTasks();
+}
+async function taskAction(taskId,action){
+  try{
+    if(action==="retry"){
+      await fetch("./api/tasks/"+taskId+"/transition",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({status:"queued",detail:"Retried from task board"})});
+    } else if(action==="close"){
+      await fetch("./api/tasks/"+taskId+"/transition",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({status:"closed",detail:"Closed from task board"})});
+    } else if(action==="merge"){
+      await fetch("./api/tasks/"+taskId+"/transition",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({status:"merged",detail:"Approved from task board"})});
+    } else if(action==="queue"){
+      await fetch("./api/tasks/"+taskId+"/transition",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({status:"queued",detail:"Queued from task board"})});
+    }
+    loadTasks();
+  }catch(err){console.error("[task-action]",err);}
+}
+
+// Auto-load task count on page load
+setTimeout(()=>{
+  fetch("./api/tasks?limit=100").then(r=>r.json()).then(data=>{
+    taskCache=data.items||[];
+    updateTaskBadge();
+  }).catch(()=>{});
+},2000);
+
+// Poll sidebar state every 15s — shows real-time status of all chats
+setInterval(()=>{
+  fetch(apiUrl("/api/sessions?project=ALL")).then(r=>r.json()).then(sessions=>{
+    // Only re-render if something changed
+    const changed = sessions.some((s,i) => {
+      const old = _allSessions[i];
+      return !old || old.lastMessageRole !== s.lastMessageRole || old.lastSnippet !== s.lastSnippet || old.lastActive !== s.lastActive;
+    }) || sessions.length !== _allSessions.length;
+    if (changed) { _allSessions = sessions; _renderSidebar(); refreshAttentionCounter(); if(window._updateFabCount)window._updateFabCount(); }
+  }).catch(()=>{});
+}, 15000);
 
 // AI TTS via server /tts endpoint (OpenAI tts-1 + disk cache). Preemptively warms cache
 // when new assistant messages arrive so tapping Read aloud plays instantly.

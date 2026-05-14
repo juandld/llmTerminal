@@ -250,6 +250,26 @@ app.get("/api/sessions", (req, res) => {
   s.sort((a, b) => (b.lastActive || 0) - (a.lastActive || 0));
   res.json(s);
 });
+
+// Full-text search across message bodies. Returns session IDs whose messages
+// contain the query. Frontend ORs this with title/project matching.
+app.get("/api/search", (req, res) => {
+  const q = (req.query.q || "").trim();
+  if (!q || q.length < 2) return res.json({ sessionIds: [] });
+  if (q.length > 200) return res.status(400).json({ error: "query too long" });
+  if (!db) return res.json({ sessionIds: [] });
+  try {
+    // LIKE escape: backslash quotes %, _, and \ itself.
+    const escaped = q.replace(/[\\%_]/g, "\\$&");
+    const rows = db
+      .prepare("SELECT DISTINCT session_id FROM messages WHERE data LIKE ? ESCAPE '\\' LIMIT 500")
+      .all(`%${escaped}%`);
+    res.json({ sessionIds: rows.map(r => r.session_id) });
+  } catch (e) {
+    console.error("[search] failed:", e.message);
+    res.status(500).json({ error: "search failed" });
+  }
+});
 app.delete("/api/sessions/:id", (req, res) => {
   saveSessions(loadSessions().filter(s => s.id !== req.params.id));
   deleteMessages(req.params.id);
@@ -287,6 +307,67 @@ app.post("/api/sessions/:id/state", express.json(), (req, res) => {
   }
   saveSessions(sessions);
   res.json({ ok: true, manualDone: s.manualDone || null });
+});
+
+// Sets lastViewed=now on a session. Frontend calls this when you open the
+// session so we can tell apart "you saw the assistant's reply" from "still
+// waiting on you to read it".
+app.post("/api/sessions/:id/viewed", (req, res) => {
+  const id = req.params.id;
+  const sessions = loadSessions();
+  const s = sessions.find(x => x.id === id);
+  if (!s) return res.status(404).json({ ok: false, error: "not found" });
+  s.lastViewed = Date.now();
+  saveSessions(sessions);
+  res.json({ ok: true, lastViewed: s.lastViewed });
+});
+
+// Records the Gmail thread ID after a successful send so the reply poller
+// can match inbound mail back to a session.
+app.post("/api/sessions/:id/email-sent", express.json(), (req, res) => {
+  const id = req.params.id;
+  const threadId = (req.body?.threadId || "").trim();
+  const account = (req.body?.account || "").trim();
+  if (!threadId) return res.status(400).json({ ok: false, error: "threadId required" });
+  const sessions = loadSessions();
+  const s = sessions.find(x => x.id === id);
+  if (!s) return res.status(404).json({ ok: false, error: "not found" });
+  s.gmailThreadId = threadId;
+  if (account) s.gmailAccount = account;
+  // Initial cursor — anything that arrives AFTER this counts as a new reply.
+  s.gmailLastSeenMs = Date.now();
+  saveSessions(sessions);
+  res.json({ ok: true });
+});
+
+// Reply detected on a tracked thread — pull the session back to the top.
+// Body: { fromEmail, subject, messageId, snippet, ts }
+app.post("/api/sessions/:id/reactivate", express.json(), (req, res) => {
+  const id = req.params.id;
+  const sessions = loadSessions();
+  const s = sessions.find(x => x.id === id);
+  if (!s) return res.status(404).json({ ok: false, error: "not found" });
+  const now = Date.now();
+  const from = (req.body?.fromEmail || "someone").trim();
+  const subject = (req.body?.subject || "").trim();
+  const snippet = (req.body?.snippet || "").trim().slice(0, 200);
+  const ts = Number(req.body?.ts) || now;
+  s.lastActive = ts;
+  s.lastMessageRole = "email_reply";
+  s.lastSnippet = `📬 Reply from ${from}` + (subject ? ` — ${subject}` : "");
+  s.gmailLastSeenMs = ts;
+  delete s.manualDone; // a reply un-marks any "done" state
+  saveSessions(sessions);
+  // Append a synthetic message so the chat view shows it.
+  try {
+    saveMessage(id, {
+      role: "email_reply",
+      ts,
+      text: `📬 Reply received from ${from}` + (subject ? ` — *${subject}*` : "") + (snippet ? `\n\n> ${snippet}` : ""),
+      fromEmail: from, subject, messageId: req.body?.messageId || null,
+    });
+  } catch (e) { console.error("[reactivate] saveMessage failed:", e.message); }
+  res.json({ ok: true });
 });
 
 
@@ -810,9 +891,21 @@ app.post("/api/email-draft/send", express.json(), (req, res) => {
   proc.stderr.on("data", c => { stderr += c.toString(); });
   proc.on("close", (code) => {
     if (code === 0) {
-      const m = stdout.match(/Message ID: (\\S+)/);
+      const m = stdout.match(/Message ID: (\S+)/);
+      const tm = stdout.match(/Thread ID:\s*([A-Za-z0-9_-]+)/);
       saveMessage(sessionId, { role: "email_sent", to, cc: cc || "", subject, account, message_id: m ? m[1] : null, ts: Date.now() });
-      res.json({ ok: true, message_id: m ? m[1] : null, account, output: stdout.slice(-2000) });
+      // Track the Gmail thread on the session so the reply poller can match replies.
+      try {
+        const sessions = loadSessions();
+        const ss = sessions.find(x => x.id === sessionId);
+        if (ss) {
+          if (tm) ss.gmailThreadId = tm[1];
+          ss.gmailAccount = account;
+          ss.gmailLastSeenMs = Date.now();
+          saveSessions(sessions);
+        }
+      } catch (e) { console.error("[email-draft/send] thread track failed:", e.message); }
+      res.json({ ok: true, message_id: m ? m[1] : null, thread_id: tm ? tm[1] : null, account, output: stdout.slice(-2000) });
     } else {
       // Surface the most useful line of the failure (BLOCKED [...] line) to the UI
       const blocked = stdout.match(/BLOCKED[^\n]+|WARNING[^\n]+/);
