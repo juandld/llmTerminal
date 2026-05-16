@@ -199,7 +199,7 @@ setTimeout(() => {
     const perms = sessionPermissions[session.id];
     killExistingClaudeFor(session.claudeSessionId);
     runClaude(
-      { project: session.project, prompt: lastUserMsg.text, claudeSessionId: session.claudeSessionId, cwd, extraAllowedTools: perms ? [...perms] : [], model: session.model },
+      { project: session.project, prompt: lastUserMsg.text, claudeSessionId: session.claudeSessionId, cwd, extraAllowedTools: perms ? [...perms] : [], model: session.model, sessionId: session.id },
       (data) => {
         if (data.type === "system" && data.subtype === "init" && data.session_id && !session.claudeSessionId) {
           session.claudeSessionId = data.session_id;
@@ -337,6 +337,37 @@ app.post("/api/sessions/:id/email-sent", express.json(), (req, res) => {
   // Initial cursor — anything that arrives AFTER this counts as a new reply.
   s.gmailLastSeenMs = Date.now();
   saveSessions(sessions);
+  res.json({ ok: true });
+});
+
+// Appends an assistant message to a session. Used by the llmterminal MCP
+// (llmt_complete with a summary) so the wrap-up shows up in the chat.
+// Loopback only — no auth, intended for MCP tools running locally.
+app.post("/api/sessions/:id/append-assistant", express.json(), (req, res) => {
+  const id = req.params.id;
+  const text = String(req.body?.text || "").trim();
+  if (!text) return res.status(400).json({ ok: false, error: "text required" });
+  const sessions = loadSessions();
+  const s = sessions.find(x => x.id === id);
+  if (!s) return res.status(404).json({ ok: false, error: "not found" });
+  const ts = Date.now();
+  try {
+    saveMessage(id, { role: "assistant", text, ts, source: "mcp_complete" });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "saveMessage failed: " + e.message });
+  }
+  s.lastActive = ts;
+  s.lastMessageRole = "assistant";
+  s.lastSnippet = text.slice(0, 200);
+  saveSessions(sessions);
+  // Push to any connected client so the chat redraws immediately.
+  try {
+    for (const client of wss.clients) {
+      if (client.readyState === 1 && client._llmSessionId === id) {
+        client.send(JSON.stringify({ type: "history", messages: loadMessages(id) }));
+      }
+    }
+  } catch {}
   res.json({ ok: true });
 });
 
@@ -1108,10 +1139,10 @@ function autoCreatePreview({ tool_name, input }, sessionId) {
 
 
 
-function autoDetectBashFiles(stdout, sessionId) {
-  const CAMOPATH = '/home/claude-user/projects/camoHero/';
+function autoDetectBashFiles(stdout, sessionId, cwd) {
   const EXT_TEXT = new Set(['.html','.htm','.md','.py','.json','.yaml','.yml','.csv','.txt']);
   const EXT_BIN  = new Set(['.pdf','.png','.jpg','.jpeg','.gif','.svg']);
+  const ALL_EXT_GROUP = '(?:html|htm|md|py|json|yaml|yml|csv|txt|pdf|png|jpg|jpeg|gif|svg)';
   const found = new Set();
   // Explicit PREVIEW: lines take priority
   for (const m of stdout.matchAll(/^PREVIEW:(.+)$/gm)) found.add(m[1].trim());
@@ -1120,6 +1151,22 @@ function autoDetectBashFiles(stdout, sessionId) {
     const p = m[0].replace(/[\)\]>,.;]+$/, '');
     const ext = require('path').extname(p).toLowerCase();
     if (EXT_TEXT.has(ext) || EXT_BIN.has(ext)) found.add(p);
+  }
+  // Scan for relative paths and resolve against the Bash cwd. Common case:
+  // `python3 -c "...write_pdf('invoices/SQ-001.pdf')"` prints `invoices/SQ-001.pdf`
+  // with no /home/... prefix. We only accept the path if (a) cwd is provided,
+  // (b) the resolved path is still under /home/claude-user/projects/, and
+  // (c) fs.existsSync confirms it. The existsSync gate kills false positives
+  // from random "foo/bar.py" strings in usage messages.
+  if (cwd && cwd.startsWith('/home/claude-user/projects/')) {
+    const relRe = new RegExp("(^|[\\s\\(\\[\\\"'`])([\\w.-]+(?:/[\\w.-]+)+\\." + ALL_EXT_GROUP + ")(?=[\\s\\)\\]\\\"'`,;:]|$)", 'gmi');
+    for (const m of stdout.matchAll(relRe)) {
+      const rel = m[2];
+      if (rel.startsWith('/') || rel.startsWith('..')) continue;
+      const abs = require('path').resolve(cwd, rel);
+      if (!abs.startsWith('/home/claude-user/projects/')) continue;
+      found.add(abs);
+    }
   }
   for (const filePath of found) {
     if (!fs.existsSync(filePath)) continue;
@@ -1415,10 +1462,10 @@ function generateSessionTitle(sessionId, userText, assistantText) {
 
 
 // ---- Run claude -p for a single message, stream JSON back ----
-function runClaude({ project, prompt, claudeSessionId, cwd, extraAllowedTools, model }, onData, onDone) {
+function runClaude({ project, prompt, claudeSessionId, cwd, extraAllowedTools, model, sessionId }, onData, onDone) {
   ensureProjectTrusted(project);
 
-  const SYSTEM_PROMPT_ADD = "When producing an email draft for david@crankwheel.com, you MUST call the mcp__crankhero-draft__draft_email tool rather than typing the draft inline. The tool validates format rules and produces a UI action card for one-tap paste on mobile. Prose drafts are strictly inferior UX.\n\nWhen presenting tabular data, ALWAYS use standard markdown pipe tables with a header row and separator row. Example:\n| Column A | Column B |\n| --- | --- |\n| value 1 | value 2 |\nNever use ASCII art tables, plain-text alignment, or code blocks for tabular data. The UI renders markdown tables as styled, mobile-friendly scrollable HTML tables.";
+  const SYSTEM_PROMPT_ADD = "When producing an email draft for david@crankwheel.com, you MUST call the mcp__crankhero-draft__draft_email tool rather than typing the draft inline. The tool validates format rules and produces a UI action card for one-tap paste on mobile. Prose drafts are strictly inferior UX.\n\nWhen presenting tabular data, ALWAYS use standard markdown pipe tables with a header row and separator row. Example:\n| Column A | Column B |\n| --- | --- |\n| value 1 | value 2 |\nNever use ASCII art tables, plain-text alignment, or code blocks for tabular data. The UI renders markdown tables as styled, mobile-friendly scrollable HTML tables.\n\nWhen you generate or modify a file the user may want to inspect (PDF, HTML, image, generated doc, invoice, report), call mcp__llmterminal__llmt_show_file with its absolute path so it appears in the user's preview drawer. Don't tell them \"can't render inline\" — pin the file instead.\n\nWhen you finish a discrete task the user asked for and there is nothing more to do unless they reply, call mcp__llmterminal__llmt_complete (optionally with a one-paragraph summary). This explicitly marks the session done so it drops out of the user's NEEDS YOU sidebar. Don't call it mid-task or while waiting on the user.";
   // Phase C: deny the hosted claude.ai Google MCPs project-wide. They
   // bypass the canonical data.* layer + use a different identity, leading
   // the agent to flail when answers don't match what data.* would give.
@@ -1442,9 +1489,13 @@ function runClaude({ project, prompt, claudeSessionId, cwd, extraAllowedTools, m
 
   const _wrap = _bwrapWrap(project, args);
   if (project === "camoHero") console.log("[sandbox] spawning camoHero in bwrap");
+  const childEnv = { HOME: "/home/claude-user", TERM: "dumb", LANG: "en_US.UTF-8", PATH: process.env.PATH };
+  // LLMT_SESSION_ID is read by the llmterminal MCP server so its tools
+  // (llmt_show_file, llmt_complete) know which session to update.
+  if (sessionId) childEnv.LLMT_SESSION_ID = sessionId;
   const proc = spawn(_wrap.cmd, _wrap.args, {
     cwd,
-    env: { HOME: "/home/claude-user", TERM: "dumb", LANG: "en_US.UTF-8", PATH: process.env.PATH },
+    env: childEnv,
     uid: 1000,
     gid: 1000,
     stdio: ["ignore", "pipe", "pipe"],
@@ -1546,9 +1597,13 @@ wss.on("connection", (ws, req) => {
     const pendingPreviews = {}; // tool_use_id -> {tool_name, input}
     const pendingDrafts = new Set(); // tool_use_id awaiting draft payload
     let seenQuestionSig = null;
+    // Track whether the run produced a final result (assistant reply) or an
+    // explicit api_error. If neither happens before the process closes, the
+    // session is stuck on tool_activity — we save a synthetic marker in onDone.
+    let gotResult = false;
     killExistingClaudeFor(session.claudeSessionId);
     activeProc = runClaude(
-      { project: session.project, prompt: fullPrompt, claudeSessionId: session.claudeSessionId, cwd, extraAllowedTools, model: session.model },
+      { project: session.project, prompt: fullPrompt, claudeSessionId: session.claudeSessionId, cwd, extraAllowedTools, model: session.model, sessionId: session.id },
       (data) => {
         if (data.type === "system" && data.subtype === "init") {
           if (data.session_id && !session.claudeSessionId) {
@@ -1573,6 +1628,14 @@ wss.on("connection", (ws, req) => {
                 // Track Bash so we can scan stdout for generated file paths
                 if (block.name === "Bash") {
                   pendingPreviews[block.id] = { tool_name: "Bash", input: block.input };
+                }
+                // Read on a project-dir file: register a preview immediately from
+                // the tool_use input. Read's tool_result returns the file CONTENT,
+                // not the path, so the existing tool_result path-scan misses it.
+                // Reusing autoDetectBashFiles handles binary files (PDF/PNG) correctly.
+                if (block.name === "Read" && typeof block.input?.file_path === "string"
+                    && block.input.file_path.startsWith("/home/claude-user/projects/")) {
+                  autoDetectBashFiles(block.input.file_path, session.id, path.join(PROJECTS_DIR, session.project));
                 }
                 // Track draft_email so we forward the result as a special message
                 if (block.name === "mcp__crankhero-draft__draft_email") {
@@ -1614,7 +1677,7 @@ wss.on("connection", (ws, req) => {
               if (!block.is_error) {
                 if (pending.tool_name === "Bash") {
                   const stdout = Array.isArray(block.content) ? (block.content[0]?.text || "") : String(block.content || "");
-                  autoDetectBashFiles(stdout, session.id);
+                  autoDetectBashFiles(stdout, session.id, path.join(PROJECTS_DIR, session.project));
                 } else {
                   autoCreatePreview(pending, session.id);
                 }
@@ -1627,7 +1690,7 @@ wss.on("connection", (ws, req) => {
               try {
                 const txt = Array.isArray(block.content) ? (block.content[0]?.text || "") : String(block.content || "");
                 if (txt && /\/home\/claude-user\/projects\//.test(txt)) {
-                  autoDetectBashFiles(txt, session.id);
+                  autoDetectBashFiles(txt, session.id, path.join(PROJECTS_DIR, session.project));
                 }
               } catch {}
               // Sentinel for the original if (don't re-process the close brace below)
@@ -1701,6 +1764,7 @@ wss.on("connection", (ws, req) => {
           const result = data.result || "";
           const apiErrorMatch = /API Error:\s*(\d{3})\b[\s\S]*?(request_id"\s*:\s*"([^"]+)")?/.exec(result);
           const isApiError = /^API Error:\s*\d{3}/.test(result);
+          gotResult = true;
           if (isApiError) {
             const statusCode = apiErrorMatch ? apiErrorMatch[1] : "";
             const requestId = apiErrorMatch ? (apiErrorMatch[3] || "") : "";
@@ -1770,6 +1834,22 @@ wss.on("connection", (ws, req) => {
         }
         if (code !== 0 && stderr) {
           try { ws.send(JSON.stringify({ type: "error", message: stderr.slice(0, 500) })); } catch {}
+        }
+        // Stalled-run guard: process closed but no result/api_error ever came.
+        // Save a synthetic marker so the persisted state isn't stuck on
+        // tool_activity forever (which makes the sidebar show "working").
+        if (!gotResult) {
+          const msgs2 = loadMessages(session.id);
+          const last = msgs2.length ? msgs2[msgs2.length - 1] : null;
+          const stuckRoles = new Set(["tool_activity", "tool_result", "permission_granted"]);
+          if (last && stuckRoles.has(last.role)) {
+            const note = code === 0
+              ? "⚠️ The agent stopped mid-run without producing a final response. Re-prompt to continue."
+              : "⚠️ The agent process exited (code " + code + ") before producing a final response. Re-prompt to retry.";
+            saveMessage(session.id, { role: "assistant", text: note, ts: Date.now(), recovered: true, stalled: true });
+            try { ws.send(JSON.stringify({ type: "history", messages: loadMessages(session.id) })); } catch {}
+            console.log("[stalled-run]", session.id, "no result; saved marker (code=" + code + ")");
+          }
         }
         try { ws.send(JSON.stringify({ type: "idle" })); } catch {}
       }
