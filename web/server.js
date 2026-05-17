@@ -1458,6 +1458,172 @@ ${lines}`;
   }
 }
 
+// ── Decision extractor (supervisor-pattern observer #2) ──
+// Workers don't self-instrument their decisions — they shouldn't have to.
+// Instead, after each run a separate cheap Haiku call reads the recent
+// transcript and extracts decisions the worker made: forks where it picked
+// between alternatives and closed off paths. Records each via the same
+// /api/sessions/:id/decisions endpoint with mined=true so the user knows
+// these are extracted, not explicitly declared.
+const _decisionExtractorLastRun = {};   // sessionId -> ts of last extractor run
+const _decisionHighWaterTs      = {};   // sessionId -> last ts we extracted past
+const DECISION_EXTRACTOR_COOLDOWN_MS = 30000;
+const DECISION_EXTRACTOR_MIN_MESSAGES = 4;
+
+function spawnDecisionExtractor(sessionId, projectName) {
+  try {
+    if (!sessionId) return;
+    const now = Date.now();
+    if (_decisionExtractorLastRun[sessionId] && (now - _decisionExtractorLastRun[sessionId]) < DECISION_EXTRACTOR_COOLDOWN_MS) return;
+    _decisionExtractorLastRun[sessionId] = now;
+
+    const all = loadMessages(sessionId);
+    if (all.length < DECISION_EXTRACTOR_MIN_MESSAGES) return;
+
+    // Only consider messages newer than the last extraction high-water mark.
+    const hwm = _decisionHighWaterTs[sessionId] || 0;
+    const recent = all.filter(m => (m.ts || 0) > hwm).slice(-40);
+    if (recent.length < 2) return;
+
+    const lines = recent.map(m => {
+      const r = (m.role || "").toUpperCase();
+      let t = m.text || m.summary || "";
+      if (r === "TOOL_ACTIVITY") {
+        // Keep tool activity but truncate hard
+        t = `(${m.tool_name || "tool"}) ${t}`.slice(0, 200);
+      } else {
+        t = String(t).slice(0, 800);
+      }
+      if (!t) return null;
+      return `${r}: ${t}`;
+    }).filter(Boolean).join("\n\n");
+    if (lines.length < 80) return;
+
+    // Pull last few already-recorded decisions for dedup hint.
+    let prevSummary = "";
+    try {
+      const prev = db.prepare("SELECT summary, chose FROM decisions WHERE session_id = ? ORDER BY ts DESC LIMIT 8").all(sessionId);
+      if (prev.length) {
+        prevSummary = "\nAlready recorded (DO NOT duplicate these):\n" + prev.map(p => `  - ${p.summary} → chose: ${p.chose}`).join("\n");
+      }
+    } catch {}
+
+    const prompt = `You are a supervisor agent observing a chat between a user and a worker agent. Your sole job is to identify DECISIONS the worker made and record them — the worker does NOT do this itself.
+
+A decision is a moment where the agent:
+  - chose between named alternatives (architecture, dependency, schema, file restructure)
+  - bypassed or weakened a constraint
+  - paused to ask the user instead of acting
+  - reversed a previous direction
+
+Skip:
+  - routine tool calls (one Read, one Bash)
+  - obvious mechanical steps (renaming a variable consistently)
+  - things already in the "Already recorded" list
+
+Output JSON ONLY (no prose, no markdown fences):
+{"decisions":[{"summary":"one-line headline (verb phrase)","chose":"the option taken","alternatives":["option a","option b"],"why":"specific reasoning","constraints":["..."],"cost":"what was given up","status":"pending|verified|reversed"}]}
+
+If nothing notable: {"decisions":[]}
+
+Rules:
+  - summary <= 14 words, verb-first ("Use ...", "Pause ...", "Defer ...")
+  - alternatives: at minimum the one or two clear other paths that were closed off
+  - why: cite the specific constraint or risk (no platitudes)
+  - status: 'verified' if the chosen path demonstrably worked (commit landed, test passed, user accepted), 'reversed' if undone, 'pending' otherwise
+  - max 3 decisions per call
+
+${prevSummary}
+
+Recent conversation (NEWEST AT BOTTOM):
+${lines}`;
+
+    console.log("[decision-extractor] firing for", sessionId, "(", recent.length, "msgs )");
+    const args = [
+      "-p", prompt,
+      "--model", "haiku",
+      "--output-format", "json",
+      "--dangerously-skip-permissions",
+      "--disallowedTools", "Bash", "Read", "Write", "Edit", "Glob", "Grep", "Agent", "NotebookEdit", "MultiEdit", "WebFetch", "WebSearch",
+    ];
+    const proc = spawn("/usr/bin/claude", args, {
+      env: { HOME: "/home/claude-user", PATH: process.env.PATH, LANG: "en_US.UTF-8" },
+      uid: 1000, gid: 1000,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "", err = "";
+    proc.stdout.on("data", c => out += c);
+    proc.stderr.on("data", c => err += c);
+    const timer = setTimeout(() => { try { proc.kill("SIGTERM"); } catch {} }, 45000);
+    proc.on("close", async () => {
+      clearTimeout(timer);
+      try {
+        const wrap = JSON.parse(out);
+        const text = (wrap.result || wrap.text || out).toString();
+        const json = text.replace(/^```(?:json)?\s*|\s*```$/g, "").trim();
+        const parsed = JSON.parse(json);
+        const decisions = Array.isArray(parsed.decisions) ? parsed.decisions : [];
+        if (!decisions.length) { console.log("[decision-extractor]", sessionId, "→ none"); _decisionHighWaterTs[sessionId] = recent[recent.length - 1].ts || now; return; }
+        for (const d of decisions) {
+          const body = {
+            summary: String(d.summary || "").trim(),
+            chose:   String(d.chose   || "").trim(),
+            alternatives: Array.isArray(d.alternatives) ? d.alternatives.map(String) : [],
+            why:     String(d.why || "").trim(),
+            constraints: Array.isArray(d.constraints) ? d.constraints.map(String) : [],
+            cost:    d.cost ? String(d.cost).trim() : null,
+            mined:   true,
+          };
+          if (!body.summary || !body.chose) continue;
+          // POST to ourselves over loopback
+          const post = JSON.stringify(body);
+          const req = http.request({
+            hostname: "127.0.0.1", port: 7683,
+            path: `/api/sessions/${encodeURIComponent(sessionId)}/decisions`,
+            method: "POST",
+            headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(post) },
+          }, (res) => {
+            let buf = "";
+            res.on("data", c => buf += c);
+            res.on("end", () => {
+              if (res.statusCode >= 200 && res.statusCode < 300) {
+                try {
+                  const j = JSON.parse(buf);
+                  const id = j.decision?.id;
+                  // If the supervisor classified status as verified/reversed up front, apply it.
+                  const status = (d.status === "verified" || d.status === "reversed") ? d.status : null;
+                  if (id && status) {
+                    const upd = JSON.stringify({ status });
+                    const r2 = http.request({
+                      hostname: "127.0.0.1", port: 7683,
+                      path: `/api/decisions/${id}/status`,
+                      method: "POST",
+                      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(upd) },
+                    });
+                    r2.on("error", () => {});
+                    r2.write(upd); r2.end();
+                  }
+                  console.log("[decision-extractor]", sessionId, "→ #" + id, body.summary.slice(0, 60));
+                } catch {}
+              } else {
+                console.warn("[decision-extractor] POST failed:", res.statusCode, buf.slice(0, 200));
+              }
+            });
+          });
+          req.on("error", e => console.warn("[decision-extractor] POST error:", e.message));
+          req.write(post); req.end();
+        }
+        _decisionHighWaterTs[sessionId] = recent[recent.length - 1].ts || now;
+      } catch (e) {
+        console.warn("[decision-extractor] parse failed:", e.message, "stderr:", err.slice(0, 200));
+      }
+    });
+    proc.on("error", e => console.error("[decision-extractor] spawn error:", e.message));
+  } catch (e) {
+    console.error("[decision-extractor] outer error:", e.message);
+  }
+}
+
 // Drain the next queued prompt for a session. Called when:
 //   - an active claude run finishes (in sendToSession's onDone)
 //   - a fresh voice-note transcript arrives and we want to fire it ASAP
@@ -1621,7 +1787,7 @@ function generateSessionTitle(sessionId, userText, assistantText) {
 function runClaude({ project, prompt, claudeSessionId, cwd, extraAllowedTools, model, sessionId }, onData, onDone) {
   ensureProjectTrusted(project);
 
-  const SYSTEM_PROMPT_ADD = "When producing an email draft for david@crankwheel.com, you MUST call the mcp__crankhero-draft__draft_email tool rather than typing the draft inline. The tool validates format rules and produces a UI action card for one-tap paste on mobile. Prose drafts are strictly inferior UX.\n\nWhen presenting tabular data, ALWAYS use standard markdown pipe tables with a header row and separator row. Example:\n| Column A | Column B |\n| --- | --- |\n| value 1 | value 2 |\nNever use ASCII art tables, plain-text alignment, or code blocks for tabular data. The UI renders markdown tables as styled, mobile-friendly scrollable HTML tables.\n\nWhen you generate or modify a file the user may want to inspect (PDF, HTML, image, generated doc, invoice, report), call mcp__llmterminal__llmt_show_file with its absolute path so it appears in the user's preview drawer. Don't tell them \"can't render inline\" — pin the file instead.\n\nWhen you finish a discrete task the user asked for and there is nothing more to do unless they reply, call mcp__llmterminal__llmt_complete (optionally with a one-paragraph summary). This explicitly marks the session done so it drops out of the user's NEEDS YOU sidebar. Don't call it mid-task or while waiting on the user.\n\nBefore taking a significant action — choosing between architectural alternatives, picking a dependency, designing a schema, deleting or restructuring files, bypassing a constraint, or pausing for user input rather than acting yourself — call mcp__llmterminal__llmt_decide to record the choice. Pass `summary` (one line), `chose` (the option taken), `alternatives` (other options you considered), `why` (the reasoning), and optionally `constraints` and `cost` (what you gave up). When the gate that justified the decision later passes or fails (commit landed, test ran, container restarted, user replied), call mcp__llmterminal__llmt_decide_resolve with the decision id and status `verified` or `reversed`, with an `artifact` (commit SHA, URL, test output line). This builds the user's decision timeline — make those forks visible instead of buried in conversation.";
+  const SYSTEM_PROMPT_ADD = "When producing an email draft for david@crankwheel.com, you MUST call the mcp__crankhero-draft__draft_email tool rather than typing the draft inline. The tool validates format rules and produces a UI action card for one-tap paste on mobile. Prose drafts are strictly inferior UX.\n\nWhen presenting tabular data, ALWAYS use standard markdown pipe tables with a header row and separator row. Example:\n| Column A | Column B |\n| --- | --- |\n| value 1 | value 2 |\nNever use ASCII art tables, plain-text alignment, or code blocks for tabular data. The UI renders markdown tables as styled, mobile-friendly scrollable HTML tables.\n\nWhen you generate or modify a file the user may want to inspect (PDF, HTML, image, generated doc, invoice, report), call mcp__llmterminal__llmt_show_file with its absolute path so it appears in the user's preview drawer. Don't tell them \"can't render inline\" — pin the file instead.\n\nWhen you finish a discrete task the user asked for and there is nothing more to do unless they reply, call mcp__llmterminal__llmt_complete (optionally with a one-paragraph summary). This explicitly marks the session done so it drops out of the user's NEEDS YOU sidebar. Don't call it mid-task or while waiting on the user.";
   // Phase C: deny the hosted claude.ai Google MCPs project-wide. They
   // bypass the canonical data.* layer + use a different identity, leading
   // the agent to flail when answers don't match what data.* would give.
@@ -1912,6 +2078,7 @@ wss.on("connection", (ws, req) => {
           setTimeout(() => { try { tryDrainQueue(session.id); } catch (e) { console.error("[queue] drain after result failed:", e.message); } }, 50);
           // Fire-and-forget observer: read recent messages, identify unaddressed asks, register as tasks
           setTimeout(() => { try { spawnObserver(session.id, session.project); } catch (e) { console.error("[observer] hook failed:", e.message); } }, 500);
+          setTimeout(() => { try { spawnDecisionExtractor(session.id, session.project); } catch (e) { console.error("[decision-extractor] hook failed:", e.message); } }, 800);
           if (!session.claudeSessionId && data.session_id) {
             session.claudeSessionId = data.session_id;
             saveSessions(loadSessions().map(s => s.id === session.id ? session : s));
