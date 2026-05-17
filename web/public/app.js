@@ -274,7 +274,13 @@ function computeSessionState(s) {
   // Non-email: manualDone means done
   if (s.manualDone) return "done";
   if (role === "question" || role === "permission_denied") return "blocked";
-  if (role === "user" || role === "tool_activity" || role === "tool_result" || role === "permission_granted") return "working";
+  // "working" rolls of activity bumps lastActive on each tool_use/tool_result the
+  // CLI streams. If we've gone >5 min without any bump, the claude process
+  // almost certainly died mid-run — surface as "stalled" so it stops looking
+  // like it's still thinking.
+  if (role === "user" || role === "tool_activity" || role === "tool_result" || role === "permission_granted") {
+    return ageMin > 5 ? "stalled" : "working";
+  }
   // Responded: if you've opened the session after the assistant's last message
   // and let it sit ≥30 min, it auto-flips to done. Otherwise stays "responded"
   // until the 3-day fallback. Reply detection bumps lastActive past lastViewed,
@@ -287,34 +293,55 @@ function computeSessionState(s) {
   }
   return "";
 }
+// Pending optimistic updates kept across loadSessions() roundtrips so a slow
+// server response doesn't wipe instant UI feedback.
+const _pendingViewed = new Map();  // sessionId -> ts
+const _pendingDone   = new Map();  // sessionId -> ts
+function _applyPendingToList(list) {
+  for (const [id, ts] of _pendingViewed) {
+    const s = list.find(x => x.id === id);
+    if (s && (s.lastViewed || 0) < ts) s.lastViewed = ts;
+  }
+  for (const [id, ts] of _pendingDone) {
+    const s = list.find(x => x.id === id);
+    if (s && !s.manualDone) s.manualDone = ts;
+  }
+}
 function markSessionViewed(sessionId) {
   if (!sessionId) return;
-  fetch(apiUrl("/api/sessions/" + sessionId + "/viewed"), { method: "POST" })
-    .then(() => { /* server bumped lastViewed; sidebar refresh next loadSessions catches it */ })
-    .catch(() => {});
-  // Optimistic local update so the sidebar reflects immediately.
+  const now = Date.now();
+  _pendingViewed.set(sessionId, now);
   const local = _allSessions.find(x => x.id === sessionId);
-  if (local) { local.lastViewed = Date.now(); _renderSidebar(); }
+  if (local) local.lastViewed = now;
+  _renderSidebar();
+  fetch(apiUrl("/api/sessions/" + sessionId + "/viewed"), { method: "POST" })
+    .then(() => { _pendingViewed.delete(sessionId); })
+    .catch(() => {});
 }
 function markSessionDone(sessionId) {
   if (!sessionId) return;
+  const now = Date.now();
+  _pendingDone.set(sessionId, now);
+  const local = _allSessions.find(x => x.id === sessionId);
+  if (local) local.manualDone = now;
+  _renderSidebar();
   fetch(apiUrl("/api/sessions/" + sessionId + "/state"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ manualDone: true }),
-  }).then(() => loadSessions()).catch(() => {});
-  // Optimistic — flip locally so it drops out of NEEDS YOU immediately.
-  const local = _allSessions.find(x => x.id === sessionId);
-  if (local) { local.manualDone = Date.now(); _renderSidebar(); }
+  })
+  .then(() => { _pendingDone.delete(sessionId); loadSessions(); })
+  .catch(() => {});
 }
 const STATE_ICONS = {
   blocked:   "❗",       // ❗
   decision:  "⚡",       // ⚡
+  stalled:   "⚠️",       // process exited mid-run, no final response
   responded: "✓",       // ✓
   working:   "⏳",       // ⏳
   done:      "✅",       // ✅
 };
-const STATE_PRIORITY = { blocked: 0, decision: 1, responded: 2, working: 3, done: 4 };
+const STATE_PRIORITY = { blocked: 0, decision: 1, stalled: 1.5, responded: 2, working: 3, done: 4 };
 
 
 // Round-robin through sessions that need attention. Tap = jump to next.
@@ -322,7 +349,7 @@ function attentionSessionsList() {
   return (_allSessions || [])
     .filter(s => !s.archived)
     .map(s => ({ s, st: computeSessionState(s) }))
-    .filter(({st}) => st === "blocked" || st === "decision" || st === "responded")
+    .filter(({st}) => st === "blocked" || st === "decision" || st === "stalled" || st === "responded")
     .sort((a, b) => {
       if (STATE_PRIORITY[a.st] !== STATE_PRIORITY[b.st]) return STATE_PRIORITY[a.st] - STATE_PRIORITY[b.st];
       return (b.s.lastActive || 0) - (a.s.lastActive || 0);
@@ -420,10 +447,11 @@ function makeSbItem(x, currentProject) {
     ti.appendChild(snip);
   }
   d.appendChild(ti);
-  // \u2713 button: mark a "responded" session done without waiting for the 30-min timer.
-  // Only shown when state==responded \u2014 hidden for blocked/decision/working/done.
-  if (state === "responded") {
-    const okb = mk("button", "sb-done-btn"); okb.textContent = "\u2713"; okb.title = "Mark done";
+  // \u2713 button: mark a "responded" or "stalled" session done without further fuss.
+  // Hidden for blocked/decision/working/done (those need real action, not dismissal).
+  if (state === "responded" || state === "stalled") {
+    const okb = mk("button", "sb-done-btn"); okb.textContent = "\u2713";
+    okb.title = state === "stalled" ? "Dismiss (claude process exited without responding)" : "Mark done";
     okb.onclick = (e) => { e.stopPropagation(); markSessionDone(x.id); };
     d.appendChild(okb);
   }
@@ -496,6 +524,8 @@ function renderProjectGroup(projectName, items, parent, forceExpand) {
 }
 async function loadSessions() {
   _allSessions = await fetch(apiUrl("/api/sessions?project=ALL")).then(r => r.json());
+  // Re-apply optimistic updates that may have raced the fetch.
+  _applyPendingToList(_allSessions);
   _renderSidebar();
 }
 function _renderSidebar() {
@@ -529,7 +559,7 @@ function _renderSidebar() {
   const doneItems      = [];  // done — collapsed at bottom
   active.forEach(s => {
     const st = computeSessionState(s);
-    if (st === "blocked" || st === "decision") attentionItems.push(s);
+    if (st === "blocked" || st === "decision" || st === "stalled") attentionItems.push(s);
     else if (st === "done") doneItems.push(s);
     else progressItems.push(s);
   });
@@ -1122,6 +1152,12 @@ function addAssistant(text, opts){
   const d=mk("div","msg assistant");
   const b=mk("div","bubble");
   b.innerHTML=fmt(text);
+  // Speaker button for quick TTS access (inside bubble for correct positioning)
+  const ttsBtn=mk("button","msg-tts-btn");
+  ttsBtn.textContent="\u{1F50A}";
+  ttsBtn.title="Read aloud";
+  ttsBtn.onclick=(e)=>{ e.stopPropagation(); playTts(bubbleText(d)); };
+  b.appendChild(ttsBtn);
   d.appendChild(b);
   const liveTs=Date.now();
   d.dataset.ts=liveTs;
@@ -1605,6 +1641,206 @@ function toggleDrawer(){
   if(!dw.classList.contains("hidden")){
     try{refreshPreviews(false);}catch{}
   }
+}
+
+// ── Decisions drawer (timeline / tree of agent decisions) ──
+let _decisions = [];
+let _decisionsView  = (function(){try{return localStorage.getItem("llmt_decisions_view")||"timeline"}catch{return "timeline"}})();
+let _decisionsScope = (function(){try{return localStorage.getItem("llmt_decisions_scope")||"session"}catch{return "session"}})();
+const _decisionsExpanded = new Set();
+
+function _bumpDecisionsViewCount(view){
+  try {
+    const k = "llmt_decisions_view_count_" + view;
+    const n = (parseInt(localStorage.getItem(k) || "0", 10) || 0) + 1;
+    localStorage.setItem(k, String(n));
+  } catch {}
+}
+
+function toggleDecisionsDrawer(){
+  const dw = document.getElementById("decisionsDrawer");
+  if (!dw) return;
+  dw.classList.toggle("hidden");
+  const open = !dw.classList.contains("hidden");
+  try{ localStorage.setItem("llmt_decisions_open", String(open)) }catch{}
+  if (open) {
+    _syncDecisionsFilterButtons();
+    _bumpDecisionsViewCount(_decisionsView);
+    loadDecisions();
+  }
+}
+
+function setDecisionsView(view){
+  if (view !== "timeline" && view !== "tree") return;
+  _decisionsView = view;
+  try{ localStorage.setItem("llmt_decisions_view", view) }catch{}
+  _bumpDecisionsViewCount(view);
+  _syncDecisionsFilterButtons();
+  renderDecisions();
+}
+
+function setDecisionsScope(scope){
+  if (scope !== "session" && scope !== "project") return;
+  _decisionsScope = scope;
+  try{ localStorage.setItem("llmt_decisions_scope", scope) }catch{}
+  _syncDecisionsFilterButtons();
+  loadDecisions();
+}
+
+function _syncDecisionsFilterButtons(){
+  document.querySelectorAll("#decisionsFilters [data-dv]").forEach(b => b.classList.toggle("active", b.dataset.dv === _decisionsView));
+  document.querySelectorAll("#decisionsFilters [data-dv-scope]").forEach(b => b.classList.toggle("active", b.dataset.dvScope === _decisionsScope));
+}
+
+async function loadDecisions(){
+  const list = document.getElementById("decisionsList");
+  if (!list) return;
+  let url;
+  if (_decisionsScope === "project") {
+    if (!session || !session.project) {
+      list.innerHTML = '<div class="drawer-empty">No project selected</div>';
+      return;
+    }
+    url = apiUrl("/api/projects/" + encodeURIComponent(session.project) + "/decisions");
+  } else {
+    if (!session || !session.id) {
+      list.innerHTML = '<div class="drawer-empty">Open a chat first</div>';
+      return;
+    }
+    url = apiUrl("/api/sessions/" + session.id + "/decisions");
+  }
+  try {
+    const r = await fetch(url);
+    const data = await r.json();
+    _decisions = Array.isArray(data.decisions) ? data.decisions : [];
+  } catch (e) {
+    _decisions = [];
+    list.innerHTML = '<div class="drawer-empty">Failed to load decisions</div>';
+    return;
+  }
+  renderDecisions();
+}
+
+function renderDecisions(){
+  const list = document.getElementById("decisionsList");
+  const cnt  = document.getElementById("decisionsCount");
+  if (!list) return;
+  if (cnt) cnt.textContent = _decisions.length ? String(_decisions.length) : "";
+  if (!_decisions.length) {
+    list.innerHTML = '<div class="drawer-empty">No decisions recorded yet. Agents call <code>llmt_decide</code> to add them.</div>';
+    return;
+  }
+  if (_decisionsView === "tree") {
+    list.innerHTML = _renderTreeHtml(_decisions);
+  } else {
+    list.innerHTML = _renderTimelineHtml(_decisions);
+  }
+  // Wire expand toggles
+  list.querySelectorAll(".dec-row").forEach(row => {
+    row.addEventListener("click", (e) => {
+      if (e.target.closest("a") || e.target.closest("button")) return;
+      const id = row.dataset.did;
+      if (_decisionsExpanded.has(id)) _decisionsExpanded.delete(id);
+      else _decisionsExpanded.add(id);
+      renderDecisions();
+    });
+  });
+}
+
+function _decStatusClass(s){ return "dec-status-" + (s || "pending"); }
+function _decStatusIcon(s){
+  return s === "verified" ? "✓"
+       : s === "reversed" ? "↺"
+       : s === "mined"    ? "~"
+       : "•";
+}
+function _decRelTime(ts){
+  const now = Date.now();
+  const dMin = Math.max(0, (now - ts) / 60000);
+  if (dMin < 1) return "just now";
+  if (dMin < 60) return Math.floor(dMin) + "m ago";
+  if (dMin < 24*60) return Math.floor(dMin/60) + "h ago";
+  return Math.floor(dMin/(24*60)) + "d ago";
+}
+function _escD(s){ return String(s||"").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])); }
+
+function _renderDecisionRow(d, depth){
+  const id = String(d.id);
+  const expanded = _decisionsExpanded.has(id);
+  const indent = depth ? `style="margin-left:${depth * 18}px"` : "";
+  const stClass = _decStatusClass(d.status);
+  const ic = _decStatusIcon(d.status);
+  let body = "";
+  if (expanded) {
+    const alts = Array.isArray(d.alternatives) && d.alternatives.length
+      ? d.alternatives.map(a => `<li>${_escD(a)}</li>`).join("")
+      : "<li class=\"dec-empty\">(none recorded)</li>";
+    const cons = Array.isArray(d.constraints) && d.constraints.length
+      ? `<div class="dec-section"><div class="dec-label">Constraints</div><ul>${d.constraints.map(c => `<li>${_escD(c)}</li>`).join("")}</ul></div>`
+      : "";
+    const cost = d.cost ? `<div class="dec-section"><div class="dec-label">Cost</div><div>${_escD(d.cost)}</div></div>` : "";
+    let arts = "";
+    if (d.artifacts) {
+      try {
+        const parts = [];
+        for (const [k, v] of Object.entries(d.artifacts)) {
+          if (Array.isArray(v)) parts.push(`<li><b>${_escD(k)}:</b><ul>${v.map(x => `<li>${_escD(x)}</li>`).join("")}</ul></li>`);
+          else parts.push(`<li><b>${_escD(k)}:</b> ${_escD(typeof v === "string" ? v : JSON.stringify(v))}</li>`);
+        }
+        if (parts.length) arts = `<div class="dec-section"><div class="dec-label">Artifacts</div><ul>${parts.join("")}</ul></div>`;
+      } catch {}
+    }
+    const mined = d.mined ? ` <span class="dec-mined" title="Auto-extracted, lower confidence">mined</span>` : "";
+    body = `
+      <div class="dec-detail">
+        <div class="dec-section"><div class="dec-label">Chose</div><div>${_escD(d.chose)}</div></div>
+        <div class="dec-section"><div class="dec-label">Alternatives</div><ul>${alts}</ul></div>
+        <div class="dec-section"><div class="dec-label">Why</div><div>${_escD(d.why || "")}</div></div>
+        ${cons}${cost}${arts}
+        <div class="dec-meta">#${id} · ${_escD(d.status)}${mined}</div>
+      </div>`;
+  }
+  return `<div class="dec-row" data-did="${id}" ${indent}>
+    <div class="dec-headline">
+      <span class="dec-dot ${stClass}" title="${_escD(d.status)}">${ic}</span>
+      <div class="dec-title">${_escD(d.summary)}</div>
+      <div class="dec-when">${_decRelTime(d.ts)}</div>
+    </div>
+    ${body}
+  </div>`;
+}
+
+function _renderTimelineHtml(decisions){
+  // Newest first feels more useful — recent forks are what you usually want to find.
+  const sorted = [...decisions].sort((a,b) => (b.ts||0) - (a.ts||0));
+  return sorted.map(d => _renderDecisionRow(d, 0)).join("");
+}
+
+function _renderTreeHtml(decisions){
+  const byParent = new Map();
+  for (const d of decisions) {
+    const p = d.parent_id == null ? "ROOT" : String(d.parent_id);
+    if (!byParent.has(p)) byParent.set(p, []);
+    byParent.get(p).push(d);
+  }
+  for (const arr of byParent.values()) arr.sort((a,b) => (a.ts||0) - (b.ts||0));
+  const out = [];
+  function walk(parentKey, depth) {
+    const kids = byParent.get(parentKey) || [];
+    for (const d of kids) {
+      out.push(_renderDecisionRow(d, depth));
+      walk(String(d.id), depth + 1);
+    }
+  }
+  walk("ROOT", 0);
+  // Orphans (parent_id points at a decision not in this list — e.g. project view with truncation)
+  const known = new Set(decisions.map(d => String(d.id)));
+  for (const d of decisions) {
+    if (d.parent_id != null && !known.has(String(d.parent_id))) {
+      // already handled above only if parent is missing AND we haven't rendered yet
+    }
+  }
+  return out.join("") || '<div class="drawer-empty">No decisions to render</div>';
 }
 
 // ── Audio Review Tool ──
@@ -2771,17 +3007,74 @@ setInterval(()=>{
   }).catch(()=>{});
 }, 15000);
 
-// AI TTS via server /tts endpoint (OpenAI tts-1 + disk cache). Preemptively warms cache
-// when new assistant messages arrive so tapping Read aloud plays instantly.
-const TTS_MAX_CHARS = 4000;
+// AI TTS via server /tts endpoint (OpenAI tts-1 + disk cache). Chunked playback:
+// splits long messages into ~1000-char segments at sentence boundaries, starts
+// playing chunk 0 while the rest are fetched. YouTube-style buffer bar shows progress.
+const TTS_CHUNK_TARGET = 1000;
 const ttsBlobCache = new Map(); // text -> blob URL
 const ttsPending = new Map();   // text -> Promise<blob URL>
 
 function ttsTextKey(t){ return t.length + ":" + t.substring(0, 200) + "|" + t.substring(Math.max(0, t.length-100)); }
 
+function splitTtsChunks(text){
+  if(!text) return [];
+  // Strip code blocks, image markdown, HTML tags, markdown formatting
+  let t = text.replace(/```[\s\S]*?```/g, " [code block] ")
+              .replace(/`[^`]+`/g, m => m.slice(1,-1))  // inline code: keep text
+              .replace(/!\[.*?\]\(.*?\)/g, "")
+              .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")   // links: keep text
+              .replace(/<[^>]+>/g, " ")
+              .replace(/^#{1,6}\s+/gm, "")                // strip heading markers
+              .replace(/^\s*[-*+]\s+/gm, ". ")            // bullets → sentence breaks
+              .replace(/^\s*\d+\.\s+/gm, ". ")            // numbered lists → sentence breaks
+              .replace(/\*\*|__/g, "")                     // bold markers
+              .replace(/[*_]/g, "")                        // italic markers
+              .replace(/\n{2,}/g, ".\n")                   // paragraph breaks → sentence break
+              .replace(/\s+/g, " ").trim();
+  if(!t) return [];
+  if(t.length <= TTS_CHUNK_TARGET) return [t];
+  // Split at sentence boundaries: .!?;: followed by whitespace
+  const sentences = [];
+  let buf = "";
+  for(let i = 0; i < t.length; i++){
+    buf += t[i];
+    const ch = t[i];
+    if(i < t.length - 1 && (ch === '.' || ch === '!' || ch === '?' || ch === ';' || ch === ':')){
+      const next = t[i+1];
+      if(next === ' ' || next === '\n'){
+        sentences.push(buf.trim());
+        buf = "";
+      }
+    }
+  }
+  if(buf.trim()) sentences.push(buf.trim());
+  // Accumulate sentences into chunks near TTS_CHUNK_TARGET
+  const chunks = [];
+  let cur = "";
+  for(const s of sentences){
+    if(s.length > TTS_CHUNK_TARGET){
+      if(cur) { chunks.push(cur); cur = ""; }
+      let rem = s;
+      while(rem.length > TTS_CHUNK_TARGET){
+        let cut = rem.lastIndexOf(' ', TTS_CHUNK_TARGET);
+        if(cut < 200) cut = TTS_CHUNK_TARGET;
+        chunks.push(rem.substring(0, cut).trim());
+        rem = rem.substring(cut).trim();
+      }
+      if(rem) cur = rem;
+    } else if(cur.length + s.length + 1 > TTS_CHUNK_TARGET){
+      chunks.push(cur);
+      cur = s;
+    } else {
+      cur += (cur ? " " : "") + s;
+    }
+  }
+  if(cur) chunks.push(cur);
+  return chunks;
+}
+
 async function fetchTtsBlob(text){
   if(!text) throw new Error("empty text");
-  if(text.length > TTS_MAX_CHARS) text = text.substring(0, TTS_MAX_CHARS);
   const key = ttsTextKey(text);
   if(ttsBlobCache.has(key)) return ttsBlobCache.get(key);
   if(ttsPending.has(key))   return ttsPending.get(key);
@@ -2798,79 +3091,192 @@ async function fetchTtsBlob(text){
 }
 
 function preemptTts(text){
-  if(!text) return;
-  const t = text.length > TTS_MAX_CHARS ? text.substring(0, TTS_MAX_CHARS) : text;
-  if(t.length < 20) return; // skip tiny texts
-  fetchTtsBlob(t).catch(err=>console.warn("[tts preempt]", err.message || err));
+  if(!text || text.length < 20) return;
+  const chunks = splitTtsChunks(text);
+  // Warm cache for first 2 chunks
+  for(let i = 0; i < Math.min(2, chunks.length); i++){
+    fetchTtsBlob(chunks[i]).catch(err=>console.warn("[tts preempt]", err.message || err));
+  }
 }
 
-let ttsState = null; // {text, audio, rate, paused}
+let ttsSession = null;
+let _ttsRaf = null; // requestAnimationFrame handle for progress bar
+
+class TtsSession {
+  constructor(text){
+    this.chunks = splitTtsChunks(text);
+    this.blobUrls = new Array(this.chunks.length).fill(null);
+    this.durations = new Array(this.chunks.length).fill(0); // audio duration per chunk (filled after load)
+    this.currentChunk = 0;
+    this.audio = null;
+    this.rate = 1.0;
+    this.paused = false;
+    this.aborted = false;
+  }
+  async start(){
+    if(!this.chunks.length){ stopTts(); return; }
+    // Fetch ALL chunks eagerly so buffer bar fills up
+    for(let i = 0; i < this.chunks.length; i++) this._fetchChunk(i);
+    try {
+      this.blobUrls[0] = await this._fetchChunk(0);
+      this._playChunk(0);
+    } catch(err){
+      console.error("[tts] chunk 0 failed:", err);
+      stopTts();
+    }
+  }
+  _fetchChunk(i){
+    if(i >= this.chunks.length) return Promise.resolve(null);
+    if(this.blobUrls[i]) return Promise.resolve(this.blobUrls[i]);
+    return fetchTtsBlob(this.chunks[i]).then(url=>{
+      this.blobUrls[i] = url;
+      _updateTtsBar(); // update buffer bar when a chunk loads
+      return url;
+    }).catch(err=>{
+      console.warn("[tts] chunk " + i + " fetch failed:", err.message||err);
+      this.blobUrls[i] = "ERR";
+      return "ERR";
+    });
+  }
+  _playChunk(i){
+    if(this.aborted) return;
+    while(i < this.chunks.length && this.blobUrls[i] === "ERR") i++;
+    if(i >= this.chunks.length){ stopTts(); return; }
+    this.currentChunk = i;
+    const url = this.blobUrls[i];
+    if(!url){
+      _updateTtsBar();
+      this._fetchChunk(i).then(()=> this._playChunk(i));
+      return;
+    }
+    const audio = new Audio(url);
+    audio.playbackRate = this.rate;
+    audio.onloadedmetadata = ()=>{ this.durations[i] = audio.duration; _updateTtsBar(); };
+    audio.onended = ()=> this._onChunkEnded();
+    audio.onerror = ()=>{ console.warn("[tts] audio error chunk " + i); this._onChunkEnded(); };
+    this.audio = audio;
+    _updateTtsBar();
+    if(!this.paused){
+      audio.play().catch(err=> console.warn("[tts] play() rejected:", err));
+    }
+  }
+  _onChunkEnded(){
+    if(this.aborted) return;
+    const next = this.currentChunk + 1;
+    if(next >= this.chunks.length){ stopTts(); return; }
+    if(this.blobUrls[next] && this.blobUrls[next] !== "ERR"){
+      this._playChunk(next);
+    } else {
+      this.audio = null;
+      _updateTtsBar();
+      this._fetchChunk(next).then(()=> this._playChunk(next));
+    }
+  }
+  togglePause(){
+    if(!this.audio) return;
+    if(this.paused){ this.audio.play().catch(()=>{}); this.paused = false; }
+    else { this.audio.pause(); this.paused = true; }
+    _updateTtsBar();
+  }
+  setRate(rate){
+    this.rate = rate;
+    if(this.audio) this.audio.playbackRate = rate;
+  }
+  stop(){
+    this.aborted = true;
+    if(this.audio){ try{ this.audio.pause(); this.audio.onended=null; }catch{} }
+    this.audio = null;
+  }
+  // Returns 0..1 for how far through the entire session we are
+  getPlaybackFraction(){
+    const n = this.chunks.length;
+    if(n <= 1 && this.audio && this.audio.duration){
+      return this.audio.currentTime / this.audio.duration;
+    }
+    const chunkFrac = this.audio && this.audio.duration > 0 ? this.audio.currentTime / this.audio.duration : 0;
+    return (this.currentChunk + chunkFrac) / n;
+  }
+  // Returns 0..1 for how much is buffered (fetched)
+  getBufferFraction(){
+    const loaded = this.blobUrls.filter(u => u && u !== "ERR").length;
+    return loaded / this.chunks.length;
+  }
+}
 
 function playTts(text){
   stopTts();
-  if(text.length > TTS_MAX_CHARS) text = text.substring(0, TTS_MAX_CHARS);
-  ttsState = {text, rate:1.0, paused:false};
-  _showTtsControls(true);
-  // If already cached, start playing within user-gesture microtask (iOS-friendly).
-  const cached = ttsBlobCache.get(ttsTextKey(text));
-  if(cached){ _ttsPlay(cached); return; }
-  // Not cached: fetch then play. On iOS cold-cache the play() may be outside user-gesture;
-  // fallback: show Loading state and hope for best.
-  fetchTtsBlob(text).then(_ttsPlay).catch(err=>{
-    console.error("[tts] fetch failed:", err);
-    alert("TTS failed: " + (err.message||err));
+  const session = new TtsSession(text);
+  ttsSession = session;
+  _showTtsControls();
+  const cached = ttsBlobCache.get(ttsTextKey(session.chunks[0] || ""));
+  if(cached) session.blobUrls[0] = cached;
+  session.start().catch(err=>{
+    console.error("[tts] session failed:", err);
     stopTts();
   });
 }
 
-function _ttsPlay(url){
-  if(!ttsState) return;
-  const audio = new Audio(url);
-  audio.playbackRate = ttsState.rate;
-  audio.onended = ()=>stopTts();
-  audio.onerror = (e)=>{ console.warn("[tts] audio error", e); stopTts(); };
-  ttsState.audio = audio;
-  _updateTtsControls();
-  audio.play().catch(err=>{
-    console.warn("[tts] play() rejected:", err);
-    // Likely iOS user-gesture expired. Let the controls stay so user can retry.
-  });
-}
-
 function togglePauseTts(){
-  if(!ttsState || !ttsState.audio) return;
-  if(ttsState.paused){ ttsState.audio.play(); ttsState.paused=false; }
-  else { ttsState.audio.pause(); ttsState.paused=true; }
-  _updateTtsControls();
+  if(ttsSession) ttsSession.togglePause();
 }
 function cycleTtsSpeed(){
-  if(!ttsState) return;
+  if(!ttsSession) return;
   const rates = [1.0, 1.25, 1.5, 2.0, 0.85];
-  const i = rates.indexOf(ttsState.rate);
-  ttsState.rate = rates[(i+1) % rates.length];
-  if(ttsState.audio) ttsState.audio.playbackRate = ttsState.rate;
-  _updateTtsControls();
+  const i = rates.indexOf(ttsSession.rate);
+  const newRate = rates[(i+1) % rates.length];
+  ttsSession.setRate(newRate);
+  _updateTtsBar();
 }
 function stopTts(){
-  if(ttsState && ttsState.audio){ try{ ttsState.audio.pause(); }catch{} }
-  ttsState = null;
+  if(_ttsRaf){ cancelAnimationFrame(_ttsRaf); _ttsRaf = null; }
+  if(ttsSession){ ttsSession.stop(); ttsSession = null; }
   document.querySelectorAll(".tts-controls").forEach(b=>b.remove());
 }
-function _showTtsControls(loading){
+function _showTtsControls(){
   document.querySelectorAll(".tts-controls").forEach(b=>b.remove());
   const bar = mk("div","tts-controls");
-  const pause = mk("button","tts-btn"); pause.id="ttsPause"; pause.textContent=loading?"\u25CB":"\u23F8"; pause.onclick=togglePauseTts; pause.title="Pause/Resume";
+  const pause = mk("button","tts-btn"); pause.id="ttsPause"; pause.textContent="\u25CB"; pause.onclick=togglePauseTts; pause.title="Pause/Resume";
+  // Progress bar container (YouTube-style)
+  const progWrap = mk("div","tts-bar-wrap"); progWrap.id="ttsBarWrap";
+  const bufBar = mk("div","tts-bar-buf"); bufBar.id="ttsBufBar";
+  const playBar = mk("div","tts-bar-play"); playBar.id="ttsPlayBar";
+  progWrap.appendChild(bufBar); progWrap.appendChild(playBar);
+  const label = mk("span","tts-bar-label"); label.id="ttsBarLabel"; label.textContent="Loading\u2026";
   const speed = mk("button","tts-btn"); speed.id="ttsSpeed"; speed.textContent="1x"; speed.onclick=cycleTtsSpeed; speed.title="Cycle speed";
   const stop  = mk("button","tts-btn tts-stop"); stop.textContent="\u23F9"; stop.onclick=stopTts; stop.title="Stop";
-  bar.appendChild(pause); bar.appendChild(speed); bar.appendChild(stop);
+  bar.appendChild(pause); bar.appendChild(progWrap); bar.appendChild(label); bar.appendChild(speed); bar.appendChild(stop);
   document.body.appendChild(bar);
+  // Start animation loop for smooth progress bar
+  _startTtsRaf();
 }
-function _updateTtsControls(){
-  const p = document.getElementById("ttsPause");
-  if(p) p.textContent = (ttsState && ttsState.audio) ? (ttsState.paused ? "\u25B6" : "\u23F8") : "\u25CB";
-  const s = document.getElementById("ttsSpeed");
-  if(s && ttsState) s.textContent = ttsState.rate + "x";
+function _startTtsRaf(){
+  function tick(){
+    if(!ttsSession){ _ttsRaf = null; return; }
+    _renderTtsBar();
+    _ttsRaf = requestAnimationFrame(tick);
+  }
+  _ttsRaf = requestAnimationFrame(tick);
 }
+function _renderTtsBar(){
+  if(!ttsSession) return;
+  const bufBar = document.getElementById("ttsBufBar");
+  const playBar = document.getElementById("ttsPlayBar");
+  const label = document.getElementById("ttsBarLabel");
+  const pause = document.getElementById("ttsPause");
+  const speed = document.getElementById("ttsSpeed");
+  if(bufBar) bufBar.style.width = (ttsSession.getBufferFraction() * 100) + "%";
+  if(playBar) playBar.style.width = (ttsSession.getPlaybackFraction() * 100) + "%";
+  if(label){
+    const n = ttsSession.chunks.length;
+    const loaded = ttsSession.blobUrls.filter(u => u && u !== "ERR").length;
+    if(!ttsSession.audio) label.textContent = "Buffering\u2026 " + loaded + "/" + n;
+    else if(n <= 1) label.textContent = "";
+    else label.textContent = (ttsSession.currentChunk+1) + " / " + n;
+  }
+  if(pause) pause.textContent = ttsSession.audio ? (ttsSession.paused ? "\u25B6" : "\u23F8") : "\u25CB";
+  if(speed) speed.textContent = ttsSession.rate + "x";
+}
+function _updateTtsBar(){ _renderTtsBar(); }
 
 // Manual long-press detection (iOS Safari often suppresses contextmenu on selectable text)
 (function(){

@@ -75,6 +75,26 @@ try {
       data TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_messages_session_ts ON messages(session_id, ts, id);
+
+    -- Decision timeline / tree (David's visualisation framework).
+    -- Append-only; resolves via separate UPDATE on status + artifacts.
+    CREATE TABLE IF NOT EXISTS decisions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id   TEXT    NOT NULL,
+      parent_id    INTEGER,
+      ts           INTEGER NOT NULL,
+      summary      TEXT    NOT NULL,
+      chose        TEXT    NOT NULL,
+      alternatives TEXT,
+      why          TEXT,
+      constraints  TEXT,
+      cost         TEXT,
+      status       TEXT    NOT NULL DEFAULT 'pending',
+      artifacts    TEXT,
+      mined        INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_decisions_session_ts ON decisions(session_id, ts, id);
+    CREATE INDEX IF NOT EXISTS idx_decisions_parent ON decisions(parent_id);
   `);
   console.log("[sqlite] messages DB opened at", MESSAGES_DB_PATH);
   // One-time migration: import JSON files not yet in DB
@@ -402,6 +422,142 @@ app.post("/api/sessions/:id/reactivate", express.json(), (req, res) => {
 });
 
 
+
+// ---- Decision timeline / tree endpoints ----
+// Append, resolve, fetch per session, fetch per project.
+// Called via the llmterminal MCP server (llmt_decide, llmt_decide_resolve)
+// running inside the claude spawn — loopback only, no auth.
+
+function _arrText(x) {
+  if (Array.isArray(x)) return JSON.stringify(x);
+  if (typeof x === "string") return x;
+  return null;
+}
+function _normalizeDecisionRow(row) {
+  if (!row) return null;
+  let alts, cons, arts;
+  try { alts = row.alternatives ? JSON.parse(row.alternatives) : []; } catch { alts = []; }
+  try { cons = row.constraints ? JSON.parse(row.constraints) : []; } catch { cons = []; }
+  try { arts = row.artifacts ? JSON.parse(row.artifacts) : null; } catch { arts = null; }
+  return {
+    id: row.id,
+    session_id: row.session_id,
+    parent_id: row.parent_id,
+    ts: row.ts,
+    summary: row.summary,
+    chose: row.chose,
+    alternatives: alts,
+    why: row.why,
+    constraints: cons,
+    cost: row.cost,
+    status: row.status,
+    artifacts: arts,
+    mined: !!row.mined,
+  };
+}
+
+app.post("/api/sessions/:id/decisions", express.json(), (req, res) => {
+  const id = req.params.id;
+  if (!db) return res.status(503).json({ ok: false, error: "db unavailable" });
+  const summary = String(req.body?.summary || "").trim();
+  const chose   = String(req.body?.chose   || "").trim();
+  if (!summary || !chose) {
+    return res.status(400).json({ ok: false, error: "summary and chose are required" });
+  }
+  const why   = String(req.body?.why   || "").trim() || null;
+  const cost  = String(req.body?.cost  || "").trim() || null;
+  const alts  = _arrText(req.body?.alternatives) || null;
+  const cons  = _arrText(req.body?.constraints)  || null;
+  let parentId = req.body?.parent_id;
+  // If unspecified, link to the most recent decision in this session.
+  if (parentId === undefined || parentId === null) {
+    try {
+      const last = db.prepare("SELECT id FROM decisions WHERE session_id = ? ORDER BY ts DESC, id DESC LIMIT 1").get(id);
+      parentId = last ? last.id : null;
+    } catch { parentId = null; }
+  } else {
+    parentId = Number(parentId) || null;
+  }
+  const ts = Date.now();
+  const mined = req.body?.mined ? 1 : 0;
+  try {
+    const result = db
+      .prepare("INSERT INTO decisions (session_id, parent_id, ts, summary, chose, alternatives, why, constraints, cost, status, artifacts, mined) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?)")
+      .run(id, parentId, ts, summary, chose, alts, why, cons, cost, mined);
+    const newId = Number(result.lastInsertRowid);
+    const row = db.prepare("SELECT * FROM decisions WHERE id = ?").get(newId);
+    res.json({ ok: true, decision: _normalizeDecisionRow(row) });
+  } catch (e) {
+    console.error("[decisions] insert failed:", e.message);
+    res.status(500).json({ ok: false, error: "insert failed" });
+  }
+});
+
+app.post("/api/decisions/:did/status", express.json(), (req, res) => {
+  if (!db) return res.status(503).json({ ok: false, error: "db unavailable" });
+  const did = Number(req.params.did);
+  const status = String(req.body?.status || "").trim();
+  const ALLOWED = new Set(["pending", "verified", "reversed", "mined"]);
+  if (!ALLOWED.has(status)) {
+    return res.status(400).json({ ok: false, error: "status must be one of " + [...ALLOWED].join("|") });
+  }
+  const artifact = req.body?.artifact;
+  try {
+    const existing = db.prepare("SELECT artifacts FROM decisions WHERE id = ?").get(did);
+    if (!existing) return res.status(404).json({ ok: false, error: "decision not found" });
+    let merged = null;
+    if (artifact !== undefined && artifact !== null) {
+      let obj;
+      try { obj = existing.artifacts ? JSON.parse(existing.artifacts) : {}; } catch { obj = {}; }
+      if (typeof artifact === "string") {
+        const arr = Array.isArray(obj.notes) ? obj.notes : [];
+        arr.push(artifact);
+        obj.notes = arr;
+      } else if (typeof artifact === "object") {
+        Object.assign(obj, artifact);
+      }
+      merged = JSON.stringify(obj);
+    }
+    if (merged !== null) {
+      db.prepare("UPDATE decisions SET status = ?, artifacts = ? WHERE id = ?").run(status, merged, did);
+    } else {
+      db.prepare("UPDATE decisions SET status = ? WHERE id = ?").run(status, did);
+    }
+    const row = db.prepare("SELECT * FROM decisions WHERE id = ?").get(did);
+    res.json({ ok: true, decision: _normalizeDecisionRow(row) });
+  } catch (e) {
+    console.error("[decisions] update failed:", e.message);
+    res.status(500).json({ ok: false, error: "update failed" });
+  }
+});
+
+app.get("/api/sessions/:id/decisions", (req, res) => {
+  if (!db) return res.status(503).json({ ok: false, error: "db unavailable" });
+  try {
+    const rows = db.prepare("SELECT * FROM decisions WHERE session_id = ? ORDER BY ts ASC, id ASC").all(req.params.id);
+    res.json({ decisions: rows.map(_normalizeDecisionRow) });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: "query failed" });
+  }
+});
+
+app.get("/api/projects/:name/decisions", (req, res) => {
+  if (!db) return res.status(503).json({ ok: false, error: "db unavailable" });
+  try {
+    // Sessions belong to projects via sessions.json — get all session ids for this project,
+    // then fetch their decisions ordered globally.
+    const sessions = loadSessions().filter(s => s.project === req.params.name);
+    if (!sessions.length) return res.json({ decisions: [] });
+    const idList = sessions.map(s => s.id);
+    const placeholders = idList.map(() => "?").join(",");
+    const rows = db
+      .prepare(`SELECT * FROM decisions WHERE session_id IN (${placeholders}) ORDER BY ts ASC, id ASC`)
+      .all(...idList);
+    res.json({ decisions: rows.map(_normalizeDecisionRow) });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: "query failed" });
+  }
+});
 
 // ---- TTS proxy to OpenAI with disk cache ----
 const TTS_CACHE_DIR = path.join(DATA_DIR, "tts-cache");
@@ -1465,7 +1621,7 @@ function generateSessionTitle(sessionId, userText, assistantText) {
 function runClaude({ project, prompt, claudeSessionId, cwd, extraAllowedTools, model, sessionId }, onData, onDone) {
   ensureProjectTrusted(project);
 
-  const SYSTEM_PROMPT_ADD = "When producing an email draft for david@crankwheel.com, you MUST call the mcp__crankhero-draft__draft_email tool rather than typing the draft inline. The tool validates format rules and produces a UI action card for one-tap paste on mobile. Prose drafts are strictly inferior UX.\n\nWhen presenting tabular data, ALWAYS use standard markdown pipe tables with a header row and separator row. Example:\n| Column A | Column B |\n| --- | --- |\n| value 1 | value 2 |\nNever use ASCII art tables, plain-text alignment, or code blocks for tabular data. The UI renders markdown tables as styled, mobile-friendly scrollable HTML tables.\n\nWhen you generate or modify a file the user may want to inspect (PDF, HTML, image, generated doc, invoice, report), call mcp__llmterminal__llmt_show_file with its absolute path so it appears in the user's preview drawer. Don't tell them \"can't render inline\" — pin the file instead.\n\nWhen you finish a discrete task the user asked for and there is nothing more to do unless they reply, call mcp__llmterminal__llmt_complete (optionally with a one-paragraph summary). This explicitly marks the session done so it drops out of the user's NEEDS YOU sidebar. Don't call it mid-task or while waiting on the user.";
+  const SYSTEM_PROMPT_ADD = "When producing an email draft for david@crankwheel.com, you MUST call the mcp__crankhero-draft__draft_email tool rather than typing the draft inline. The tool validates format rules and produces a UI action card for one-tap paste on mobile. Prose drafts are strictly inferior UX.\n\nWhen presenting tabular data, ALWAYS use standard markdown pipe tables with a header row and separator row. Example:\n| Column A | Column B |\n| --- | --- |\n| value 1 | value 2 |\nNever use ASCII art tables, plain-text alignment, or code blocks for tabular data. The UI renders markdown tables as styled, mobile-friendly scrollable HTML tables.\n\nWhen you generate or modify a file the user may want to inspect (PDF, HTML, image, generated doc, invoice, report), call mcp__llmterminal__llmt_show_file with its absolute path so it appears in the user's preview drawer. Don't tell them \"can't render inline\" — pin the file instead.\n\nWhen you finish a discrete task the user asked for and there is nothing more to do unless they reply, call mcp__llmterminal__llmt_complete (optionally with a one-paragraph summary). This explicitly marks the session done so it drops out of the user's NEEDS YOU sidebar. Don't call it mid-task or while waiting on the user.\n\nBefore taking a significant action — choosing between architectural alternatives, picking a dependency, designing a schema, deleting or restructuring files, bypassing a constraint, or pausing for user input rather than acting yourself — call mcp__llmterminal__llmt_decide to record the choice. Pass `summary` (one line), `chose` (the option taken), `alternatives` (other options you considered), `why` (the reasoning), and optionally `constraints` and `cost` (what you gave up). When the gate that justified the decision later passes or fails (commit landed, test ran, container restarted, user replied), call mcp__llmterminal__llmt_decide_resolve with the decision id and status `verified` or `reversed`, with an `artifact` (commit SHA, URL, test output line). This builds the user's decision timeline — make those forks visible instead of buried in conversation.";
   // Phase C: deny the hosted claude.ai Google MCPs project-wide. They
   // bypass the canonical data.* layer + use a different identity, leading
   // the agent to flail when answers don't match what data.* would give.
