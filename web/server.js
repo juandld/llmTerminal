@@ -198,6 +198,20 @@ function ensureProjectTrusted(project) {
 // ---- Session store ----
 function loadSessions() { try { return JSON.parse(fs.readFileSync(SESSIONS_FILE, "utf8")); } catch { return []; } }
 function saveSessions(s) { fs.writeFileSync(SESSIONS_FILE, JSON.stringify(s, null, 2)); }
+// Update a single session object in the store (replaces the repeated
+// `saveSessions(loadSessions().map(s => s.id === x.id ? x : s))` pattern).
+function updateSessionInStore(session) {
+  saveSessions(loadSessions().map(s => s.id === session.id ? session : s));
+}
+// Push a JSON payload to all WS clients subscribed to a given session.
+function broadcastToSession(sessionId, payload) {
+  const msg = JSON.stringify(payload);
+  for (const client of wss.clients) {
+    if (client.readyState === 1 && client._llmSessionId === sessionId) {
+      try { client.send(msg); } catch {}
+    }
+  }
+}
 
 // ---- Image uploads ----
 const activeProcs = new Set();
@@ -231,17 +245,12 @@ setTimeout(() => {
       (data) => {
         if (data.type === "system" && data.subtype === "init" && data.session_id && !session.claudeSessionId) {
           session.claudeSessionId = data.session_id;
-          saveSessions(loadSessions().map(s => s.id === session.id ? session : s));
+          updateSessionInStore(session);
         }
         if (data.type === "result" && data.result) {
           saveMessage(session.id, { role: "assistant", text: data.result, ts: Date.now(), recovered: true });
           console.log("[startup-recovery] recovered:", session.id);
-          // Push to any connected client
-          for (const client of wss.clients) {
-            if (client.readyState === 1 && client._llmSessionId === session.id) {
-              client.send(JSON.stringify({ type: "history", messages: loadMessages(session.id) }));
-            }
-          }
+          broadcastToSession(session.id, { type: "history", messages: loadMessages(session.id) });
         }
       },
       (code) => { if (code !== 0) console.log("[startup-recovery] failed:", session.id, "code:", code); }
@@ -448,13 +457,7 @@ app.post("/api/sessions/:id/append-assistant", express.json(), (req, res) => {
   s.lastSnippet = text.slice(0, 200);
   saveSessions(sessions);
   // Push to any connected client so the chat redraws immediately.
-  try {
-    for (const client of wss.clients) {
-      if (client.readyState === 1 && client._llmSessionId === id) {
-        client.send(JSON.stringify({ type: "history", messages: loadMessages(id) }));
-      }
-    }
-  } catch {}
+  try { broadcastToSession(id, { type: "history", messages: loadMessages(id) }); } catch {}
   res.json({ ok: true });
 });
 
@@ -1840,11 +1843,7 @@ function generateSessionTitle(sessionId, userText, assistantText) {
     session.titleGenerated = true;
     saveSessions(sessions);
     console.log("[title-gen] renamed", sessionId, "\u2192", title);
-    for (const client of wss.clients) {
-      if (client.readyState === 1 && client._llmSessionId === sessionId) {
-        try { client.send(JSON.stringify({ type: "title_updated", sessionId, title })); } catch {}
-      }
-    }
+    broadcastToSession(sessionId, { type: "title_updated", sessionId, title });
   });
   proc.on("error", (e) => {
     console.warn("[title-gen] spawn error for", sessionId, ":", e.message);
@@ -1999,7 +1998,7 @@ wss.on("connection", (ws, req) => {
         if (data.type === "system" && data.subtype === "init") {
           if (data.session_id && !session.claudeSessionId) {
             session.claudeSessionId = data.session_id;
-            saveSessions(loadSessions().map(s => s.id === session.id ? session : s));
+            updateSessionInStore(session);
           }
           return;
         }
@@ -2150,7 +2149,7 @@ wss.on("connection", (ws, req) => {
           setTimeout(() => { try { spawnDecisionExtractor(session.id, session.project); } catch (e) { console.error("[decision-extractor] hook failed:", e.message); } }, 800);
           if (!session.claudeSessionId && data.session_id) {
             session.claudeSessionId = data.session_id;
-            saveSessions(loadSessions().map(s => s.id === session.id ? session : s));
+            updateSessionInStore(session);
           }
           // Detect Anthropic API errors: CLI emits them as the result text
           const result = data.result || "";
@@ -2205,7 +2204,7 @@ wss.on("connection", (ws, req) => {
         if (code !== 0 && stderr && /No conversation found with session ID/.test(stderr) && session.claudeSessionId) {
           console.log("[stale-resume] clearing claudeSessionId for", session.id);
           session.claudeSessionId = null;
-          saveSessions(loadSessions().map(s => s.id === session.id ? session : s));
+          updateSessionInStore(session);
           if (!isRetry) {
             const msgs0 = loadMessages(session.id);
             const lu = [...msgs0].reverse().find(m => m.role === "user");
@@ -2294,7 +2293,7 @@ wss.on("connection", (ws, req) => {
         session.messageCount++;
         if (session.messageCount === 1) session.title = text.slice(0, 80);
         session.lastActive = Date.now();
-        saveSessions(loadSessions().map(s => s.id === session.id ? session : s));
+        updateSessionInStore(session);
 
         // Save user message
         saveMessage(session.id, { role: "user", text, ts: Date.now(), client_id: msg.client_id, hasImages: imagePaths.length > 0 });
@@ -2321,7 +2320,7 @@ wss.on("connection", (ws, req) => {
           break;
         }
         session.model = m || null;
-        saveSessions(loadSessions().map(s => s.id === session.id ? session : s));
+        updateSessionInStore(session);
         try { ws.send(JSON.stringify({ type: "model_set", model: session.model })); } catch {}
         console.log("[model] session", session.id, "->", session.model || "default");
         break;
@@ -2329,7 +2328,7 @@ wss.on("connection", (ws, req) => {
       case "link_task": {
         const taskId = String(msg.task_id || "").trim();
         session.linked_task = taskId || null;
-        saveSessions(loadSessions().map(s => s.id === session.id ? session : s));
+        updateSessionInStore(session);
         try { ws.send(JSON.stringify({ type: "task_linked", task_id: session.linked_task })); } catch {}
         console.log("[task-link] session", session.id, "->", session.linked_task || "none");
         break;
