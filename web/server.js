@@ -169,6 +169,14 @@ function saveMessage(sessionId, msg) {
       else if (msg.role === "tool_use") s.lastSnippet = "Running: " + (msg.tool_name || "tool");
       else if (msg.role === "question") s.lastSnippet = "Question waiting";
       else if (msg.role === "permission_denied") s.lastSnippet = "Permission needed";
+      // Pending asks: accumulate user messages, clear on substantive assistant reply
+      if (msg.role === "user" && text) {
+        if (!s.pendingAsks) s.pendingAsks = [];
+        s.pendingAsks.push({ text: text.slice(0, 100), ts: msg.ts || Date.now() });
+        if (s.pendingAsks.length > 8) s.pendingAsks = s.pendingAsks.slice(-8);
+      } else if (msg.role === "assistant" && text.length > 30) {
+        s.pendingAsks = [];
+      }
       if (msg.role === "email_sent") s.manualDone = Date.now();
       if (msg.role === "user") delete s.manualDone;
       saveSessions(sessions);
@@ -304,8 +312,14 @@ app.get("/health", (_, res) => {
   res.json({ status: "ok", sessions: sessions.length, stuck: stuck.length });
 });
 app.get("/api/projects", (_, res) => {
+  // Skip symlinks so legacy compat symlinks (e.g. narrativeHero -> orchestratorHero)
+  // do not show up as duplicate projects in the sidebar. Real dirs only.
   const dirs = fs.readdirSync(PROJECTS_DIR).filter(d => {
-    try { return fs.statSync(path.join(PROJECTS_DIR, d)).isDirectory() && !d.startsWith("."); } catch { return false; }
+    if (d.startsWith(".")) return false;
+    try {
+      const st = fs.lstatSync(path.join(PROJECTS_DIR, d));
+      return st.isDirectory() && !st.isSymbolicLink();
+    } catch { return false; }
   });
   res.json(dirs);
 });
@@ -1005,7 +1019,7 @@ fs.mkdirSync(PERMISSIONS_DIR, { recursive: true });
 const BROWSER_CDP_PORTS = {
   camohero: 9222,
   crankhero: 9223,
-  narrativehero: 9224,
+  orchestratorhero: 9224,
   llmterminal: 9225,
 };
 /* <<< llmTerminal-managed <<< */
