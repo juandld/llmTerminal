@@ -22,9 +22,9 @@
       "color": "#E74C3C"
     },
     {
-      "slug": "narrativehero",
-      "name": "narrativeHero",
-      "project_path": "/home/claude-user/projects/narrativeHero",
+      "slug": "orchestratorhero",
+      "name": "orchestratorHero",
+      "project_path": "/home/claude-user/projects/orchestratorHero",
       "display": 101,
       "vnc_port": 5902,
       "novnc_port": 6082,

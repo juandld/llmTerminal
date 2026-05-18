@@ -39,7 +39,7 @@
     <button class="menu-btn" onclick="toggleSB()" title="Sessions">&#9776;</button>
     <span class="badge" id="badge">-</span>
     <a href="/" class="app-btn">App</a>
-    <button class="attention-btn hidden" id="attentionBtn" onclick="nextAttentionSession()" title="Next chat needing attention"><span class="att-icon">🔔</span><span class="att-count">0</span></button>
+    <button class="topbar-att hide-mobile" id="topbarAtt" onclick="nextAttentionSession()" title="Next chat needing attention"><span class="topbar-att-icon" id="topbarAttIcon"></span><span class="topbar-att-text" id="topbarAttText">All clear</span></button>
     <a class="browser-btn off" id="browserBtn" title="No browser active" target="_blank" rel="noopener noreferrer" onclick="return handleBrowserClick(event)"><span class="browser-dot"></span><span class="btn-icon">🌐</span><span class="browser-url" id="browserUrl"></span></a>
     <button class="files-btn topbar-collapsible" id="filesBtn" onclick="toggleDrawer()"><span class="btn-icon">◳</span><span class="btn-label">Files</span><span class="badge-count" id="filesBadge" style="display:none">0</span></button>
     <select id="modelSel" class="model-sel" title="Claude model for this session">
@@ -48,6 +48,8 @@
       <option value="sonnet">Sonnet 4.6</option>
       <option value="haiku">Haiku 4.5</option>
     </select>
+    <button class="topbar-btn topbar-collapsible" id="tasksBtn" title="Task board" onclick="toggleTaskBoard()"><span class="btn-icon">▦</span><span class="btn-label">Tasks</span><span class="badge-count" id="tasksBadge" style="display:none">0</span></button>
+    <button class="topbar-btn topbar-collapsible" id="decisionsBtn" title="Decision timeline / tree" onclick="toggleDecisionsDrawer()"><span class="btn-icon">⌥</span><span class="btn-label">Decisions</span><span class="badge-count" id="decisionsBadge" style="display:none">0</span></button>
     <button class="topbar-btn topbar-collapsible" id="searchBtn" title="Search (Cmd+F)" onclick="toggleChatSearch()"><span class="btn-icon">⌕</span><span class="btn-label">Search</span></button>
     <button class="topbar-btn topbar-collapsible" id="summaryBtn" title="Session summary" onclick="toggleSummary()"><span class="btn-icon">Σ</span><span class="btn-label">Summary</span></button>
     <div class="topbar-overflow" id="topbarOverflow">
@@ -55,6 +57,8 @@
       <div class="topbar-overflow-menu" id="overflowMenu">
         <a id="omBrowserBtn" target="_blank" rel="noopener" style="display:none" onclick="closeOverflowMenu()"><span class="om-dot" id="omBrowserDot"></span><span>🌐 Browser</span><span class="om-url" id="omBrowserUrl"></span></a>
         <button onclick="toggleDrawer();closeOverflowMenu()">◳ Files<span class="badge-count" id="filesBadgeMobile" style="display:none;margin-left:auto;background:var(--accent);color:#000;font-size:9px;padding:1px 5px;border-radius:8px">0</span></button>
+        <button onclick="toggleTaskBoard();closeOverflowMenu()">▦ Tasks<span class="badge-count" id="tasksBadgeMobile" style="display:none;margin-left:auto;background:var(--accent);color:#000;font-size:9px;padding:1px 5px;border-radius:8px">0</span></button>
+        <button onclick="toggleDecisionsDrawer();closeOverflowMenu()">⌥ Decisions<span class="badge-count" id="decisionsBadgeMobile" style="display:none;margin-left:auto;background:var(--accent);color:#000;font-size:9px;padding:1px 5px;border-radius:8px">0</span></button>
         <button onclick="toggleChatSearch();closeOverflowMenu()">⌕ Search</button>
         <button onclick="toggleSummary();closeOverflowMenu()">Σ Summary</button>
         <a href="/" onclick="closeOverflowMenu()" style="color:var(--dim)">↗ App</a>
@@ -75,7 +79,7 @@
         <textarea id="inp" rows="1" placeholder="Message Claude..."></textarea>
         <input type="file" id="imgFileInput" accept="image/*" multiple style="display:none" onchange="handleImgFiles(event)">
         <button class="btn-mic" id="attachBtn" onclick="document.getElementById('imgFileInput').click()" title="Attach image" aria-label="Attach image">📎</button>
-        <button class="btn-mic" id="micBtn" onclick="toggleVoiceInput()" title="Voice input" aria-label="Voice input">♫</button>
+        <button class="btn-mic" id="micBtn" onclick="toggleVoiceInput()" title="Voice note (Space)" aria-label="Voice note">🎙</button>
         <button class="btn-send" id="sendBtn" onclick="send()">Send</button>
         <button class="btn-stop" id="stopBtn" onclick="interrupt()">Stop</button>
       </div>
@@ -85,6 +89,30 @@
         <div class="drawer-title-row"><h2>Summary</h2><button onclick="toggleSummary()">&times;</button></div>
       </div>
       <div class="summary-body" id="summaryBody"><div class="drawer-empty">Loading…</div></div>
+    </div>
+    <div class="drawer hidden" id="taskBoard">
+      <div class="drawer-head">
+        <div class="drawer-title-row"><h2>Tasks</h2><span class="drawer-count" id="taskCount"></span><button onclick="toggleTaskBoard()">&times;</button></div>
+        <div class="drawer-filters" id="taskFilters">
+          <button class="active" data-tf="actionable" onclick="setTaskFilter('actionable')">Needs input</button>
+          <button data-tf="active" onclick="setTaskFilter('active')">Active</button>
+          <button data-tf="all" onclick="setTaskFilter('all')">All</button>
+          <button class="tk-btn tk-btn-retry" onclick="retryAllBlocked()" title="Retry all blocked tasks">↻ Retry all</button>
+        </div>
+      </div>
+      <div class="drawer-list" id="taskList"><div class="drawer-empty">Loading tasks…</div></div>
+    </div>
+    <div class="drawer hidden" id="decisionsDrawer">
+      <div class="drawer-head">
+        <div class="drawer-title-row"><h2>Decisions</h2><span class="drawer-count" id="decisionsCount"></span><button onclick="toggleDecisionsDrawer()">&times;</button></div>
+        <div class="drawer-filters" id="decisionsFilters">
+          <button class="active" data-dv="timeline" onclick="setDecisionsView('timeline')">Timeline</button>
+          <button data-dv="tree" onclick="setDecisionsView('tree')">Tree</button>
+          <button data-dv-scope="session" class="active" onclick="setDecisionsScope('session')" title="This chat">This chat</button>
+          <button data-dv-scope="project" onclick="setDecisionsScope('project')" title="All chats in this project">Project</button>
+        </div>
+      </div>
+      <div class="drawer-list" id="decisionsList"><div class="drawer-empty">No decisions recorded yet</div></div>
     </div>
     <div class="drawer hidden" id="drawer">
       <div class="drawer-head">
@@ -99,6 +127,10 @@
       <div class="drawer-list" id="drawerList"><div class="drawer-empty">No files yet</div></div>
     </div>
   </div>
+</div>
+
+<div class="fab" id="fab" title="Next chat needing attention">
+  <span class="fab-icon">🔔</span><span class="fab-count" id="fabCount">0</span>
 </div>
 
 <script src="app.js"></script>

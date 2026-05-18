@@ -75,6 +75,26 @@ try {
       data TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_messages_session_ts ON messages(session_id, ts, id);
+
+    -- Decision timeline / tree (David's visualisation framework).
+    -- Append-only; resolves via separate UPDATE on status + artifacts.
+    CREATE TABLE IF NOT EXISTS decisions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id   TEXT    NOT NULL,
+      parent_id    INTEGER,
+      ts           INTEGER NOT NULL,
+      summary      TEXT    NOT NULL,
+      chose        TEXT    NOT NULL,
+      alternatives TEXT,
+      why          TEXT,
+      constraints  TEXT,
+      cost         TEXT,
+      status       TEXT    NOT NULL DEFAULT 'pending',
+      artifacts    TEXT,
+      mined        INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_decisions_session_ts ON decisions(session_id, ts, id);
+    CREATE INDEX IF NOT EXISTS idx_decisions_parent ON decisions(parent_id);
   `);
   console.log("[sqlite] messages DB opened at", MESSAGES_DB_PATH);
   // One-time migration: import JSON files not yet in DB
@@ -149,6 +169,14 @@ function saveMessage(sessionId, msg) {
       else if (msg.role === "tool_use") s.lastSnippet = "Running: " + (msg.tool_name || "tool");
       else if (msg.role === "question") s.lastSnippet = "Question waiting";
       else if (msg.role === "permission_denied") s.lastSnippet = "Permission needed";
+      // Pending asks: accumulate user messages, clear on substantive assistant reply
+      if (msg.role === "user" && text) {
+        if (!s.pendingAsks) s.pendingAsks = [];
+        s.pendingAsks.push({ text: text.slice(0, 100), ts: msg.ts || Date.now() });
+        if (s.pendingAsks.length > 8) s.pendingAsks = s.pendingAsks.slice(-8);
+      } else if (msg.role === "assistant" && text.length > 30) {
+        s.pendingAsks = [];
+      }
       if (msg.role === "email_sent") s.manualDone = Date.now();
       if (msg.role === "user") delete s.manualDone;
       saveSessions(sessions);
@@ -170,6 +198,20 @@ function ensureProjectTrusted(project) {
 // ---- Session store ----
 function loadSessions() { try { return JSON.parse(fs.readFileSync(SESSIONS_FILE, "utf8")); } catch { return []; } }
 function saveSessions(s) { fs.writeFileSync(SESSIONS_FILE, JSON.stringify(s, null, 2)); }
+// Update a single session object in the store (replaces the repeated
+// `saveSessions(loadSessions().map(s => s.id === x.id ? x : s))` pattern).
+function updateSessionInStore(session) {
+  saveSessions(loadSessions().map(s => s.id === session.id ? session : s));
+}
+// Push a JSON payload to all WS clients subscribed to a given session.
+function broadcastToSession(sessionId, payload) {
+  const msg = JSON.stringify(payload);
+  for (const client of wss.clients) {
+    if (client.readyState === 1 && client._llmSessionId === sessionId) {
+      try { client.send(msg); } catch {}
+    }
+  }
+}
 
 // ---- Image uploads ----
 const activeProcs = new Set();
@@ -199,27 +241,75 @@ setTimeout(() => {
     const perms = sessionPermissions[session.id];
     killExistingClaudeFor(session.claudeSessionId);
     runClaude(
-      { project: session.project, prompt: lastUserMsg.text, claudeSessionId: session.claudeSessionId, cwd, extraAllowedTools: perms ? [...perms] : [], model: session.model },
+      { project: session.project, prompt: lastUserMsg.text, claudeSessionId: session.claudeSessionId, cwd, extraAllowedTools: perms ? [...perms] : [], model: session.model, sessionId: session.id },
       (data) => {
         if (data.type === "system" && data.subtype === "init" && data.session_id && !session.claudeSessionId) {
           session.claudeSessionId = data.session_id;
-          saveSessions(loadSessions().map(s => s.id === session.id ? session : s));
+          updateSessionInStore(session);
         }
         if (data.type === "result" && data.result) {
           saveMessage(session.id, { role: "assistant", text: data.result, ts: Date.now(), recovered: true });
           console.log("[startup-recovery] recovered:", session.id);
-          // Push to any connected client
-          for (const client of wss.clients) {
-            if (client.readyState === 1 && client._llmSessionId === session.id) {
-              client.send(JSON.stringify({ type: "history", messages: loadMessages(session.id) }));
-            }
-          }
+          broadcastToSession(session.id, { type: "history", messages: loadMessages(session.id) });
         }
       },
       (code) => { if (code !== 0) console.log("[startup-recovery] failed:", session.id, "code:", code); }
     );
   }
 }, 5000);
+
+// ---- Gmail Pub/Sub Webhook (replaces 5-min polling timer) ----
+const GMAIL_POLLER_SCRIPT = path.join(__dirname, "scripts", "gmail-reply-poller.py");
+let _gmailPollerRunning = false;
+
+app.post("/webhooks/gmail", express.json(), (req, res) => {
+  // Google Pub/Sub push delivery format:
+  // { message: { data: "<base64>", messageId, publishTime }, subscription }
+  // data decodes to: { emailAddress, historyId }
+  res.status(200).send(); // ack immediately to avoid redelivery
+
+  if (_gmailPollerRunning) return; // debounce concurrent notifications
+  _gmailPollerRunning = true;
+
+  const dataB64 = req.body?.message?.data;
+  let emailAddress = "unknown";
+  if (dataB64) {
+    try {
+      const decoded = JSON.parse(Buffer.from(dataB64, "base64").toString("utf8"));
+      emailAddress = decoded.emailAddress || "unknown";
+    } catch {}
+  }
+  console.log("[gmail-webhook] push notification for:", emailAddress);
+
+  const child = spawn("python3", [GMAIL_POLLER_SCRIPT], {
+    env: { ...process.env, LLMT_BASE_URL: "http://127.0.0.1:" + (process.env.PORT || 7683) },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let out = "";
+  child.stdout.on("data", d => { out += d; });
+  child.stderr.on("data", d => { out += d; });
+  child.on("close", (code) => {
+    _gmailPollerRunning = false;
+    if (out.trim()) console.log("[gmail-webhook] poller output:", out.trim());
+    if (code !== 0) console.warn("[gmail-webhook] poller exited with code:", code);
+  });
+  // Safety timeout: unlock after 30s even if child hangs
+  setTimeout(() => { _gmailPollerRunning = false; }, 30000);
+});
+
+// Watch renewal: call users.watch() on startup and every 6 days
+const GMAIL_SETUP_SCRIPT = path.join(__dirname, "scripts", "gmail-pubsub-setup.py");
+function renewGmailWatch() {
+  const child = spawn("python3", [GMAIL_SETUP_SCRIPT, "--renew"], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let out = "";
+  child.stdout.on("data", d => { out += d; });
+  child.stderr.on("data", d => { out += d; });
+  child.on("close", () => { if (out.trim()) console.log("[gmail-watch]", out.trim()); });
+}
+setTimeout(renewGmailWatch, 10000); // 10s after startup
+setInterval(renewGmailWatch, 6 * 24 * 60 * 60 * 1000); // every 6 days
 
 // ---- API ----
 app.get("/health", (_, res) => {
@@ -231,8 +321,14 @@ app.get("/health", (_, res) => {
   res.json({ status: "ok", sessions: sessions.length, stuck: stuck.length });
 });
 app.get("/api/projects", (_, res) => {
+  // Skip symlinks so legacy compat symlinks (e.g. narrativeHero -> orchestratorHero)
+  // do not show up as duplicate projects in the sidebar. Real dirs only.
   const dirs = fs.readdirSync(PROJECTS_DIR).filter(d => {
-    try { return fs.statSync(path.join(PROJECTS_DIR, d)).isDirectory() && !d.startsWith("."); } catch { return false; }
+    if (d.startsWith(".")) return false;
+    try {
+      const st = fs.lstatSync(path.join(PROJECTS_DIR, d));
+      return st.isDirectory() && !st.isSymbolicLink();
+    } catch { return false; }
   });
   res.json(dirs);
 });
@@ -249,6 +345,26 @@ app.get("/api/sessions", (req, res) => {
   // Sort newest first within the result.
   s.sort((a, b) => (b.lastActive || 0) - (a.lastActive || 0));
   res.json(s);
+});
+
+// Full-text search across message bodies. Returns session IDs whose messages
+// contain the query. Frontend ORs this with title/project matching.
+app.get("/api/search", (req, res) => {
+  const q = (req.query.q || "").trim();
+  if (!q || q.length < 2) return res.json({ sessionIds: [] });
+  if (q.length > 200) return res.status(400).json({ error: "query too long" });
+  if (!db) return res.json({ sessionIds: [] });
+  try {
+    // LIKE escape: backslash quotes %, _, and \ itself.
+    const escaped = q.replace(/[\\%_]/g, "\\$&");
+    const rows = db
+      .prepare("SELECT DISTINCT session_id FROM messages WHERE data LIKE ? ESCAPE '\\' LIMIT 500")
+      .all(`%${escaped}%`);
+    res.json({ sessionIds: rows.map(r => r.session_id) });
+  } catch (e) {
+    console.error("[search] failed:", e.message);
+    res.status(500).json({ error: "search failed" });
+  }
 });
 app.delete("/api/sessions/:id", (req, res) => {
   saveSessions(loadSessions().filter(s => s.id !== req.params.id));
@@ -289,7 +405,229 @@ app.post("/api/sessions/:id/state", express.json(), (req, res) => {
   res.json({ ok: true, manualDone: s.manualDone || null });
 });
 
+// Sets lastViewed=now on a session. Frontend calls this when you open the
+// session so we can tell apart "you saw the assistant's reply" from "still
+// waiting on you to read it".
+app.post("/api/sessions/:id/viewed", (req, res) => {
+  const id = req.params.id;
+  const sessions = loadSessions();
+  const s = sessions.find(x => x.id === id);
+  if (!s) return res.status(404).json({ ok: false, error: "not found" });
+  s.lastViewed = Date.now();
+  saveSessions(sessions);
+  res.json({ ok: true, lastViewed: s.lastViewed });
+});
 
+// Records the Gmail thread ID after a successful send so the reply poller
+// can match inbound mail back to a session.
+app.post("/api/sessions/:id/email-sent", express.json(), (req, res) => {
+  const id = req.params.id;
+  const threadId = (req.body?.threadId || "").trim();
+  const account = (req.body?.account || "").trim();
+  if (!threadId) return res.status(400).json({ ok: false, error: "threadId required" });
+  const sessions = loadSessions();
+  const s = sessions.find(x => x.id === id);
+  if (!s) return res.status(404).json({ ok: false, error: "not found" });
+  s.gmailThreadId = threadId;
+  if (account) s.gmailAccount = account;
+  // Initial cursor — anything that arrives AFTER this counts as a new reply.
+  s.gmailLastSeenMs = Date.now();
+  saveSessions(sessions);
+  res.json({ ok: true });
+});
+
+// Appends an assistant message to a session. Used by the llmterminal MCP
+// (llmt_complete with a summary) so the wrap-up shows up in the chat.
+// Loopback only — no auth, intended for MCP tools running locally.
+app.post("/api/sessions/:id/append-assistant", express.json(), (req, res) => {
+  const id = req.params.id;
+  const text = String(req.body?.text || "").trim();
+  if (!text) return res.status(400).json({ ok: false, error: "text required" });
+  const sessions = loadSessions();
+  const s = sessions.find(x => x.id === id);
+  if (!s) return res.status(404).json({ ok: false, error: "not found" });
+  const ts = Date.now();
+  try {
+    saveMessage(id, { role: "assistant", text, ts, source: "mcp_complete" });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "saveMessage failed: " + e.message });
+  }
+  s.lastActive = ts;
+  s.lastMessageRole = "assistant";
+  s.lastSnippet = text.slice(0, 200);
+  saveSessions(sessions);
+  // Push to any connected client so the chat redraws immediately.
+  try { broadcastToSession(id, { type: "history", messages: loadMessages(id) }); } catch {}
+  res.json({ ok: true });
+});
+
+// Reply detected on a tracked thread — pull the session back to the top.
+// Body: { fromEmail, subject, messageId, snippet, ts }
+app.post("/api/sessions/:id/reactivate", express.json(), (req, res) => {
+  const id = req.params.id;
+  const sessions = loadSessions();
+  const s = sessions.find(x => x.id === id);
+  if (!s) return res.status(404).json({ ok: false, error: "not found" });
+  const now = Date.now();
+  const from = (req.body?.fromEmail || "someone").trim();
+  const subject = (req.body?.subject || "").trim();
+  const snippet = (req.body?.snippet || "").trim().slice(0, 200);
+  const ts = Number(req.body?.ts) || now;
+  s.lastActive = ts;
+  s.lastMessageRole = "email_reply";
+  s.lastSnippet = `📬 Reply from ${from}` + (subject ? ` — ${subject}` : "");
+  s.gmailLastSeenMs = ts;
+  delete s.manualDone; // a reply un-marks any "done" state
+  saveSessions(sessions);
+  // Append a synthetic message so the chat view shows it.
+  try {
+    saveMessage(id, {
+      role: "email_reply",
+      ts,
+      text: `📬 Reply received from ${from}` + (subject ? ` — *${subject}*` : "") + (snippet ? `\n\n> ${snippet}` : ""),
+      fromEmail: from, subject, messageId: req.body?.messageId || null,
+    });
+  } catch (e) { console.error("[reactivate] saveMessage failed:", e.message); }
+  res.json({ ok: true });
+});
+
+
+
+// ---- Decision timeline / tree endpoints ----
+// Append, resolve, fetch per session, fetch per project.
+// Called via the llmterminal MCP server (llmt_decide, llmt_decide_resolve)
+// running inside the claude spawn — loopback only, no auth.
+
+function _arrText(x) {
+  if (Array.isArray(x)) return JSON.stringify(x);
+  if (typeof x === "string") return x;
+  return null;
+}
+function _normalizeDecisionRow(row) {
+  if (!row) return null;
+  let alts, cons, arts;
+  try { alts = row.alternatives ? JSON.parse(row.alternatives) : []; } catch { alts = []; }
+  try { cons = row.constraints ? JSON.parse(row.constraints) : []; } catch { cons = []; }
+  try { arts = row.artifacts ? JSON.parse(row.artifacts) : null; } catch { arts = null; }
+  return {
+    id: row.id,
+    session_id: row.session_id,
+    parent_id: row.parent_id,
+    ts: row.ts,
+    summary: row.summary,
+    chose: row.chose,
+    alternatives: alts,
+    why: row.why,
+    constraints: cons,
+    cost: row.cost,
+    status: row.status,
+    artifacts: arts,
+    mined: !!row.mined,
+  };
+}
+
+app.post("/api/sessions/:id/decisions", express.json(), (req, res) => {
+  const id = req.params.id;
+  if (!db) return res.status(503).json({ ok: false, error: "db unavailable" });
+  const summary = String(req.body?.summary || "").trim();
+  const chose   = String(req.body?.chose   || "").trim();
+  if (!summary || !chose) {
+    return res.status(400).json({ ok: false, error: "summary and chose are required" });
+  }
+  const why   = String(req.body?.why   || "").trim() || null;
+  const cost  = String(req.body?.cost  || "").trim() || null;
+  const alts  = _arrText(req.body?.alternatives) || null;
+  const cons  = _arrText(req.body?.constraints)  || null;
+  let parentId = req.body?.parent_id;
+  // If unspecified, link to the most recent decision in this session.
+  if (parentId === undefined || parentId === null) {
+    try {
+      const last = db.prepare("SELECT id FROM decisions WHERE session_id = ? ORDER BY ts DESC, id DESC LIMIT 1").get(id);
+      parentId = last ? last.id : null;
+    } catch { parentId = null; }
+  } else {
+    parentId = Number(parentId) || null;
+  }
+  const ts = Date.now();
+  const mined = req.body?.mined ? 1 : 0;
+  try {
+    const result = db
+      .prepare("INSERT INTO decisions (session_id, parent_id, ts, summary, chose, alternatives, why, constraints, cost, status, artifacts, mined) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?)")
+      .run(id, parentId, ts, summary, chose, alts, why, cons, cost, mined);
+    const newId = Number(result.lastInsertRowid);
+    const row = db.prepare("SELECT * FROM decisions WHERE id = ?").get(newId);
+    res.json({ ok: true, decision: _normalizeDecisionRow(row) });
+  } catch (e) {
+    console.error("[decisions] insert failed:", e.message);
+    res.status(500).json({ ok: false, error: "insert failed" });
+  }
+});
+
+app.post("/api/decisions/:did/status", express.json(), (req, res) => {
+  if (!db) return res.status(503).json({ ok: false, error: "db unavailable" });
+  const did = Number(req.params.did);
+  const status = String(req.body?.status || "").trim();
+  const ALLOWED = new Set(["pending", "verified", "reversed", "mined"]);
+  if (!ALLOWED.has(status)) {
+    return res.status(400).json({ ok: false, error: "status must be one of " + [...ALLOWED].join("|") });
+  }
+  const artifact = req.body?.artifact;
+  try {
+    const existing = db.prepare("SELECT artifacts FROM decisions WHERE id = ?").get(did);
+    if (!existing) return res.status(404).json({ ok: false, error: "decision not found" });
+    let merged = null;
+    if (artifact !== undefined && artifact !== null) {
+      let obj;
+      try { obj = existing.artifacts ? JSON.parse(existing.artifacts) : {}; } catch { obj = {}; }
+      if (typeof artifact === "string") {
+        const arr = Array.isArray(obj.notes) ? obj.notes : [];
+        arr.push(artifact);
+        obj.notes = arr;
+      } else if (typeof artifact === "object") {
+        Object.assign(obj, artifact);
+      }
+      merged = JSON.stringify(obj);
+    }
+    if (merged !== null) {
+      db.prepare("UPDATE decisions SET status = ?, artifacts = ? WHERE id = ?").run(status, merged, did);
+    } else {
+      db.prepare("UPDATE decisions SET status = ? WHERE id = ?").run(status, did);
+    }
+    const row = db.prepare("SELECT * FROM decisions WHERE id = ?").get(did);
+    res.json({ ok: true, decision: _normalizeDecisionRow(row) });
+  } catch (e) {
+    console.error("[decisions] update failed:", e.message);
+    res.status(500).json({ ok: false, error: "update failed" });
+  }
+});
+
+app.get("/api/sessions/:id/decisions", (req, res) => {
+  if (!db) return res.status(503).json({ ok: false, error: "db unavailable" });
+  try {
+    const rows = db.prepare("SELECT * FROM decisions WHERE session_id = ? ORDER BY ts ASC, id ASC").all(req.params.id);
+    res.json({ decisions: rows.map(_normalizeDecisionRow) });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: "query failed" });
+  }
+});
+
+app.get("/api/projects/:name/decisions", (req, res) => {
+  if (!db) return res.status(503).json({ ok: false, error: "db unavailable" });
+  try {
+    // Sessions belong to projects via sessions.json — get all session ids for this project,
+    // then fetch their decisions ordered globally.
+    const sessions = loadSessions().filter(s => s.project === req.params.name);
+    if (!sessions.length) return res.json({ decisions: [] });
+    const idList = sessions.map(s => s.id);
+    const placeholders = idList.map(() => "?").join(",");
+    const rows = db
+      .prepare(`SELECT * FROM decisions WHERE session_id IN (${placeholders}) ORDER BY ts ASC, id ASC`)
+      .all(...idList);
+    res.json({ decisions: rows.map(_normalizeDecisionRow) });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: "query failed" });
+  }
+});
 
 // ---- TTS proxy to OpenAI with disk cache ----
 const TTS_CACHE_DIR = path.join(DATA_DIR, "tts-cache");
@@ -684,7 +1022,7 @@ fs.mkdirSync(PERMISSIONS_DIR, { recursive: true });
 const BROWSER_CDP_PORTS = {
   camohero: 9222,
   crankhero: 9223,
-  narrativehero: 9224,
+  orchestratorhero: 9224,
   llmterminal: 9225,
 };
 /* <<< llmTerminal-managed <<< */
@@ -810,9 +1148,21 @@ app.post("/api/email-draft/send", express.json(), (req, res) => {
   proc.stderr.on("data", c => { stderr += c.toString(); });
   proc.on("close", (code) => {
     if (code === 0) {
-      const m = stdout.match(/Message ID: (\\S+)/);
+      const m = stdout.match(/Message ID: (\S+)/);
+      const tm = stdout.match(/Thread ID:\s*([A-Za-z0-9_-]+)/);
       saveMessage(sessionId, { role: "email_sent", to, cc: cc || "", subject, account, message_id: m ? m[1] : null, ts: Date.now() });
-      res.json({ ok: true, message_id: m ? m[1] : null, account, output: stdout.slice(-2000) });
+      // Track the Gmail thread on the session so the reply poller can match replies.
+      try {
+        const sessions = loadSessions();
+        const ss = sessions.find(x => x.id === sessionId);
+        if (ss) {
+          if (tm) ss.gmailThreadId = tm[1];
+          ss.gmailAccount = account;
+          ss.gmailLastSeenMs = Date.now();
+          saveSessions(sessions);
+        }
+      } catch (e) { console.error("[email-draft/send] thread track failed:", e.message); }
+      res.json({ ok: true, message_id: m ? m[1] : null, thread_id: tm ? tm[1] : null, account, output: stdout.slice(-2000) });
     } else {
       // Surface the most useful line of the failure (BLOCKED [...] line) to the UI
       const blocked = stdout.match(/BLOCKED[^\n]+|WARNING[^\n]+/);
@@ -846,6 +1196,8 @@ const FILE_SERVE_MIME = {
   '.md': 'text/plain; charset=utf-8', '.txt': 'text/plain; charset=utf-8',
   '.py': 'text/plain; charset=utf-8', '.yaml': 'text/plain; charset=utf-8',
   '.yml': 'text/plain; charset=utf-8',
+  '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.m4a': 'audio/mp4',
+  '.ogg': 'audio/ogg', '.webm': 'audio/webm',
 };
 app.get('/api/file', (req, res) => {
   const raw = String(req.query.path || '');
@@ -1015,10 +1367,10 @@ function autoCreatePreview({ tool_name, input }, sessionId) {
 
 
 
-function autoDetectBashFiles(stdout, sessionId) {
-  const CAMOPATH = '/home/claude-user/projects/camoHero/';
+function autoDetectBashFiles(stdout, sessionId, cwd) {
   const EXT_TEXT = new Set(['.html','.htm','.md','.py','.json','.yaml','.yml','.csv','.txt']);
-  const EXT_BIN  = new Set(['.pdf','.png','.jpg','.jpeg','.gif','.svg']);
+  const EXT_BIN  = new Set(['.pdf','.png','.jpg','.jpeg','.gif','.svg','.mp3','.wav','.m4a','.ogg','.webm']);
+  const ALL_EXT_GROUP = '(?:html|htm|md|py|json|yaml|yml|csv|txt|pdf|png|jpg|jpeg|gif|svg|mp3|wav|m4a|ogg|webm)';
   const found = new Set();
   // Explicit PREVIEW: lines take priority
   for (const m of stdout.matchAll(/^PREVIEW:(.+)$/gm)) found.add(m[1].trim());
@@ -1027,6 +1379,22 @@ function autoDetectBashFiles(stdout, sessionId) {
     const p = m[0].replace(/[\)\]>,.;]+$/, '');
     const ext = require('path').extname(p).toLowerCase();
     if (EXT_TEXT.has(ext) || EXT_BIN.has(ext)) found.add(p);
+  }
+  // Scan for relative paths and resolve against the Bash cwd. Common case:
+  // `python3 -c "...write_pdf('invoices/SQ-001.pdf')"` prints `invoices/SQ-001.pdf`
+  // with no /home/... prefix. We only accept the path if (a) cwd is provided,
+  // (b) the resolved path is still under /home/claude-user/projects/, and
+  // (c) fs.existsSync confirms it. The existsSync gate kills false positives
+  // from random "foo/bar.py" strings in usage messages.
+  if (cwd && cwd.startsWith('/home/claude-user/projects/')) {
+    const relRe = new RegExp("(^|[\\s\\(\\[\\\"'`])([\\w.-]+(?:/[\\w.-]+)+\\." + ALL_EXT_GROUP + ")(?=[\\s\\)\\]\\\"'`,;:]|$)", 'gmi');
+    for (const m of stdout.matchAll(relRe)) {
+      const rel = m[2];
+      if (rel.startsWith('/') || rel.startsWith('..')) continue;
+      const abs = require('path').resolve(cwd, rel);
+      if (!abs.startsWith('/home/claude-user/projects/')) continue;
+      found.add(abs);
+    }
   }
   for (const filePath of found) {
     if (!fs.existsSync(filePath)) continue;
@@ -1058,6 +1426,41 @@ function autoDetectBashFiles(stdout, sessionId) {
 }
 
 
+// ── Shared cheap-Claude spawner for supervisor-pattern observers ──
+// Spawns `claude -p` with Haiku, tools disabled, JSON output. Parses the
+// result and calls onParsed(parsed, stderr). Fire-and-forget, 45s timeout.
+function runCheapClaude(prompt, tag, onParsed) {
+  const args = [
+    "-p", prompt,
+    "--model", "haiku",
+    "--output-format", "json",
+    "--dangerously-skip-permissions",
+    "--disallowedTools", "Bash", "Read", "Write", "Edit", "Glob", "Grep", "Agent", "NotebookEdit", "MultiEdit", "WebFetch", "WebSearch",
+  ];
+  const proc = spawn("/usr/bin/claude", args, {
+    env: { HOME: "/home/claude-user", PATH: process.env.PATH, LANG: "en_US.UTF-8" },
+    uid: 1000, gid: 1000,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let out = "", err = "";
+  proc.stdout.on("data", c => out += c);
+  proc.stderr.on("data", c => err += c);
+  const timer = setTimeout(() => { try { proc.kill("SIGTERM"); } catch {} }, 45000);
+  proc.on("close", async () => {
+    clearTimeout(timer);
+    try {
+      const wrap = JSON.parse(out);
+      const text = (wrap.result || wrap.text || out).toString();
+      const json = text.replace(/^```(?:json)?\s*|\s*```$/g, "").trim();
+      const parsed = JSON.parse(json);
+      await onParsed(parsed, err);
+    } catch (e) {
+      console.warn(`[${tag}] parse failed:`, e.message, "raw:", out.slice(0, 300));
+    }
+  });
+  proc.on("error", e => console.error(`[${tag}] spawn error:`, e.message));
+}
+
 // ── End-of-run observer (Tier 2 "supervisor pattern") ──
 // After each agent run completes, fire a cheap Haiku call to read the recent
 // messages and identify anything David asked for that the agent didn't address.
@@ -1066,7 +1469,6 @@ function autoDetectBashFiles(stdout, sessionId) {
 const _observerLastRun = {};  // sessionId -> ts of last observer fire
 const OBSERVER_COOLDOWN_MS = 30000;  // don't re-observe a session within 30s
 const OBSERVER_MIN_MESSAGES = 4;     // skip if conversation is trivial
-const OBSERVER_MODEL = "haiku";
 
 function spawnObserver(sessionId, projectName) {
   try {
@@ -1105,60 +1507,169 @@ Recent conversation:
 ${lines}`;
 
     console.log("[observer] firing for", sessionId, "(", recent.length, "msgs )");
-    // Fire-and-forget: spawn a detached claude -p with Haiku, disabled tools, no file I/O
-    const args = [
-      "-p", prompt,
-      "--model", OBSERVER_MODEL,
-      "--output-format", "json",
-      "--dangerously-skip-permissions",
-      "--disallowedTools", "Bash", "Read", "Write", "Edit", "Glob", "Grep", "Agent", "NotebookEdit", "MultiEdit", "WebFetch", "WebSearch",
-    ];
-    const proc = spawn("/usr/bin/claude", args, {
-      env: { HOME: "/home/claude-user", PATH: process.env.PATH, LANG: "en_US.UTF-8" },
-      uid: 1000, gid: 1000,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let out = "", err = "";
-    proc.stdout.on("data", c => out += c);
-    proc.stderr.on("data", c => err += c);
-    const timer = setTimeout(() => { try { proc.kill("SIGTERM"); } catch {} }, 45000);
-    proc.on("close", async () => {
-      clearTimeout(timer);
-      try {
-        const wrap = JSON.parse(out);
-        const text = (wrap.result || wrap.text || out).toString();
-        // Strip optional code fences
-        const json = text.replace(/^```(?:json)?\s*|\s*```$/g, "").trim();
-        const parsed = JSON.parse(json);
-        const tasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
-        if (!tasks.length) { console.log("[observer]", sessionId, "→ no unaddressed items"); return; }
-        // POST each task to our own endpoint
-        for (const t of tasks.slice(0, 3)) {
-          if (!t.title) continue;
-          try {
-            const r = await fetch("http://127.0.0.1:7683/api/tasks", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                title: String(t.title).slice(0, 140),
-                description: String(t.description || "").slice(0, 2000) + "\n\n— observed from session " + sessionId,
-                project_id: (projectName || "").toLowerCase(),
-                priority: t.priority || "normal",
-              }),
-            });
-            const data = await r.json();
-            console.log("[observer] +task:", t.title.slice(0, 60), "id=" + (data.item?.task_id || "?"));
-          } catch (e) {
-            console.error("[observer] task POST failed:", e.message);
-          }
+    runCheapClaude(prompt, "observer", async (parsed) => {
+      const tasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
+      if (!tasks.length) { console.log("[observer]", sessionId, "→ no unaddressed items"); return; }
+      for (const t of tasks.slice(0, 3)) {
+        if (!t.title) continue;
+        try {
+          const r = await fetch("http://127.0.0.1:7683/api/tasks", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              title: String(t.title).slice(0, 140),
+              description: String(t.description || "").slice(0, 2000) + "\n\n— observed from session " + sessionId,
+              project_id: (projectName || "").toLowerCase(),
+              priority: t.priority || "normal",
+            }),
+          });
+          const data = await r.json();
+          console.log("[observer] +task:", t.title.slice(0, 60), "id=" + (data.item?.task_id || "?"));
+        } catch (e) {
+          console.error("[observer] task POST failed:", e.message);
         }
-      } catch (e) {
-        console.warn("[observer] parse failed for", sessionId, "—", e.message, "raw:", out.slice(0, 300));
       }
     });
-    proc.on("error", e => console.error("[observer] spawn error:", e.message));
   } catch (e) {
     console.error("[observer] outer error:", e.message);
+  }
+}
+
+// ── Decision extractor (supervisor-pattern observer #2) ──
+// Workers don't self-instrument their decisions — they shouldn't have to.
+// Instead, after each run a separate cheap Haiku call reads the recent
+// transcript and extracts decisions the worker made: forks where it picked
+// between alternatives and closed off paths. Records each via the same
+// /api/sessions/:id/decisions endpoint with mined=true so the user knows
+// these are extracted, not explicitly declared.
+const _decisionExtractorLastRun = {};   // sessionId -> ts of last extractor run
+const _decisionHighWaterTs      = {};   // sessionId -> last ts we extracted past
+const DECISION_EXTRACTOR_COOLDOWN_MS = 30000;
+const DECISION_EXTRACTOR_MIN_MESSAGES = 4;
+
+function spawnDecisionExtractor(sessionId, projectName) {
+  try {
+    if (!sessionId) return;
+    const now = Date.now();
+    if (_decisionExtractorLastRun[sessionId] && (now - _decisionExtractorLastRun[sessionId]) < DECISION_EXTRACTOR_COOLDOWN_MS) return;
+    _decisionExtractorLastRun[sessionId] = now;
+
+    const all = loadMessages(sessionId);
+    if (all.length < DECISION_EXTRACTOR_MIN_MESSAGES) return;
+
+    // Only consider messages newer than the last extraction high-water mark.
+    const hwm = _decisionHighWaterTs[sessionId] || 0;
+    const recent = all.filter(m => (m.ts || 0) > hwm).slice(-40);
+    if (recent.length < 2) return;
+
+    const lines = recent.map(m => {
+      const r = (m.role || "").toUpperCase();
+      let t = m.text || m.summary || "";
+      if (r === "TOOL_ACTIVITY") {
+        // Keep tool activity but truncate hard
+        t = `(${m.tool_name || "tool"}) ${t}`.slice(0, 200);
+      } else {
+        t = String(t).slice(0, 800);
+      }
+      if (!t) return null;
+      return `${r}: ${t}`;
+    }).filter(Boolean).join("\n\n");
+    if (lines.length < 80) return;
+
+    // Pull last few already-recorded decisions for dedup hint.
+    let prevSummary = "";
+    try {
+      const prev = db.prepare("SELECT summary, chose FROM decisions WHERE session_id = ? ORDER BY ts DESC LIMIT 8").all(sessionId);
+      if (prev.length) {
+        prevSummary = "\nAlready recorded (DO NOT duplicate these):\n" + prev.map(p => `  - ${p.summary} → chose: ${p.chose}`).join("\n");
+      }
+    } catch {}
+
+    const prompt = `You are a supervisor agent observing a chat between a user and a worker agent. Your sole job is to identify DECISIONS the worker made and record them — the worker does NOT do this itself.
+
+A decision is a moment where the agent:
+  - chose between named alternatives (architecture, dependency, schema, file restructure)
+  - bypassed or weakened a constraint
+  - paused to ask the user instead of acting
+  - reversed a previous direction
+
+Skip:
+  - routine tool calls (one Read, one Bash)
+  - obvious mechanical steps (renaming a variable consistently)
+  - things already in the "Already recorded" list
+
+Output JSON ONLY (no prose, no markdown fences):
+{"decisions":[{"summary":"one-line headline (verb phrase)","chose":"the option taken","alternatives":["option a","option b"],"why":"specific reasoning","constraints":["..."],"cost":"what was given up","status":"pending|verified|reversed"}]}
+
+If nothing notable: {"decisions":[]}
+
+Rules:
+  - summary <= 14 words, verb-first ("Use ...", "Pause ...", "Defer ...")
+  - alternatives: at minimum the one or two clear other paths that were closed off
+  - why: cite the specific constraint or risk (no platitudes)
+  - status: 'verified' if the chosen path demonstrably worked (commit landed, test passed, user accepted), 'reversed' if undone, 'pending' otherwise
+  - max 3 decisions per call
+
+${prevSummary}
+
+Recent conversation (NEWEST AT BOTTOM):
+${lines}`;
+
+    console.log("[decision-extractor] firing for", sessionId, "(", recent.length, "msgs )");
+    runCheapClaude(prompt, "decision-extractor", async (parsed) => {
+      const decisions = Array.isArray(parsed.decisions) ? parsed.decisions : [];
+      if (!decisions.length) { console.log("[decision-extractor]", sessionId, "→ none"); _decisionHighWaterTs[sessionId] = recent[recent.length - 1].ts || now; return; }
+      for (const d of decisions) {
+        const body = {
+          summary: String(d.summary || "").trim(),
+          chose:   String(d.chose   || "").trim(),
+          alternatives: Array.isArray(d.alternatives) ? d.alternatives.map(String) : [],
+          why:     String(d.why || "").trim(),
+          constraints: Array.isArray(d.constraints) ? d.constraints.map(String) : [],
+          cost:    d.cost ? String(d.cost).trim() : null,
+          mined:   true,
+        };
+        if (!body.summary || !body.chose) continue;
+        const post = JSON.stringify(body);
+        const req = http.request({
+          hostname: "127.0.0.1", port: 7683,
+          path: `/api/sessions/${encodeURIComponent(sessionId)}/decisions`,
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(post) },
+        }, (res) => {
+          let buf = "";
+          res.on("data", c => buf += c);
+          res.on("end", () => {
+            if (res.statusCode >= 200 && res.statusCode < 300) {
+              try {
+                const j = JSON.parse(buf);
+                const id = j.decision?.id;
+                const status = (d.status === "verified" || d.status === "reversed") ? d.status : null;
+                if (id && status) {
+                  const upd = JSON.stringify({ status });
+                  const r2 = http.request({
+                    hostname: "127.0.0.1", port: 7683,
+                    path: `/api/decisions/${id}/status`,
+                    method: "POST",
+                    headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(upd) },
+                  });
+                  r2.on("error", () => {});
+                  r2.write(upd); r2.end();
+                }
+                console.log("[decision-extractor]", sessionId, "→ #" + id, body.summary.slice(0, 60));
+              } catch {}
+            } else {
+              console.warn("[decision-extractor] POST failed:", res.statusCode, buf.slice(0, 200));
+            }
+          });
+        });
+        req.on("error", e => console.warn("[decision-extractor] POST error:", e.message));
+        req.write(post); req.end();
+      }
+      _decisionHighWaterTs[sessionId] = recent[recent.length - 1].ts || now;
+    });
+  } catch (e) {
+    console.error("[decision-extractor] outer error:", e.message);
   }
 }
 
@@ -1309,11 +1820,7 @@ function generateSessionTitle(sessionId, userText, assistantText) {
     session.titleGenerated = true;
     saveSessions(sessions);
     console.log("[title-gen] renamed", sessionId, "\u2192", title);
-    for (const client of wss.clients) {
-      if (client.readyState === 1 && client._llmSessionId === sessionId) {
-        try { client.send(JSON.stringify({ type: "title_updated", sessionId, title })); } catch {}
-      }
-    }
+    broadcastToSession(sessionId, { type: "title_updated", sessionId, title });
   });
   proc.on("error", (e) => {
     console.warn("[title-gen] spawn error for", sessionId, ":", e.message);
@@ -1322,10 +1829,10 @@ function generateSessionTitle(sessionId, userText, assistantText) {
 
 
 // ---- Run claude -p for a single message, stream JSON back ----
-function runClaude({ project, prompt, claudeSessionId, cwd, extraAllowedTools, model }, onData, onDone) {
+function runClaude({ project, prompt, claudeSessionId, cwd, extraAllowedTools, model, sessionId }, onData, onDone) {
   ensureProjectTrusted(project);
 
-  const SYSTEM_PROMPT_ADD = "When producing an email draft for david@crankwheel.com, you MUST call the mcp__crankhero-draft__draft_email tool rather than typing the draft inline. The tool validates format rules and produces a UI action card for one-tap paste on mobile. Prose drafts are strictly inferior UX.\n\nWhen presenting tabular data, ALWAYS use standard markdown pipe tables with a header row and separator row. Example:\n| Column A | Column B |\n| --- | --- |\n| value 1 | value 2 |\nNever use ASCII art tables, plain-text alignment, or code blocks for tabular data. The UI renders markdown tables as styled, mobile-friendly scrollable HTML tables.";
+  const SYSTEM_PROMPT_ADD = "When producing an email draft for david@crankwheel.com, you MUST call the mcp__crankhero-draft__draft_email tool rather than typing the draft inline. The tool validates format rules and produces a UI action card for one-tap paste on mobile. Prose drafts are strictly inferior UX.\n\nWhen presenting tabular data, ALWAYS use standard markdown pipe tables with a header row and separator row. Example:\n| Column A | Column B |\n| --- | --- |\n| value 1 | value 2 |\nNever use ASCII art tables, plain-text alignment, or code blocks for tabular data. The UI renders markdown tables as styled, mobile-friendly scrollable HTML tables.\n\nWhen you generate or modify a file the user may want to inspect (PDF, HTML, image, generated doc, invoice, report), call mcp__llmterminal__llmt_show_file with its absolute path so it appears in the user's preview drawer. Don't tell them \"can't render inline\" — pin the file instead.\n\nWhen you finish a discrete task the user asked for and there is nothing more to do unless they reply, call mcp__llmterminal__llmt_complete (optionally with a one-paragraph summary). This explicitly marks the session done so it drops out of the user's NEEDS YOU sidebar. Don't call it mid-task or while waiting on the user.";
   // Phase C: deny the hosted claude.ai Google MCPs project-wide. They
   // bypass the canonical data.* layer + use a different identity, leading
   // the agent to flail when answers don't match what data.* would give.
@@ -1349,9 +1856,13 @@ function runClaude({ project, prompt, claudeSessionId, cwd, extraAllowedTools, m
 
   const _wrap = _bwrapWrap(project, args);
   if (project === "camoHero") console.log("[sandbox] spawning camoHero in bwrap");
+  const childEnv = { HOME: "/home/claude-user", TERM: "dumb", LANG: "en_US.UTF-8", PATH: process.env.PATH };
+  // LLMT_SESSION_ID is read by the llmterminal MCP server so its tools
+  // (llmt_show_file, llmt_complete) know which session to update.
+  if (sessionId) childEnv.LLMT_SESSION_ID = sessionId;
   const proc = spawn(_wrap.cmd, _wrap.args, {
     cwd,
-    env: { HOME: "/home/claude-user", TERM: "dumb", LANG: "en_US.UTF-8", PATH: process.env.PATH },
+    env: childEnv,
     uid: 1000,
     gid: 1000,
     stdio: ["ignore", "pipe", "pipe"],
@@ -1453,14 +1964,18 @@ wss.on("connection", (ws, req) => {
     const pendingPreviews = {}; // tool_use_id -> {tool_name, input}
     const pendingDrafts = new Set(); // tool_use_id awaiting draft payload
     let seenQuestionSig = null;
+    // Track whether the run produced a final result (assistant reply) or an
+    // explicit api_error. If neither happens before the process closes, the
+    // session is stuck on tool_activity — we save a synthetic marker in onDone.
+    let gotResult = false;
     killExistingClaudeFor(session.claudeSessionId);
     activeProc = runClaude(
-      { project: session.project, prompt: fullPrompt, claudeSessionId: session.claudeSessionId, cwd, extraAllowedTools, model: session.model },
+      { project: session.project, prompt: fullPrompt, claudeSessionId: session.claudeSessionId, cwd, extraAllowedTools, model: session.model, sessionId: session.id },
       (data) => {
         if (data.type === "system" && data.subtype === "init") {
           if (data.session_id && !session.claudeSessionId) {
             session.claudeSessionId = data.session_id;
-            saveSessions(loadSessions().map(s => s.id === session.id ? session : s));
+            updateSessionInStore(session);
           }
           return;
         }
@@ -1480,6 +1995,14 @@ wss.on("connection", (ws, req) => {
                 // Track Bash so we can scan stdout for generated file paths
                 if (block.name === "Bash") {
                   pendingPreviews[block.id] = { tool_name: "Bash", input: block.input };
+                }
+                // Read on a project-dir file: register a preview immediately from
+                // the tool_use input. Read's tool_result returns the file CONTENT,
+                // not the path, so the existing tool_result path-scan misses it.
+                // Reusing autoDetectBashFiles handles binary files (PDF/PNG) correctly.
+                if (block.name === "Read" && typeof block.input?.file_path === "string"
+                    && block.input.file_path.startsWith("/home/claude-user/projects/")) {
+                  autoDetectBashFiles(block.input.file_path, session.id, path.join(PROJECTS_DIR, session.project));
                 }
                 // Track draft_email so we forward the result as a special message
                 if (block.name === "mcp__crankhero-draft__draft_email") {
@@ -1521,7 +2044,7 @@ wss.on("connection", (ws, req) => {
               if (!block.is_error) {
                 if (pending.tool_name === "Bash") {
                   const stdout = Array.isArray(block.content) ? (block.content[0]?.text || "") : String(block.content || "");
-                  autoDetectBashFiles(stdout, session.id);
+                  autoDetectBashFiles(stdout, session.id, path.join(PROJECTS_DIR, session.project));
                 } else {
                   autoCreatePreview(pending, session.id);
                 }
@@ -1534,7 +2057,7 @@ wss.on("connection", (ws, req) => {
               try {
                 const txt = Array.isArray(block.content) ? (block.content[0]?.text || "") : String(block.content || "");
                 if (txt && /\/home\/claude-user\/projects\//.test(txt)) {
-                  autoDetectBashFiles(txt, session.id);
+                  autoDetectBashFiles(txt, session.id, path.join(PROJECTS_DIR, session.project));
                 }
               } catch {}
               // Sentinel for the original if (don't re-process the close brace below)
@@ -1600,14 +2123,16 @@ wss.on("connection", (ws, req) => {
           setTimeout(() => { try { tryDrainQueue(session.id); } catch (e) { console.error("[queue] drain after result failed:", e.message); } }, 50);
           // Fire-and-forget observer: read recent messages, identify unaddressed asks, register as tasks
           setTimeout(() => { try { spawnObserver(session.id, session.project); } catch (e) { console.error("[observer] hook failed:", e.message); } }, 500);
+          setTimeout(() => { try { spawnDecisionExtractor(session.id, session.project); } catch (e) { console.error("[decision-extractor] hook failed:", e.message); } }, 800);
           if (!session.claudeSessionId && data.session_id) {
             session.claudeSessionId = data.session_id;
-            saveSessions(loadSessions().map(s => s.id === session.id ? session : s));
+            updateSessionInStore(session);
           }
           // Detect Anthropic API errors: CLI emits them as the result text
           const result = data.result || "";
           const apiErrorMatch = /API Error:\s*(\d{3})\b[\s\S]*?(request_id"\s*:\s*"([^"]+)")?/.exec(result);
           const isApiError = /^API Error:\s*\d{3}/.test(result);
+          gotResult = true;
           if (isApiError) {
             const statusCode = apiErrorMatch ? apiErrorMatch[1] : "";
             const requestId = apiErrorMatch ? (apiErrorMatch[3] || "") : "";
@@ -1656,7 +2181,7 @@ wss.on("connection", (ws, req) => {
         if (code !== 0 && stderr && /No conversation found with session ID/.test(stderr) && session.claudeSessionId) {
           console.log("[stale-resume] clearing claudeSessionId for", session.id);
           session.claudeSessionId = null;
-          saveSessions(loadSessions().map(s => s.id === session.id ? session : s));
+          updateSessionInStore(session);
           if (!isRetry) {
             const msgs0 = loadMessages(session.id);
             const lu = [...msgs0].reverse().find(m => m.role === "user");
@@ -1677,6 +2202,22 @@ wss.on("connection", (ws, req) => {
         }
         if (code !== 0 && stderr) {
           try { ws.send(JSON.stringify({ type: "error", message: stderr.slice(0, 500) })); } catch {}
+        }
+        // Stalled-run guard: process closed but no result/api_error ever came.
+        // Save a synthetic marker so the persisted state isn't stuck on
+        // tool_activity forever (which makes the sidebar show "working").
+        if (!gotResult) {
+          const msgs2 = loadMessages(session.id);
+          const last = msgs2.length ? msgs2[msgs2.length - 1] : null;
+          const stuckRoles = new Set(["tool_activity", "tool_result", "permission_granted"]);
+          if (last && stuckRoles.has(last.role)) {
+            const note = code === 0
+              ? "⚠️ The agent stopped mid-run without producing a final response. Re-prompt to continue."
+              : "⚠️ The agent process exited (code " + code + ") before producing a final response. Re-prompt to retry.";
+            saveMessage(session.id, { role: "assistant", text: note, ts: Date.now(), recovered: true, stalled: true });
+            try { ws.send(JSON.stringify({ type: "history", messages: loadMessages(session.id) })); } catch {}
+            console.log("[stalled-run]", session.id, "no result; saved marker (code=" + code + ")");
+          }
         }
         try { ws.send(JSON.stringify({ type: "idle" })); } catch {}
       }
@@ -1729,7 +2270,7 @@ wss.on("connection", (ws, req) => {
         session.messageCount++;
         if (session.messageCount === 1) session.title = text.slice(0, 80);
         session.lastActive = Date.now();
-        saveSessions(loadSessions().map(s => s.id === session.id ? session : s));
+        updateSessionInStore(session);
 
         // Save user message
         saveMessage(session.id, { role: "user", text, ts: Date.now(), client_id: msg.client_id, hasImages: imagePaths.length > 0 });
@@ -1756,7 +2297,7 @@ wss.on("connection", (ws, req) => {
           break;
         }
         session.model = m || null;
-        saveSessions(loadSessions().map(s => s.id === session.id ? session : s));
+        updateSessionInStore(session);
         try { ws.send(JSON.stringify({ type: "model_set", model: session.model })); } catch {}
         console.log("[model] session", session.id, "->", session.model || "default");
         break;
@@ -1764,7 +2305,7 @@ wss.on("connection", (ws, req) => {
       case "link_task": {
         const taskId = String(msg.task_id || "").trim();
         session.linked_task = taskId || null;
-        saveSessions(loadSessions().map(s => s.id === session.id ? session : s));
+        updateSessionInStore(session);
         try { ws.send(JSON.stringify({ type: "task_linked", task_id: session.linked_task })); } catch {}
         console.log("[task-link] session", session.id, "->", session.linked_task || "none");
         break;
