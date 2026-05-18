@@ -1426,6 +1426,41 @@ function autoDetectBashFiles(stdout, sessionId, cwd) {
 }
 
 
+// ── Shared cheap-Claude spawner for supervisor-pattern observers ──
+// Spawns `claude -p` with Haiku, tools disabled, JSON output. Parses the
+// result and calls onParsed(parsed, stderr). Fire-and-forget, 45s timeout.
+function runCheapClaude(prompt, tag, onParsed) {
+  const args = [
+    "-p", prompt,
+    "--model", "haiku",
+    "--output-format", "json",
+    "--dangerously-skip-permissions",
+    "--disallowedTools", "Bash", "Read", "Write", "Edit", "Glob", "Grep", "Agent", "NotebookEdit", "MultiEdit", "WebFetch", "WebSearch",
+  ];
+  const proc = spawn("/usr/bin/claude", args, {
+    env: { HOME: "/home/claude-user", PATH: process.env.PATH, LANG: "en_US.UTF-8" },
+    uid: 1000, gid: 1000,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let out = "", err = "";
+  proc.stdout.on("data", c => out += c);
+  proc.stderr.on("data", c => err += c);
+  const timer = setTimeout(() => { try { proc.kill("SIGTERM"); } catch {} }, 45000);
+  proc.on("close", async () => {
+    clearTimeout(timer);
+    try {
+      const wrap = JSON.parse(out);
+      const text = (wrap.result || wrap.text || out).toString();
+      const json = text.replace(/^```(?:json)?\s*|\s*```$/g, "").trim();
+      const parsed = JSON.parse(json);
+      await onParsed(parsed, err);
+    } catch (e) {
+      console.warn(`[${tag}] parse failed:`, e.message, "raw:", out.slice(0, 300));
+    }
+  });
+  proc.on("error", e => console.error(`[${tag}] spawn error:`, e.message));
+}
+
 // ── End-of-run observer (Tier 2 "supervisor pattern") ──
 // After each agent run completes, fire a cheap Haiku call to read the recent
 // messages and identify anything David asked for that the agent didn't address.
@@ -1434,7 +1469,6 @@ function autoDetectBashFiles(stdout, sessionId, cwd) {
 const _observerLastRun = {};  // sessionId -> ts of last observer fire
 const OBSERVER_COOLDOWN_MS = 30000;  // don't re-observe a session within 30s
 const OBSERVER_MIN_MESSAGES = 4;     // skip if conversation is trivial
-const OBSERVER_MODEL = "haiku";
 
 function spawnObserver(sessionId, projectName) {
   try {
@@ -1473,58 +1507,29 @@ Recent conversation:
 ${lines}`;
 
     console.log("[observer] firing for", sessionId, "(", recent.length, "msgs )");
-    // Fire-and-forget: spawn a detached claude -p with Haiku, disabled tools, no file I/O
-    const args = [
-      "-p", prompt,
-      "--model", OBSERVER_MODEL,
-      "--output-format", "json",
-      "--dangerously-skip-permissions",
-      "--disallowedTools", "Bash", "Read", "Write", "Edit", "Glob", "Grep", "Agent", "NotebookEdit", "MultiEdit", "WebFetch", "WebSearch",
-    ];
-    const proc = spawn("/usr/bin/claude", args, {
-      env: { HOME: "/home/claude-user", PATH: process.env.PATH, LANG: "en_US.UTF-8" },
-      uid: 1000, gid: 1000,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let out = "", err = "";
-    proc.stdout.on("data", c => out += c);
-    proc.stderr.on("data", c => err += c);
-    const timer = setTimeout(() => { try { proc.kill("SIGTERM"); } catch {} }, 45000);
-    proc.on("close", async () => {
-      clearTimeout(timer);
-      try {
-        const wrap = JSON.parse(out);
-        const text = (wrap.result || wrap.text || out).toString();
-        // Strip optional code fences
-        const json = text.replace(/^```(?:json)?\s*|\s*```$/g, "").trim();
-        const parsed = JSON.parse(json);
-        const tasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
-        if (!tasks.length) { console.log("[observer]", sessionId, "→ no unaddressed items"); return; }
-        // POST each task to our own endpoint
-        for (const t of tasks.slice(0, 3)) {
-          if (!t.title) continue;
-          try {
-            const r = await fetch("http://127.0.0.1:7683/api/tasks", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                title: String(t.title).slice(0, 140),
-                description: String(t.description || "").slice(0, 2000) + "\n\n— observed from session " + sessionId,
-                project_id: (projectName || "").toLowerCase(),
-                priority: t.priority || "normal",
-              }),
-            });
-            const data = await r.json();
-            console.log("[observer] +task:", t.title.slice(0, 60), "id=" + (data.item?.task_id || "?"));
-          } catch (e) {
-            console.error("[observer] task POST failed:", e.message);
-          }
+    runCheapClaude(prompt, "observer", async (parsed) => {
+      const tasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
+      if (!tasks.length) { console.log("[observer]", sessionId, "→ no unaddressed items"); return; }
+      for (const t of tasks.slice(0, 3)) {
+        if (!t.title) continue;
+        try {
+          const r = await fetch("http://127.0.0.1:7683/api/tasks", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              title: String(t.title).slice(0, 140),
+              description: String(t.description || "").slice(0, 2000) + "\n\n— observed from session " + sessionId,
+              project_id: (projectName || "").toLowerCase(),
+              priority: t.priority || "normal",
+            }),
+          });
+          const data = await r.json();
+          console.log("[observer] +task:", t.title.slice(0, 60), "id=" + (data.item?.task_id || "?"));
+        } catch (e) {
+          console.error("[observer] task POST failed:", e.message);
         }
-      } catch (e) {
-        console.warn("[observer] parse failed for", sessionId, "—", e.message, "raw:", out.slice(0, 300));
       }
     });
-    proc.on("error", e => console.error("[observer] spawn error:", e.message));
   } catch (e) {
     console.error("[observer] outer error:", e.message);
   }
@@ -1611,86 +1616,58 @@ Recent conversation (NEWEST AT BOTTOM):
 ${lines}`;
 
     console.log("[decision-extractor] firing for", sessionId, "(", recent.length, "msgs )");
-    const args = [
-      "-p", prompt,
-      "--model", "haiku",
-      "--output-format", "json",
-      "--dangerously-skip-permissions",
-      "--disallowedTools", "Bash", "Read", "Write", "Edit", "Glob", "Grep", "Agent", "NotebookEdit", "MultiEdit", "WebFetch", "WebSearch",
-    ];
-    const proc = spawn("/usr/bin/claude", args, {
-      env: { HOME: "/home/claude-user", PATH: process.env.PATH, LANG: "en_US.UTF-8" },
-      uid: 1000, gid: 1000,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let out = "", err = "";
-    proc.stdout.on("data", c => out += c);
-    proc.stderr.on("data", c => err += c);
-    const timer = setTimeout(() => { try { proc.kill("SIGTERM"); } catch {} }, 45000);
-    proc.on("close", async () => {
-      clearTimeout(timer);
-      try {
-        const wrap = JSON.parse(out);
-        const text = (wrap.result || wrap.text || out).toString();
-        const json = text.replace(/^```(?:json)?\s*|\s*```$/g, "").trim();
-        const parsed = JSON.parse(json);
-        const decisions = Array.isArray(parsed.decisions) ? parsed.decisions : [];
-        if (!decisions.length) { console.log("[decision-extractor]", sessionId, "→ none"); _decisionHighWaterTs[sessionId] = recent[recent.length - 1].ts || now; return; }
-        for (const d of decisions) {
-          const body = {
-            summary: String(d.summary || "").trim(),
-            chose:   String(d.chose   || "").trim(),
-            alternatives: Array.isArray(d.alternatives) ? d.alternatives.map(String) : [],
-            why:     String(d.why || "").trim(),
-            constraints: Array.isArray(d.constraints) ? d.constraints.map(String) : [],
-            cost:    d.cost ? String(d.cost).trim() : null,
-            mined:   true,
-          };
-          if (!body.summary || !body.chose) continue;
-          // POST to ourselves over loopback
-          const post = JSON.stringify(body);
-          const req = http.request({
-            hostname: "127.0.0.1", port: 7683,
-            path: `/api/sessions/${encodeURIComponent(sessionId)}/decisions`,
-            method: "POST",
-            headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(post) },
-          }, (res) => {
-            let buf = "";
-            res.on("data", c => buf += c);
-            res.on("end", () => {
-              if (res.statusCode >= 200 && res.statusCode < 300) {
-                try {
-                  const j = JSON.parse(buf);
-                  const id = j.decision?.id;
-                  // If the supervisor classified status as verified/reversed up front, apply it.
-                  const status = (d.status === "verified" || d.status === "reversed") ? d.status : null;
-                  if (id && status) {
-                    const upd = JSON.stringify({ status });
-                    const r2 = http.request({
-                      hostname: "127.0.0.1", port: 7683,
-                      path: `/api/decisions/${id}/status`,
-                      method: "POST",
-                      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(upd) },
-                    });
-                    r2.on("error", () => {});
-                    r2.write(upd); r2.end();
-                  }
-                  console.log("[decision-extractor]", sessionId, "→ #" + id, body.summary.slice(0, 60));
-                } catch {}
-              } else {
-                console.warn("[decision-extractor] POST failed:", res.statusCode, buf.slice(0, 200));
-              }
-            });
+    runCheapClaude(prompt, "decision-extractor", async (parsed) => {
+      const decisions = Array.isArray(parsed.decisions) ? parsed.decisions : [];
+      if (!decisions.length) { console.log("[decision-extractor]", sessionId, "→ none"); _decisionHighWaterTs[sessionId] = recent[recent.length - 1].ts || now; return; }
+      for (const d of decisions) {
+        const body = {
+          summary: String(d.summary || "").trim(),
+          chose:   String(d.chose   || "").trim(),
+          alternatives: Array.isArray(d.alternatives) ? d.alternatives.map(String) : [],
+          why:     String(d.why || "").trim(),
+          constraints: Array.isArray(d.constraints) ? d.constraints.map(String) : [],
+          cost:    d.cost ? String(d.cost).trim() : null,
+          mined:   true,
+        };
+        if (!body.summary || !body.chose) continue;
+        const post = JSON.stringify(body);
+        const req = http.request({
+          hostname: "127.0.0.1", port: 7683,
+          path: `/api/sessions/${encodeURIComponent(sessionId)}/decisions`,
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(post) },
+        }, (res) => {
+          let buf = "";
+          res.on("data", c => buf += c);
+          res.on("end", () => {
+            if (res.statusCode >= 200 && res.statusCode < 300) {
+              try {
+                const j = JSON.parse(buf);
+                const id = j.decision?.id;
+                const status = (d.status === "verified" || d.status === "reversed") ? d.status : null;
+                if (id && status) {
+                  const upd = JSON.stringify({ status });
+                  const r2 = http.request({
+                    hostname: "127.0.0.1", port: 7683,
+                    path: `/api/decisions/${id}/status`,
+                    method: "POST",
+                    headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(upd) },
+                  });
+                  r2.on("error", () => {});
+                  r2.write(upd); r2.end();
+                }
+                console.log("[decision-extractor]", sessionId, "→ #" + id, body.summary.slice(0, 60));
+              } catch {}
+            } else {
+              console.warn("[decision-extractor] POST failed:", res.statusCode, buf.slice(0, 200));
+            }
           });
-          req.on("error", e => console.warn("[decision-extractor] POST error:", e.message));
-          req.write(post); req.end();
-        }
-        _decisionHighWaterTs[sessionId] = recent[recent.length - 1].ts || now;
-      } catch (e) {
-        console.warn("[decision-extractor] parse failed:", e.message, "stderr:", err.slice(0, 200));
+        });
+        req.on("error", e => console.warn("[decision-extractor] POST error:", e.message));
+        req.write(post); req.end();
       }
+      _decisionHighWaterTs[sessionId] = recent[recent.length - 1].ts || now;
     });
-    proc.on("error", e => console.error("[decision-extractor] spawn error:", e.message));
   } catch (e) {
     console.error("[decision-extractor] outer error:", e.message);
   }
