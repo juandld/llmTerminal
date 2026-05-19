@@ -133,8 +133,6 @@
   .topbar-overflow-btn.nav-active .overflow-dot     { background: var(--green); box-shadow: 0 0 6px var(--green); }
   .topbar-overflow-btn.nav-idle .overflow-dot       { background: #3498DB; box-shadow: 0 0 5px rgba(52,152,219,.6); }
   .topbar-overflow-btn.nav-dormant .overflow-dot    { background: #666; box-shadow: none; }
-  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
-
   .topbar-overflow{position:relative;display:none}
   .topbar-overflow-btn{background:var(--surface2);color:var(--dim);border:1px solid var(--border);padding:0;border-radius:10px;font-size:16px;cursor:pointer;font-family:var(--mono);height:36px;width:36px;display:grid;place-items:center;position:relative}
   @media(max-width:768px){.topbar-overflow-btn{height:40px;width:40px;border-radius:10px;font-size:16px}}

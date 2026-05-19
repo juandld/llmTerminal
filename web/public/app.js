@@ -9,6 +9,7 @@ function pushInputHistory(text){
   if(sentHistory.length>100)sentHistory.length=100;
   try{localStorage.setItem("llmt_input_history",JSON.stringify(sentHistory));}catch{}
 }
+function autoResizeInput(el){el.style.height="44px";el.style.height=Math.min(el.scrollHeight,140)+"px";}
 // ---- Phase 1 state: outbox, heartbeat, scroll/selection persistence ----
 let outbox=[];
 try{outbox=JSON.parse(localStorage.getItem("llmt_outbox")||"[]")}catch{}
@@ -1255,7 +1256,7 @@ function addQuestion(text){
         return(q.header||"Q"+(qi+1))+": "+val;
       }).join("\n");
       inp.value=answers;
-      inp.style.height="44px";inp.style.height=Math.min(inp.scrollHeight,140)+"px";
+      autoResizeInput(inp);
       // Clear saved drafts for this question set
       try{
         structured.forEach((q,qi)=>localStorage.removeItem(draftKeyBase+qi));
@@ -1409,17 +1410,7 @@ function addInlinePreview(p){
     if(c.body_text) html+=fileBodyHtml(c.body_text,p.title,null);
   }
   if(p.attachments&&p.attachments.length){
-    html+='<div class="fp-attachments">';
-    p.attachments.forEach(a=>{
-      const aUrl="/api/previews/"+p.id+"/attachments/"+encodeURIComponent(a.filename);
-      const isAudio=/\.(mp3|wav|m4a|ogg|webm)$/i.test(a.filename);
-      if(isAudio){
-        html+='<div style="margin:6px 0"><div style="font-size:11px;color:var(--dim);margin-bottom:4px">🔊 '+esc(a.filename)+(a.size?" ("+formatSize(a.size)+")":"")+'</div><audio controls preload="metadata" style="width:100%;height:36px" src="'+aUrl+'"></audio></div>';
-      } else {
-        html+='<a class="fp-att" href="'+aUrl+'" target="_blank">📎 '+esc(a.filename)+(a.size?" ("+formatSize(a.size)+")":"")+'</a>';
-      }
-    });
-    html+='</div>';
+    html+='<div class="fp-attachments">'+renderAttachmentsHtml(p.id,p.attachments)+'</div>';
   }
   html+='<div class="fp-review-actions" data-pid="'+p.id+'">';
   html+='<button class="fp-approve" onclick="reviewPreview(\''+p.id+'\',\'approve\')">Approve</button>';
@@ -1474,6 +1465,19 @@ function timeAgo(ts){
   return Math.floor(ms/86400000)+"d";
 }
 function formatSize(b){if(b<1024)return b+"B";if(b<1048576)return(b/1024).toFixed(1)+"KB";return(b/1048576).toFixed(1)+"MB"}
+function renderAttachmentsHtml(previewId,attachments){
+  let h='';
+  attachments.forEach(a=>{
+    const aUrl="/api/previews/"+previewId+"/attachments/"+encodeURIComponent(a.filename);
+    const isAudio=/\.(mp3|wav|m4a|ogg|webm)$/i.test(a.filename);
+    if(isAudio){
+      h+='<div style="margin:6px 0"><div style="font-size:11px;color:var(--dim);margin-bottom:4px">🔊 '+esc(a.filename)+(a.size?" ("+formatSize(a.size)+")":"")+'</div><audio controls preload="metadata" style="width:100%;height:36px" src="'+aUrl+'"></audio></div>';
+    } else {
+      h+='<a class="fp-att" href="'+aUrl+'" target="_blank">📎 '+esc(a.filename)+(a.size?" ("+formatSize(a.size)+")":"")+'</a>';
+    }
+  });
+  return h;
+}
 
 
 
@@ -1601,17 +1605,7 @@ function renderDrawer(){
         if(c.body_text) html+=fileBodyHtml(c.body_text,p.title,query);
       }
       if(p.attachments&&p.attachments.length){
-        html+='<div class="fp-attachments">';
-        p.attachments.forEach(a=>{
-          const aUrl="/api/previews/"+p.id+"/attachments/"+encodeURIComponent(a.filename);
-          const isAudio=/\.(mp3|wav|m4a|ogg|webm)$/i.test(a.filename);
-          if(isAudio){
-            html+='<div style="margin:6px 0"><div style="font-size:11px;color:var(--dim);margin-bottom:4px">🔊 '+esc(a.filename)+(a.size?" ("+formatSize(a.size)+")":"")+'</div><audio controls preload="metadata" style="width:100%;height:36px" src="'+aUrl+'"></audio></div>';
-          } else {
-            html+='<a class="fp-att" href="'+aUrl+'" target="_blank">📎 '+esc(a.filename)+(a.size?" ("+formatSize(a.size)+")":"")+'</a>';
-          }
-        });
-        html+='</div>';
+        html+='<div class="fp-attachments">'+renderAttachmentsHtml(p.id,p.attachments)+'</div>';
       }
       html+='</div>';
       html+='<div class="fp-actions"><button onclick="copyPreviewText(\''+p.id+'\')">Copy</button><button onclick="reviewPreview(\''+p.id+'\',\'revise\')">Revise</button><button class="danger" onclick="deletePreview(\''+p.id+'\')">Delete</button></div>';
@@ -2593,11 +2587,11 @@ function updateSendButton(){
 }
 
 inp.addEventListener("input",()=>{
-  inp.style.height="44px";inp.style.height=Math.min(inp.scrollHeight,140)+"px";
+  autoResizeInput(inp);
   localStorage.setItem("llmt_draft",inp.value);
 });
 // Restore draft on load
-try{const d=localStorage.getItem("llmt_draft");if(d){inp.value=d;inp.style.height="44px";inp.style.height=Math.min(inp.scrollHeight,140)+"px";}}catch{}
+try{const d=localStorage.getItem("llmt_draft");if(d){inp.value=d;autoResizeInput(inp);}}catch{}
 // Phase 1: restore selection, sidebar/drawer state, file filter, search query
 try{
   const sel=JSON.parse(localStorage.getItem("llmt_draft_sel")||"null");
@@ -2828,7 +2822,7 @@ function loadTaskIntoChat(el){
     +(desc?"\n\n"+desc:"")
     +"\n\nWhat should we do with this?";
   inp.value=text;
-  inp.style.height="44px";inp.style.height=Math.min(inp.scrollHeight,140)+"px";
+  autoResizeInput(inp);
   localStorage.setItem("llmt_draft",inp.value);
   // Link this session to the task
   if(ws&&ws.readyState===1) ws.send(JSON.stringify({type:"link_task",task_id:tid}));
