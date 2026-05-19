@@ -9,6 +9,7 @@ function pushInputHistory(text){
   if(sentHistory.length>100)sentHistory.length=100;
   try{localStorage.setItem("llmt_input_history",JSON.stringify(sentHistory));}catch{}
 }
+function autoResizeInput(el){el.style.height="44px";el.style.height=Math.min(el.scrollHeight,140)+"px";}
 // ---- Phase 1 state: outbox, heartbeat, scroll/selection persistence ----
 let outbox=[];
 try{outbox=JSON.parse(localStorage.getItem("llmt_outbox")||"[]")}catch{}
@@ -1255,7 +1256,7 @@ function addQuestion(text){
         return(q.header||"Q"+(qi+1))+": "+val;
       }).join("\n");
       inp.value=answers;
-      inp.style.height="44px";inp.style.height=Math.min(inp.scrollHeight,140)+"px";
+      autoResizeInput(inp);
       // Clear saved drafts for this question set
       try{
         structured.forEach((q,qi)=>localStorage.removeItem(draftKeyBase+qi));
@@ -2593,11 +2594,11 @@ function updateSendButton(){
 }
 
 inp.addEventListener("input",()=>{
-  inp.style.height="44px";inp.style.height=Math.min(inp.scrollHeight,140)+"px";
+  autoResizeInput(inp);
   localStorage.setItem("llmt_draft",inp.value);
 });
 // Restore draft on load
-try{const d=localStorage.getItem("llmt_draft");if(d){inp.value=d;inp.style.height="44px";inp.style.height=Math.min(inp.scrollHeight,140)+"px";}}catch{}
+try{const d=localStorage.getItem("llmt_draft");if(d){inp.value=d;autoResizeInput(inp);}}catch{}
 // Phase 1: restore selection, sidebar/drawer state, file filter, search query
 try{
   const sel=JSON.parse(localStorage.getItem("llmt_draft_sel")||"null");
@@ -2828,7 +2829,7 @@ function loadTaskIntoChat(el){
     +(desc?"\n\n"+desc:"")
     +"\n\nWhat should we do with this?";
   inp.value=text;
-  inp.style.height="44px";inp.style.height=Math.min(inp.scrollHeight,140)+"px";
+  autoResizeInput(inp);
   localStorage.setItem("llmt_draft",inp.value);
   // Link this session to the task
   if(ws&&ws.readyState===1) ws.send(JSON.stringify({type:"link_task",task_id:tid}));
