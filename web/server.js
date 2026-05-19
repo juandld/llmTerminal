@@ -212,6 +212,14 @@ function wsSend(ws, typeOrPayload, data) {
     ws.send(JSON.stringify(payload));
   } catch {}
 }
+// Look up a session by id, sending a 404 response if missing.
+// Returns { sessions, session } or null (after responding with 404).
+function findSessionOr404(id, res) {
+  const sessions = loadSessions();
+  const session = sessions.find(x => x.id === id);
+  if (!session) { res.status(404).json({ ok: false, error: "not found" }); return null; }
+  return { sessions, session };
+}
 // Push a JSON payload to all WS clients subscribed to a given session.
 function broadcastToSession(sessionId, payload) {
   const msg = JSON.stringify(payload);
@@ -400,12 +408,9 @@ app.post("/api/sessions/bulk-archive-done", express.json(), (req, res) => {
 });
 
 app.post("/api/sessions/:id/state", express.json(), (req, res) => {
-  const id = req.params.id;
-  const manualDone = !!req.body?.manualDone;
-  const sessions = loadSessions();
-  const s = sessions.find(x => x.id === id);
-  if (!s) return res.status(404).json({ ok: false, error: "not found" });
-  if (manualDone) {
+  const found = findSessionOr404(req.params.id, res); if (!found) return;
+  const { sessions, session: s } = found;
+  if (req.body?.manualDone) {
     s.manualDone = Date.now();
   } else {
     delete s.manualDone;
@@ -418,10 +423,8 @@ app.post("/api/sessions/:id/state", express.json(), (req, res) => {
 // session so we can tell apart "you saw the assistant's reply" from "still
 // waiting on you to read it".
 app.post("/api/sessions/:id/viewed", (req, res) => {
-  const id = req.params.id;
-  const sessions = loadSessions();
-  const s = sessions.find(x => x.id === id);
-  if (!s) return res.status(404).json({ ok: false, error: "not found" });
+  const found = findSessionOr404(req.params.id, res); if (!found) return;
+  const { sessions, session: s } = found;
   s.lastViewed = Date.now();
   saveSessions(sessions);
   res.json({ ok: true, lastViewed: s.lastViewed });
@@ -434,9 +437,8 @@ app.post("/api/sessions/:id/email-sent", express.json(), (req, res) => {
   const threadId = (req.body?.threadId || "").trim();
   const account = (req.body?.account || "").trim();
   if (!threadId) return res.status(400).json({ ok: false, error: "threadId required" });
-  const sessions = loadSessions();
-  const s = sessions.find(x => x.id === id);
-  if (!s) return res.status(404).json({ ok: false, error: "not found" });
+  const found = findSessionOr404(id, res); if (!found) return;
+  const { sessions, session: s } = found;
   s.gmailThreadId = threadId;
   if (account) s.gmailAccount = account;
   // Initial cursor — anything that arrives AFTER this counts as a new reply.
@@ -452,9 +454,8 @@ app.post("/api/sessions/:id/append-assistant", express.json(), (req, res) => {
   const id = req.params.id;
   const text = String(req.body?.text || "").trim();
   if (!text) return res.status(400).json({ ok: false, error: "text required" });
-  const sessions = loadSessions();
-  const s = sessions.find(x => x.id === id);
-  if (!s) return res.status(404).json({ ok: false, error: "not found" });
+  const found = findSessionOr404(id, res); if (!found) return;
+  const { sessions, session: s } = found;
   const ts = Date.now();
   try {
     saveMessage(id, { role: "assistant", text, ts, source: "mcp_complete" });
@@ -474,9 +475,8 @@ app.post("/api/sessions/:id/append-assistant", express.json(), (req, res) => {
 // Body: { fromEmail, subject, messageId, snippet, ts }
 app.post("/api/sessions/:id/reactivate", express.json(), (req, res) => {
   const id = req.params.id;
-  const sessions = loadSessions();
-  const s = sessions.find(x => x.id === id);
-  if (!s) return res.status(404).json({ ok: false, error: "not found" });
+  const found = findSessionOr404(id, res); if (!found) return;
+  const { sessions, session: s } = found;
   const now = Date.now();
   const from = (req.body?.fromEmail || "someone").trim();
   const subject = (req.body?.subject || "").trim();
