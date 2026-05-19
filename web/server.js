@@ -203,6 +203,15 @@ function saveSessions(s) { fs.writeFileSync(SESSIONS_FILE, JSON.stringify(s, nul
 function updateSessionInStore(session) {
   saveSessions(loadSessions().map(s => s.id === session.id ? session : s));
 }
+// Send a JSON payload to a single WebSocket, swallowing errors (client may have disconnected).
+function wsSend(ws, typeOrPayload, data) {
+  try {
+    const payload = typeof typeOrPayload === "string"
+      ? Object.assign({ type: typeOrPayload }, data || {})
+      : typeOrPayload;
+    ws.send(JSON.stringify(payload));
+  } catch {}
+}
 // Push a JSON payload to all WS clients subscribed to a given session.
 function broadcastToSession(sessionId, payload) {
   const msg = JSON.stringify(payload);
@@ -1942,12 +1951,12 @@ wss.on("connection", (ws, req) => {
   setTimeout(() => { try { tryDrainQueue(session.id); } catch {} }, 200);
   // Tell client current queue depth so it can show "N queued"
   const _qd = queueLoad(session.id).length;
-  if (_qd > 0) try { ws.send(JSON.stringify({ type: "queue_state", queueDepth: _qd })); } catch {}
+  if (_qd > 0) wsSend(ws, "queue_state", { queueDepth: _qd });
 
   // Heartbeat: ping client every 20s
   const pingInterval = setInterval(() => {
     if (ws.readyState !== 1) return;
-    try { ws.send(JSON.stringify({ type: "ping", ts: Date.now() })); } catch {}
+    wsSend(ws, "ping", { ts: Date.now() });
   }, 20000);
 
   // Hoisted so permission_grant can call it for auto-retry
@@ -1984,7 +1993,7 @@ wss.on("connection", (ws, req) => {
           if (Array.isArray(content)) {
             for (const block of content) {
               if (block.type === "text" && block.text) {
-                try { ws.send(JSON.stringify({ type: "text", text: block.text })); } catch {}
+                wsSend(ws, "text", { text: block.text });
               }
               if (block.type === "tool_use") {
                 lastToolUse = { name: block.name, input: block.input, id: block.id };
@@ -2024,7 +2033,7 @@ wss.on("connection", (ws, req) => {
                   }
                   seenQuestionSig = sig;
                 }
-                try { ws.send(JSON.stringify({ type: "tool_use", name: block.name, input: block.input })); } catch {}
+                wsSend(ws, "tool_use", { name: block.name, input: block.input });
                 if (block.name === "AskUserQuestion") {
                   const qText = block.input?.question || block.input?.text || JSON.stringify(block.input);
                   saveMessage(session.id, { role: "question", text: qText, ts: Date.now() });
@@ -2079,7 +2088,7 @@ wss.on("connection", (ws, req) => {
                       attachments: Array.isArray(payload.attachments) ? payload.attachments : [],
                       project: session.project,
                       ts: Date.now() };
-                    try { ws.send(JSON.stringify(draftMsg)); } catch {}
+                    wsSend(ws, draftMsg);
                     saveMessage(session.id, { role: "email_draft",
                       to: draftMsg.to, cc: draftMsg.cc,
                       subject: draftMsg.subject, body: draftMsg.body,
@@ -2096,27 +2105,24 @@ wss.on("connection", (ws, req) => {
             if (block.type === "tool_result" && block.is_error &&
                 typeof block.content === "string" &&
                 (block.content.includes("requested permissions") || block.content.includes("requires approval"))) {
-              try {
-                ws.send(JSON.stringify({
-                  type: "permission_denied",
-                  tool_use_id: block.tool_use_id,
-                  message: block.content,
-                  tool_name: lastToolUse?.name || "unknown",
-                  tool_input: lastToolUse?.input || {},
-                }));
-                saveMessage(session.id, {
-                  role: "permission_denied",
-                  tool_name: lastToolUse?.name || "unknown",
-                  tool_input: lastToolUse?.input || {},
-                  message: block.content,
-                  ts: Date.now(),
-                });
-              } catch {}
+              wsSend(ws, "permission_denied", {
+                tool_use_id: block.tool_use_id,
+                message: block.content,
+                tool_name: lastToolUse?.name || "unknown",
+                tool_input: lastToolUse?.input || {},
+              });
+              saveMessage(session.id, {
+                role: "permission_denied",
+                tool_name: lastToolUse?.name || "unknown",
+                tool_input: lastToolUse?.input || {},
+                message: block.content,
+                ts: Date.now(),
+              });
             }
           }
         }
         if (data.type === "tool_result") {
-          try { ws.send(JSON.stringify({ type: "tool_result", name: data.tool_name || "", content: data.content || "" })); } catch {}
+          wsSend(ws, "tool_result", { name: data.tool_name || "", content: data.content || "" });
         }
         if (data.type === "result") {
           // After clearing activeProc below, try to drain the next queued prompt
@@ -2137,14 +2143,11 @@ wss.on("connection", (ws, req) => {
             const statusCode = apiErrorMatch ? apiErrorMatch[1] : "";
             const requestId = apiErrorMatch ? (apiErrorMatch[3] || "") : "";
             // Don't save as assistant — prevents polluting context on retry
-            try {
-              ws.send(JSON.stringify({
-                type: "api_error",
-                status_code: statusCode,
-                request_id: requestId,
-                message: result.slice(0, 500),
-              }));
-            } catch {}
+            wsSend(ws, "api_error", {
+              status_code: statusCode,
+              request_id: requestId,
+              message: result.slice(0, 500),
+            });
           } else {
             if (result) {
               saveMessage(session.id, { role: "assistant", text: result, ts: Date.now(), cost: data.total_cost_usd, duration: data.duration_ms });
@@ -2161,15 +2164,12 @@ wss.on("connection", (ws, req) => {
                 }
               } catch (e) { console.warn("[title-gen] trigger failed:", e.message); }
             }
-            try {
-              ws.send(JSON.stringify({
-                type: "done",
-                result,
-                cost: data.total_cost_usd,
-                duration: data.duration_ms,
-                session_id: data.session_id,
-              }));
-            } catch {}
+            wsSend(ws, "done", {
+              result,
+              cost: data.total_cost_usd,
+              duration: data.duration_ms,
+              session_id: data.session_id,
+            });
           }
         }
       },
@@ -2186,7 +2186,7 @@ wss.on("connection", (ws, req) => {
             const msgs0 = loadMessages(session.id);
             const lu = [...msgs0].reverse().find(m => m.role === "user");
             if (lu) {
-              try { ws.send(JSON.stringify({ type: "thinking" })); } catch {}
+              wsSend(ws, "thinking");
               sendToSession(lu.text, true);
               return;
             }
@@ -2196,12 +2196,12 @@ wss.on("connection", (ws, req) => {
         const lastMsg = msgs.length ? msgs[msgs.length - 1] : null;
         if (lastMsg && lastMsg.role === "user" && !isRetry) {
           console.log("[auto-retry] response lost, retrying:", session.id);
-          try { ws.send(JSON.stringify({ type: "thinking" })); } catch {}
+          wsSend(ws, "thinking");
           sendToSession(lastMsg.text, true);
           return;
         }
         if (code !== 0 && stderr) {
-          try { ws.send(JSON.stringify({ type: "error", message: stderr.slice(0, 500) })); } catch {}
+          wsSend(ws, "error", { message: stderr.slice(0, 500) });
         }
         // Stalled-run guard: process closed but no result/api_error ever came.
         // Save a synthetic marker so the persisted state isn't stuck on
@@ -2215,11 +2215,11 @@ wss.on("connection", (ws, req) => {
               ? "⚠️ The agent stopped mid-run without producing a final response. Re-prompt to continue."
               : "⚠️ The agent process exited (code " + code + ") before producing a final response. Re-prompt to retry.";
             saveMessage(session.id, { role: "assistant", text: note, ts: Date.now(), recovered: true, stalled: true });
-            try { ws.send(JSON.stringify({ type: "history", messages: loadMessages(session.id) })); } catch {}
+            wsSend(ws, "history", { messages: loadMessages(session.id) });
             console.log("[stalled-run]", session.id, "no result; saved marker (code=" + code + ")");
           }
         }
-        try { ws.send(JSON.stringify({ type: "idle" })); } catch {}
+        wsSend(ws, "idle");
       }
     );
   }
@@ -2231,7 +2231,7 @@ wss.on("connection", (ws, req) => {
       case "prompt": {
         // ACK immediately so client can drop from outbox even if we reject below
         if (msg.client_id) {
-          try { ws.send(JSON.stringify({ type: "ack", client_id: msg.client_id })); } catch {}
+          wsSend(ws, "ack", { client_id: msg.client_id });
         }
         // Dedupe resends: if we already saved this client_id as a user message, skip
         if (msg.resend && msg.client_id) {
@@ -2245,7 +2245,7 @@ wss.on("connection", (ws, req) => {
           // Already running — write the new prompt to the persistent queue.
           // It will auto-fire when the current run completes (see onDone).
           queueAppend(session.id, { text: msg.text || "", source: "prompt", client_id: msg.client_id });
-          try { ws.send(JSON.stringify({ type: "queued", client_id: msg.client_id, queueDepth: queueLoad(session.id).length })); } catch {}
+          wsSend(ws, "queued", { client_id: msg.client_id, queueDepth: queueLoad(session.id).length });
           return;
         }
 
@@ -2293,12 +2293,12 @@ wss.on("connection", (ws, req) => {
         const m = String((msg && msg.model) || "").trim();
         const ALLOWED = /^[a-z][a-z0-9.-]{0,80}$/;
         if (m && !ALLOWED.test(m)) {
-          try { ws.send(JSON.stringify({ type: "error", message: "Invalid model name" })); } catch {}
+          wsSend(ws, "error", { message: "Invalid model name" });
           break;
         }
         session.model = m || null;
         updateSessionInStore(session);
-        try { ws.send(JSON.stringify({ type: "model_set", model: session.model })); } catch {}
+        wsSend(ws, "model_set", { model: session.model });
         console.log("[model] session", session.id, "->", session.model || "default");
         break;
       }
@@ -2306,7 +2306,7 @@ wss.on("connection", (ws, req) => {
         const taskId = String(msg.task_id || "").trim();
         session.linked_task = taskId || null;
         updateSessionInStore(session);
-        try { ws.send(JSON.stringify({ type: "task_linked", task_id: session.linked_task })); } catch {}
+        wsSend(ws, "task_linked", { task_id: session.linked_task });
         console.log("[task-link] session", session.id, "->", session.linked_task || "none");
         break;
       }
@@ -2318,7 +2318,7 @@ wss.on("connection", (ws, req) => {
           sessionPermissions[session.id].add(perm);
           savePermissions(session.id);
           console.log("[permission] granted for session", session.id, ":", perm);
-          try { ws.send(JSON.stringify({ type: "permission_granted", permission: perm })); } catch {}
+          wsSend(ws, "permission_granted", { permission: perm });
 
           // Auto-retry: re-send the last user message with the new permission.
           // If activeProc is somehow still alive (race between permission_denied
@@ -2338,11 +2338,11 @@ wss.on("connection", (ws, req) => {
             }
             if (lastUserText) {
               console.log("[permission] auto-retrying after grant:", session.id);
-              try { ws.send(JSON.stringify({ type: "thinking" })); } catch {}
+              wsSend(ws, "thinking");
               sendToSession(lastUserText, true);
             } else {
               console.warn("[permission] grant arrived but no user message to retry:", session.id);
-              try { ws.send(JSON.stringify({ type: "error", message: "Permission granted but couldn\u2019t find a message to retry. Send your prompt again." })); } catch {}
+              wsSend(ws, "error", { message: "Permission granted but couldn\u2019t find a message to retry. Send your prompt again." });
             }
           }
         }
@@ -2369,24 +2369,21 @@ wss.on("connection", (ws, req) => {
         }
         const durationSec = (startedAt && lastActive) ? Math.round((lastActive - startedAt) / 1000) : 0;
         const totalCost = allMsgs.filter(m => typeof m.cost === "number").reduce((a, m) => a + m.cost, 0);
-        try {
-          ws.send(JSON.stringify({
-            type: "session_summary",
-            data: {
-              user_messages: userMessages,
-              questions,
-              files_written: filesWritten,
-              files_edited: filesEdited,
-              files_read: filesRead,
-              bash_commands: bashCommands,
-              mcp_tools: mcpTools,
-              duration_seconds: durationSec,
-              total_cost_usd: totalCost,
-              started_at: startedAt,
-              last_active: lastActive,
-            },
-          }));
-        } catch {}
+        wsSend(ws, "session_summary", {
+          data: {
+            user_messages: userMessages,
+            questions,
+            files_written: filesWritten,
+            files_edited: filesEdited,
+            files_read: filesRead,
+            bash_commands: bashCommands,
+            mcp_tools: mcpTools,
+            duration_seconds: durationSec,
+            total_cost_usd: totalCost,
+            started_at: startedAt,
+            last_active: lastActive,
+          },
+        });
         break;
       }
       case "interrupt": {
@@ -2398,7 +2395,7 @@ wss.on("connection", (ws, req) => {
           setTimeout(() => { try { process.kill(-_p.pid, "SIGKILL"); } catch { try { _p.kill("SIGKILL"); } catch {} } }, 2000);
           saveMessage(session.id, { role: "interrupted", ts: Date.now() });
         }
-        try { ws.send(JSON.stringify({ type: "interrupted" })); } catch {}
+        wsSend(ws, "interrupted");
         break;
       }
     }
