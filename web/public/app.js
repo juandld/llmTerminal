@@ -1315,12 +1315,17 @@ function grantAllPerms(extraPerm){
     }
   }
 }
-function addPermissionCard(msg){
-  removeThinking();
+function _buildPermCardBase(toolName, toolInput, message){
   const d=mk("div","msg permission");
   const label=mk("div","perm-label");label.textContent="Permission Required";
-  const tool=mk("div","perm-tool");tool.textContent=describePermAction(msg);
-  const detail=mk("div","perm-detail");detail.textContent=msg.message||"";
+  const tool=mk("div","perm-tool");tool.textContent=describePermAction({tool_name:toolName,tool_input:toolInput});
+  const detail=mk("div","perm-detail");detail.textContent=message||"";
+  d.appendChild(label);d.appendChild(tool);d.appendChild(detail);
+  return d;
+}
+function addPermissionCard(msg){
+  removeThinking();
+  const d=_buildPermCardBase(msg.tool_name,msg.tool_input,msg.message);
   const actions=mk("div","perm-actions");
   const allow=mk("button","perm-btn perm-allow");allow.textContent="Allow";
   const allowAll=mk("button","perm-btn perm-allow");allowAll.textContent="Allow All";allowAll.title="Grant all permissions for this session";
@@ -1339,23 +1344,17 @@ function addPermissionCard(msg){
     actions.innerHTML='<span class="perm-result denied">Denied</span>';
   };
   actions.appendChild(allow);actions.appendChild(allowAll);actions.appendChild(deny);
-  d.appendChild(label);d.appendChild(tool);d.appendChild(detail);d.appendChild(actions);
+  d.appendChild(actions);
   chat.appendChild(d);scrollToBottomForce();
 }
 function addPermissionCardFromHistory(msg){
-  // Check if this permission is currently in the granted set
   const perm=buildPermString({tool_name:msg.tool_name,tool_input:msg.tool_input});
   const isGranted=grantedPerms&&grantedPerms.has(perm);
-  const d=mk("div","msg permission");
-  const label=mk("div","perm-label");label.textContent="Permission Required";
-  const tool=mk("div","perm-tool");tool.textContent=describePermAction({tool_name:msg.tool_name,tool_input:msg.tool_input});
-  const detail=mk("div","perm-detail");detail.textContent=msg.message||"";
-  d.appendChild(label);d.appendChild(tool);d.appendChild(detail);
+  const d=_buildPermCardBase(msg.tool_name,msg.tool_input,msg.message);
   if(isGranted){
     const res=mk("div","perm-result allowed");res.textContent="(allowed)";
     d.appendChild(res);
   }else{
-    // Still needs grant — show actionable buttons
     const actions=mk("div","perm-actions");
     const allow=mk("button","perm-btn perm-allow");allow.textContent="Allow";
     const allowAll=mk("button","perm-btn perm-allow");allowAll.textContent="Allow All";
@@ -1456,14 +1455,7 @@ function matchesSearch(p, q){
   return fields.some(f=>f.toLowerCase().includes(low));
 }
 
-function timeAgo(ts){
-  if(!ts) return "";
-  const ms=Date.now()-new Date(ts).getTime();
-  if(ms<60000) return "now";
-  if(ms<3600000) return Math.floor(ms/60000)+"m";
-  if(ms<86400000) return Math.floor(ms/3600000)+"h";
-  return Math.floor(ms/86400000)+"d";
-}
+function timeAgo(ts){ return relativeTime(new Date(ts).getTime()); }
 function formatSize(b){if(b<1024)return b+"B";if(b<1048576)return(b/1024).toFixed(1)+"KB";return(b/1048576).toFixed(1)+"MB"}
 function renderAttachmentsHtml(previewId,attachments){
   let h='';
@@ -1748,16 +1740,6 @@ function _decStatusIcon(s){
        : s === "mined"    ? "~"
        : "•";
 }
-function _decRelTime(ts){
-  const now = Date.now();
-  const dMin = Math.max(0, (now - ts) / 60000);
-  if (dMin < 1) return "just now";
-  if (dMin < 60) return Math.floor(dMin) + "m ago";
-  if (dMin < 24*60) return Math.floor(dMin/60) + "h ago";
-  return Math.floor(dMin/(24*60)) + "d ago";
-}
-function _escD(s){ return String(s||"").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])); }
-
 function _renderDecisionRow(d, depth){
   const id = String(d.id);
   const expanded = _decisionsExpanded.has(id);
@@ -1767,19 +1749,19 @@ function _renderDecisionRow(d, depth){
   let body = "";
   if (expanded) {
     const alts = Array.isArray(d.alternatives) && d.alternatives.length
-      ? d.alternatives.map(a => `<li>${_escD(a)}</li>`).join("")
+      ? d.alternatives.map(a => `<li>${esc(a)}</li>`).join("")
       : "<li class=\"dec-empty\">(none recorded)</li>";
     const cons = Array.isArray(d.constraints) && d.constraints.length
-      ? `<div class="dec-section"><div class="dec-label">Constraints</div><ul>${d.constraints.map(c => `<li>${_escD(c)}</li>`).join("")}</ul></div>`
+      ? `<div class="dec-section"><div class="dec-label">Constraints</div><ul>${d.constraints.map(c => `<li>${esc(c)}</li>`).join("")}</ul></div>`
       : "";
-    const cost = d.cost ? `<div class="dec-section"><div class="dec-label">Cost</div><div>${_escD(d.cost)}</div></div>` : "";
+    const cost = d.cost ? `<div class="dec-section"><div class="dec-label">Cost</div><div>${esc(d.cost)}</div></div>` : "";
     let arts = "";
     if (d.artifacts) {
       try {
         const parts = [];
         for (const [k, v] of Object.entries(d.artifacts)) {
-          if (Array.isArray(v)) parts.push(`<li><b>${_escD(k)}:</b><ul>${v.map(x => `<li>${_escD(x)}</li>`).join("")}</ul></li>`);
-          else parts.push(`<li><b>${_escD(k)}:</b> ${_escD(typeof v === "string" ? v : JSON.stringify(v))}</li>`);
+          if (Array.isArray(v)) parts.push(`<li><b>${esc(k)}:</b><ul>${v.map(x => `<li>${esc(x)}</li>`).join("")}</ul></li>`);
+          else parts.push(`<li><b>${esc(k)}:</b> ${esc(typeof v === "string" ? v : JSON.stringify(v))}</li>`);
         }
         if (parts.length) arts = `<div class="dec-section"><div class="dec-label">Artifacts</div><ul>${parts.join("")}</ul></div>`;
       } catch {}
@@ -1787,18 +1769,18 @@ function _renderDecisionRow(d, depth){
     const mined = d.mined ? ` <span class="dec-mined" title="Auto-extracted, lower confidence">mined</span>` : "";
     body = `
       <div class="dec-detail">
-        <div class="dec-section"><div class="dec-label">Chose</div><div>${_escD(d.chose)}</div></div>
+        <div class="dec-section"><div class="dec-label">Chose</div><div>${esc(d.chose)}</div></div>
         <div class="dec-section"><div class="dec-label">Alternatives</div><ul>${alts}</ul></div>
-        <div class="dec-section"><div class="dec-label">Why</div><div>${_escD(d.why || "")}</div></div>
+        <div class="dec-section"><div class="dec-label">Why</div><div>${esc(d.why || "")}</div></div>
         ${cons}${cost}${arts}
-        <div class="dec-meta">#${id} · ${_escD(d.status)}${mined}</div>
+        <div class="dec-meta">#${id} · ${esc(d.status)}${mined}</div>
       </div>`;
   }
   return `<div class="dec-row" data-did="${id}" ${indent}>
     <div class="dec-headline">
-      <span class="dec-dot ${stClass}" title="${_escD(d.status)}">${ic}</span>
-      <div class="dec-title">${_escD(d.summary)}</div>
-      <div class="dec-when">${_decRelTime(d.ts)}</div>
+      <span class="dec-dot ${stClass}" title="${esc(d.status)}">${ic}</span>
+      <div class="dec-title">${esc(d.summary)}</div>
+      <div class="dec-when">${relativeTime(d.ts)}</div>
     </div>
     ${body}
   </div>`;
