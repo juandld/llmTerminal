@@ -895,6 +895,17 @@ app.use("/voice-notes", express.static(VOICE_DIR));
 // ---- Orchestrator task board proxy (narrativeHero :8000) ----
 const ORCH_BASE = "http://localhost:8000/api/orchestrator";
 
+// Proxy a request to the narrativeHero orchestrator and forward the JSON response
+async function proxyOrchestrator(res, orchPath, fetchOpts = {}) {
+  try {
+    const r = await fetch(ORCH_BASE + orchPath, fetchOpts);
+    if (!r.ok) return res.status(r.status).json({ error: "orchestrator error", status: r.status });
+    res.json(await r.json());
+  } catch (err) {
+    res.status(502).json({ error: "orchestrator unreachable", detail: String(err.message || err) });
+  }
+}
+
 // Drafts-only policy: send_gmail_email.py refuses to run without this token.
 // We read it once at startup and inject into the spawn env for /api/email-draft/send only.
 let LLMT_SEND_TOKEN = "";
@@ -906,58 +917,33 @@ try {
 
 // Create a new task — proxies to narrativeHero orchestrator queue/create
 app.post("/api/tasks", express.json(), async (req, res) => {
-  try {
-    const body = req.body || {};
-    if (!body.title) return res.status(400).json({ error: "title required" });
-    const r = await fetch(ORCH_BASE + "/queue/create", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!r.ok) return res.status(r.status).json({ error: "orchestrator create failed", status: r.status });
-    const data = await r.json();
-    res.json(data);
-  } catch (err) {
-    res.status(502).json({ error: "orchestrator unreachable", detail: String(err.message || err) });
-  }
+  const body = req.body || {};
+  if (!body.title) return res.status(400).json({ error: "title required" });
+  proxyOrchestrator(res, "/queue/create", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
 });
 
 app.get("/api/tasks", async (req, res) => {
-  try {
-    const qs = new URLSearchParams();
-    if (req.query.status) qs.set("status", req.query.status);
-    if (req.query.project_id) qs.set("project_id", req.query.project_id);
-    qs.set("limit", req.query.limit || "100");
-    const r = await fetch(ORCH_BASE + "/queue/items?" + qs);
-    if (!r.ok) return res.status(r.status).json({ error: "orchestrator error" });
-    res.json(await r.json());
-  } catch (err) {
-    res.status(502).json({ error: "orchestrator unreachable", detail: String(err.message || err) });
-  }
+  const qs = new URLSearchParams();
+  if (req.query.status) qs.set("status", req.query.status);
+  if (req.query.project_id) qs.set("project_id", req.query.project_id);
+  qs.set("limit", req.query.limit || "100");
+  proxyOrchestrator(res, "/queue/items?" + qs);
 });
 
 app.get("/api/tasks/summary", async (_req, res) => {
-  try {
-    const r = await fetch(ORCH_BASE + "/queue/summary");
-    if (!r.ok) return res.status(r.status).json({ error: "orchestrator error" });
-    res.json(await r.json());
-  } catch (err) {
-    res.status(502).json({ error: "orchestrator unreachable", detail: String(err.message || err) });
-  }
+  proxyOrchestrator(res, "/queue/summary");
 });
 
 app.post("/api/tasks/:id/transition", express.json(), async (req, res) => {
-  try {
-    const r = await fetch(ORCH_BASE + "/queue/items/" + req.params.id + "/transition", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(req.body)
-    });
-    if (!r.ok) return res.status(r.status).json({ error: "transition failed" });
-    res.json(await r.json());
-  } catch (err) {
-    res.status(502).json({ error: "orchestrator unreachable", detail: String(err.message || err) });
-  }
+  proxyOrchestrator(res, "/queue/items/" + req.params.id + "/transition", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req.body),
+  });
 });
 
 // ---- Auto-retry blocked tasks every 5 minutes ----
@@ -1470,6 +1456,26 @@ function runCheapClaude(prompt, tag, onParsed) {
   proc.on("error", e => console.error(`[${tag}] spawn error:`, e.message));
 }
 
+// ── Shared transcript builder for supervisor-pattern observers ──
+// Builds a compact text transcript from recent messages for use in prompts.
+// opts.includeToolActivity: if true, keeps TOOL_ACTIVITY lines (truncated)
+// opts.maxChars: per-message truncation limit (default 600)
+function buildRecentTranscript(messages, opts = {}) {
+  const maxChars = opts.maxChars || 600;
+  return messages.map(m => {
+    const r = (m.role || "").toUpperCase();
+    let t = m.text || m.summary || "";
+    if (r === "TOOL_ACTIVITY") {
+      if (!opts.includeToolActivity) return null;
+      t = `(${m.tool_name || "tool"}) ${t}`.slice(0, 200);
+    } else {
+      t = String(t).slice(0, maxChars);
+    }
+    if (!t) return null;
+    return `${r}: ${t}`;
+  }).filter(Boolean).join("\n\n");
+}
+
 // ── End-of-run observer (Tier 2 "supervisor pattern") ──
 // After each agent run completes, fire a cheap Haiku call to read the recent
 // messages and identify anything David asked for that the agent didn't address.
@@ -1491,13 +1497,7 @@ function spawnObserver(sessionId, projectName) {
     if (all.length < OBSERVER_MIN_MESSAGES) return;
     const recent = all.slice(-25);  // bound prompt size
 
-    // Build a compact conversation log
-    const lines = recent.map(m => {
-      const r = (m.role || "").toUpperCase();
-      const t = m.text || m.summary || "";
-      if (!t || r === "TOOL_ACTIVITY") return null;
-      return `${r}: ${String(t).slice(0, 600)}`;
-    }).filter(Boolean).join("\n\n");
+    const lines = buildRecentTranscript(recent);
     if (lines.length < 50) return;
 
     const prompt = `You are observing a chat between David (user) and an agent. Read the recent messages and identify any items David ASKED FOR that the agent did NOT clearly address or complete. Skip items the agent finished.
@@ -1571,18 +1571,7 @@ function spawnDecisionExtractor(sessionId, projectName) {
     const recent = all.filter(m => (m.ts || 0) > hwm).slice(-40);
     if (recent.length < 2) return;
 
-    const lines = recent.map(m => {
-      const r = (m.role || "").toUpperCase();
-      let t = m.text || m.summary || "";
-      if (r === "TOOL_ACTIVITY") {
-        // Keep tool activity but truncate hard
-        t = `(${m.tool_name || "tool"}) ${t}`.slice(0, 200);
-      } else {
-        t = String(t).slice(0, 800);
-      }
-      if (!t) return null;
-      return `${r}: ${t}`;
-    }).filter(Boolean).join("\n\n");
+    const lines = buildRecentTranscript(recent, { includeToolActivity: true, maxChars: 800 });
     if (lines.length < 80) return;
 
     // Pull last few already-recorded decisions for dedup hint.
