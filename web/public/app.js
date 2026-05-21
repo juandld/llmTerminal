@@ -1742,15 +1742,6 @@ function _decStatusIcon(s){
        : s === "mined"    ? "~"
        : "•";
 }
-function _decRelTime(ts){
-  const now = Date.now();
-  const dMin = Math.max(0, (now - ts) / 60000);
-  if (dMin < 1) return "just now";
-  if (dMin < 60) return Math.floor(dMin) + "m ago";
-  if (dMin < 24*60) return Math.floor(dMin/60) + "h ago";
-  return Math.floor(dMin/(24*60)) + "d ago";
-}
-function _escD(s){ return String(s||"").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])); }
 
 function _renderDecisionRow(d, depth){
   const id = String(d.id);
@@ -1761,19 +1752,19 @@ function _renderDecisionRow(d, depth){
   let body = "";
   if (expanded) {
     const alts = Array.isArray(d.alternatives) && d.alternatives.length
-      ? d.alternatives.map(a => `<li>${_escD(a)}</li>`).join("")
+      ? d.alternatives.map(a => `<li>${esc(a)}</li>`).join("")
       : "<li class=\"dec-empty\">(none recorded)</li>";
     const cons = Array.isArray(d.constraints) && d.constraints.length
-      ? `<div class="dec-section"><div class="dec-label">Constraints</div><ul>${d.constraints.map(c => `<li>${_escD(c)}</li>`).join("")}</ul></div>`
+      ? `<div class="dec-section"><div class="dec-label">Constraints</div><ul>${d.constraints.map(c => `<li>${esc(c)}</li>`).join("")}</ul></div>`
       : "";
-    const cost = d.cost ? `<div class="dec-section"><div class="dec-label">Cost</div><div>${_escD(d.cost)}</div></div>` : "";
+    const cost = d.cost ? `<div class="dec-section"><div class="dec-label">Cost</div><div>${esc(d.cost)}</div></div>` : "";
     let arts = "";
     if (d.artifacts) {
       try {
         const parts = [];
         for (const [k, v] of Object.entries(d.artifacts)) {
-          if (Array.isArray(v)) parts.push(`<li><b>${_escD(k)}:</b><ul>${v.map(x => `<li>${_escD(x)}</li>`).join("")}</ul></li>`);
-          else parts.push(`<li><b>${_escD(k)}:</b> ${_escD(typeof v === "string" ? v : JSON.stringify(v))}</li>`);
+          if (Array.isArray(v)) parts.push(`<li><b>${esc(k)}:</b><ul>${v.map(x => `<li>${esc(x)}</li>`).join("")}</ul></li>`);
+          else parts.push(`<li><b>${esc(k)}:</b> ${esc(typeof v === "string" ? v : JSON.stringify(v))}</li>`);
         }
         if (parts.length) arts = `<div class="dec-section"><div class="dec-label">Artifacts</div><ul>${parts.join("")}</ul></div>`;
       } catch {}
@@ -1781,18 +1772,18 @@ function _renderDecisionRow(d, depth){
     const mined = d.mined ? ` <span class="dec-mined" title="Auto-extracted, lower confidence">mined</span>` : "";
     body = `
       <div class="dec-detail">
-        <div class="dec-section"><div class="dec-label">Chose</div><div>${_escD(d.chose)}</div></div>
+        <div class="dec-section"><div class="dec-label">Chose</div><div>${esc(d.chose)}</div></div>
         <div class="dec-section"><div class="dec-label">Alternatives</div><ul>${alts}</ul></div>
-        <div class="dec-section"><div class="dec-label">Why</div><div>${_escD(d.why || "")}</div></div>
+        <div class="dec-section"><div class="dec-label">Why</div><div>${esc(d.why || "")}</div></div>
         ${cons}${cost}${arts}
-        <div class="dec-meta">#${id} · ${_escD(d.status)}${mined}</div>
+        <div class="dec-meta">#${id} · ${esc(d.status)}${mined}</div>
       </div>`;
   }
   return `<div class="dec-row" data-did="${id}" ${indent}>
     <div class="dec-headline">
-      <span class="dec-dot ${stClass}" title="${_escD(d.status)}">${ic}</span>
-      <div class="dec-title">${_escD(d.summary)}</div>
-      <div class="dec-when">${_decRelTime(d.ts)}</div>
+      <span class="dec-dot ${stClass}" title="${esc(d.status)}">${ic}</span>
+      <div class="dec-title">${esc(d.summary)}</div>
+      <div class="dec-when">${relativeTime(d.ts)}</div>
     </div>
     ${body}
   </div>`;
