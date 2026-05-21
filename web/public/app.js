@@ -778,6 +778,7 @@ function connect(project,sessionId){
         loadSessions();
         refreshPreviews(false);
         startBrowserPoll();
+        if (modelSel) { modelSel.value = session.model || ""; applyModelDirty(); }
         break;
       case "history":
         // Diff-based rendering: only append messages newer than what's already on screen
@@ -906,13 +907,6 @@ function connect(project,sessionId){
         break;
       case "permission_denied":
         addPermissionCard(msg);
-        break;
-case "session":
-        // Server ships the session object on connect; reflect its current model.
-        if (msg.session && modelSel) {
-          modelSel.value = msg.session.model || "";
-          applyModelDirty();
-        }
         break;
       case "model_set":
         if (modelSel) {
