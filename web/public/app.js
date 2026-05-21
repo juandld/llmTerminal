@@ -669,6 +669,14 @@ function renderDoneSection(items) {
 }
 
 
+function _teardownAndConnect(project, sessionId){
+  if(ws) ws.close();
+  chat.innerHTML=""; session=null; ws=null; busy=false; removeThinking();
+  try { localStorage.setItem("llmt_project", project); } catch {}
+  setBusy(false);
+  connect(project, sessionId);
+  _updateNewSessionLabel();
+}
 function newSession(project){
   // Always show picker if no project given so the user picks explicitly
   // (avoids "session landed in the wrong project" surprises).
@@ -676,13 +684,8 @@ function newSession(project){
     openNewSessionPicker();
     return;
   }
-  if(ws) ws.close();
-  chat.innerHTML=""; session=null; ws=null; busy=false; removeThinking();
   localStorage.removeItem("llmt_session"); location.hash="";
-  try { localStorage.setItem("llmt_project", project); } catch {}
-  setBusy(false);
-  connect(project, null);
-  _updateNewSessionLabel();
+  _teardownAndConnect(project, null);
 }
 function openNewSessionPicker(){
   const overlay = mk("div", "sb-picker-overlay");
@@ -717,12 +720,7 @@ function openNewSessionPicker(){
   document.body.appendChild(overlay);
 }
 function resumeSession(s){
-  if(ws) ws.close();
-  chat.innerHTML=""; session=null; ws=null; busy=false; removeThinking();
-  try { localStorage.setItem("llmt_project", s.project); } catch {}
-  setBusy(false);
-  connect(s.project,s.id);
-  _updateNewSessionLabel();
+  _teardownAndConnect(s.project, s.id);
 }
 async function delSession(id){
   await fetch(apiUrl("/api/sessions/"+id),{method:"DELETE"});
