@@ -972,6 +972,9 @@ function connect(project,sessionId){
   },5000);
 }
 
+function _clearInput(){
+  inp.value=""; inp.style.height="44px"; localStorage.removeItem("llmt_draft"); clearImages();
+}
 function send(){
   const text=inp.value.trim();
   if(!text&&pendingImages.length===0) return;
@@ -987,8 +990,7 @@ function send(){
     const previews=pendingImages.map(i=>i.preview);
     messageQueue.push({text,images,previews});
     addQueued(text);
-    inp.value=""; inp.style.height="44px"; localStorage.removeItem("llmt_draft");
-    clearImages();
+    _clearInput();
     renderQueueCount();
     return;
   }
@@ -1005,7 +1007,7 @@ function send(){
       ws.send(JSON.stringify({type:"prompt",client_id:clientId,text:prompt,images}));
       setBusy(true);
     };
-    addUser(text,previews); inp.value=""; inp.style.height="44px"; clearImages();
+    addUser(text,previews); _clearInput();
     return;
   }
   const clientId=genMsgId();
@@ -1016,10 +1018,8 @@ function send(){
   const liveTs=Date.now();
   const last=chat.lastElementChild;
   if(last){last.dataset.ts=liveTs; lastRenderedTs=liveTs}
-  inp.value=""; inp.style.height="44px"; inp.setAttribute("placeholder","Message Claude...");
-  localStorage.removeItem("llmt_draft");
+  _clearInput(); inp.setAttribute("placeholder","Message Claude...");
   localStorage.removeItem("llmt_draft_sel");
-  clearImages();
   setBusy(true);
 }
 
@@ -2936,32 +2936,24 @@ function loadTaskIntoChat(el){
   }
 })();
 
+function _transitionTask(taskId, status, detail){
+  return fetch("./api/tasks/"+taskId+"/transition",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({status,detail})});
+}
 async function retryAllBlocked(){
   const blocked=taskCache.filter(t=>t.status==="blocked");
   if(!blocked.length){alert("No blocked tasks");return;}
   let ok=0;
   for(const t of blocked){
-    try{
-      const r=await fetch("./api/tasks/"+t.task_id+"/transition",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({status:"queued",detail:"Bulk retry from task board"})});
-      if(r.ok) ok++;
-    }catch{}
+    try{ const r=await _transitionTask(t.task_id,"queued","Bulk retry from task board"); if(r.ok) ok++; }catch{}
   }
   console.log("[tasks] retried "+ok+"/"+blocked.length+" blocked tasks");
   loadTasks();
 }
 async function taskAction(taskId,action){
-  try{
-    if(action==="retry"){
-      await fetch("./api/tasks/"+taskId+"/transition",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({status:"queued",detail:"Retried from task board"})});
-    } else if(action==="close"){
-      await fetch("./api/tasks/"+taskId+"/transition",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({status:"closed",detail:"Closed from task board"})});
-    } else if(action==="merge"){
-      await fetch("./api/tasks/"+taskId+"/transition",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({status:"merged",detail:"Approved from task board"})});
-    } else if(action==="queue"){
-      await fetch("./api/tasks/"+taskId+"/transition",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({status:"queued",detail:"Queued from task board"})});
-    }
-    loadTasks();
-  }catch(err){console.error("[task-action]",err);}
+  const map={retry:["queued","Retried from task board"],close:["closed","Closed from task board"],merge:["merged","Approved from task board"],queue:["queued","Queued from task board"]};
+  const args=map[action];
+  if(!args) return;
+  try{ await _transitionTask(taskId,args[0],args[1]); loadTasks(); }catch(err){console.error("[task-action]",err);}
 }
 
 // Auto-load task count on page load
