@@ -30,8 +30,7 @@ function rewriteCacheBust(html, publicDir) {
     /(<(?:script|link)[^>]*?(?:src|href)=")([^"?]+\.(?:js|css))(")/g,
     (m, pre, file, post) => {
       try {
-        const fs2 = require("fs");
-        const st = fs2.statSync(path.join(publicDir, file));
+        const st = fs.statSync(path.join(publicDir, file));
         return pre + file + "?v=" + Math.floor(st.mtimeMs) + post;
       } catch { return m; }
     }
@@ -899,7 +898,7 @@ const ORCH_BASE = "http://localhost:8000/api/orchestrator";
 // We read it once at startup and inject into the spawn env for /api/email-draft/send only.
 let LLMT_SEND_TOKEN = "";
 try {
-  LLMT_SEND_TOKEN = require("fs").readFileSync("/home/claude-user/.camohero-send/llmt-token", "utf8").trim();
+  LLMT_SEND_TOKEN = fs.readFileSync("/home/claude-user/.camohero-send/llmt-token", "utf8").trim();
 } catch (e) {
   console.error("[email-draft] WARNING: cannot read send-auth token:", e.message);
 }
@@ -1127,8 +1126,6 @@ app.post("/api/email-draft/send", express.json(), (req, res) => {
   if (threadId && /^[A-Za-z0-9_-]+$/.test(threadId)) { args.push("--thread-id", threadId); }
   // Attachments: validate each path is absolute, exists, and lives under camoHero project dir
   if (Array.isArray(attachments) && attachments.length) {
-    const path = require("path");
-    const fsx = require("fs");
     const ALLOWED_PREFIX = "/home/claude-user/projects/camoHero/";
     for (const ap of attachments) {
       if (typeof ap !== "string") {
@@ -1138,7 +1135,7 @@ app.post("/api/email-draft/send", express.json(), (req, res) => {
       if (!abs.startsWith(ALLOWED_PREFIX)) {
         return res.status(400).json({ ok: false, error: `attachment outside allowed dir: ${ap}` });
       }
-      if (!fsx.existsSync(abs)) {
+      if (!fs.existsSync(abs)) {
         return res.status(400).json({ ok: false, error: `attachment not found: ${ap}` });
       }
       args.push("--attach", abs);
@@ -1386,7 +1383,7 @@ function autoDetectBashFiles(stdout, sessionId, cwd) {
   // Scan for absolute paths under any project dir with known extensions
   for (const m of stdout.matchAll(/\/home\/claude-user\/projects\/[a-zA-Z0-9_-]+\/[^\s\\)\]>,.;]+/g)) {
     const p = m[0].replace(/[\)\]>,.;]+$/, '');
-    const ext = require('path').extname(p).toLowerCase();
+    const ext = path.extname(p).toLowerCase();
     if (EXT_TEXT.has(ext) || EXT_BIN.has(ext)) found.add(p);
   }
   // Scan for relative paths and resolve against the Bash cwd. Common case:
@@ -1400,7 +1397,7 @@ function autoDetectBashFiles(stdout, sessionId, cwd) {
     for (const m of stdout.matchAll(relRe)) {
       const rel = m[2];
       if (rel.startsWith('/') || rel.startsWith('..')) continue;
-      const abs = require('path').resolve(cwd, rel);
+      const abs = path.resolve(cwd, rel);
       if (!abs.startsWith('/home/claude-user/projects/')) continue;
       found.add(abs);
     }
@@ -1409,7 +1406,7 @@ function autoDetectBashFiles(stdout, sessionId, cwd) {
     if (!fs.existsSync(filePath)) continue;
     const mapKey = sessionId + ':' + filePath;
     if (previewMap[mapKey]) continue;
-    const ext = require('path').extname(filePath).toLowerCase();
+    const ext = path.extname(filePath).toLowerCase();
     const isBin = EXT_BIN.has(ext);
     let bodyText;
     if (isBin) {
@@ -1417,7 +1414,7 @@ function autoDetectBashFiles(stdout, sessionId, cwd) {
     } else {
       try { bodyText = fs.readFileSync(filePath, 'utf8'); } catch { continue; }
     }
-    const title = require('path').basename(filePath);
+    const title = path.basename(filePath);
     const body = JSON.stringify({ type: 'file', title, content: { body_text: bodyText }, session_id: sessionId });
     const req = http.request({
       hostname: '127.0.0.1', port: 8000, path: '/api/previews', method: 'POST',
