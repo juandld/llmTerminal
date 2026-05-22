@@ -34,7 +34,7 @@ function addEmailDraft(msg){
   const attachments = Array.isArray(msg.attachments) ? msg.attachments : [];
 
   const d = mk("div","msg email-draft");
-  const label = mk("div","draft-label");
+  const label = mk("div","msg-label draft-label");
   label.textContent = threadId ? "\u21A9 Reply (threads into existing conversation)" : "\u2709 New email";
   const hdr = mk("div","draft-hdr");
   const addRow = (k,v)=>{ if(!v) return;

@@ -846,7 +846,7 @@ function connect(project,sessionId){
           }
           const d=mk("div","msg "+(m.role==="user"?"user":m.role==="question"?"question":"assistant"));
           if(m.role==="user") d.appendChild(document.createTextNode(m.text));
-          else if(m.role==="question"){const l=mk("div","q-label");l.textContent="Question";const b=mk("div","q-text");b.innerHTML=fmt(m.text);d.appendChild(l);d.appendChild(b);}
+          else if(m.role==="question"){const l=mk("div","msg-label q-label");l.textContent="Question";const b=mk("div","q-text");b.innerHTML=fmt(m.text);d.appendChild(l);d.appendChild(b);}
           else{const b=mk("div","bubble");b.innerHTML=fmt(m.text);d.appendChild(b);}
           frag.appendChild(d);
         });
@@ -1169,12 +1169,12 @@ function addQuestion(text){
     else if(Array.isArray(parsed)) structured=parsed;
   }catch{}
   if(structured){
-    const label=mk("div","q-label");label.textContent="Questions — pick options below";
+    const label=mk("div","msg-label q-label");label.textContent="Questions — pick options below";
     d.appendChild(label);
     const selections={};
     structured.forEach((q,qi)=>{
       const card=mk("div","q-card");
-      if(q.header){const h=mk("div","q-header");h.textContent=q.header;card.appendChild(h);}
+      if(q.header){const h=mk("div","msg-label q-header");h.textContent=q.header;card.appendChild(h);}
       const qt=mk("div","q-question");qt.textContent=q.question;card.appendChild(qt);
       if(q.options&&q.options.length){
         selections[qi]=q.multiSelect?new Set():null;
@@ -1258,7 +1258,7 @@ function addQuestion(text){
     };
     d.appendChild(submit);
   }else{
-    const label=mk("div","q-label");label.textContent="Question — reply below";
+    const label=mk("div","msg-label q-label");label.textContent="Question — reply below";
     const body=mk("div","q-text");body.innerHTML=fmt(text);
     d.appendChild(label);d.appendChild(body);
   }
@@ -1310,7 +1310,7 @@ function grantAllPerms(extraPerm){
 function addPermissionCard(msg){
   removeThinking();
   const d=mk("div","msg permission");
-  const label=mk("div","perm-label");label.textContent="Permission Required";
+  const label=mk("div","msg-label perm-label");label.textContent="Permission Required";
   const tool=mk("div","perm-tool");tool.textContent=describePermAction(msg);
   const detail=mk("div","perm-detail");detail.textContent=msg.message||"";
   const actions=mk("div","perm-actions");
@@ -1339,7 +1339,7 @@ function addPermissionCardFromHistory(msg){
   const perm=buildPermString({tool_name:msg.tool_name,tool_input:msg.tool_input});
   const isGranted=grantedPerms&&grantedPerms.has(perm);
   const d=mk("div","msg permission");
-  const label=mk("div","perm-label");label.textContent="Permission Required";
+  const label=mk("div","msg-label perm-label");label.textContent="Permission Required";
   const tool=mk("div","perm-tool");tool.textContent=describePermAction({tool_name:msg.tool_name,tool_input:msg.tool_input});
   const detail=mk("div","perm-detail");detail.textContent=msg.message||"";
   d.appendChild(label);d.appendChild(tool);d.appendChild(detail);
@@ -2124,7 +2124,7 @@ function addToolActivityLine(toolName, summary){
 
 function addApiErrorCard(msg){
   const card=mk("div","msg api-error-card");
-  const label=mk("div","api-err-label");
+  const label=mk("div","msg-label api-err-label");
   label.textContent="API Error"+(msg.status_code?" "+msg.status_code:"");
   const body=mk("div","api-err-body");
   body.textContent=msg.message||"Anthropic returned an error.";
@@ -2241,7 +2241,7 @@ function renderSummary(data){
     ["Bash commands", (data.bash_commands||[]).length],
     ["Questions asked", data.questions||0],
   ];
-  html+='<div class="summary-section"><h3>Activity</h3>';
+  html+='<div class="summary-section"><h3 class="msg-label">Activity</h3>';
   stats.forEach(([k,v])=>{html+='<div class="summary-stat">'+k+'<span>'+v+'</span></div>'});
   if(typeof data.total_cost_usd==="number"){
     html+='<div class="summary-stat">Total cost<span>$'+data.total_cost_usd.toFixed(4)+'</span></div>';
@@ -2260,7 +2260,7 @@ function renderSummary(data){
   ];
   lists.forEach(([label,items])=>{
     if(!items||!items.length)return;
-    html+='<div class="summary-section"><h3>'+label+' ('+items.length+')</h3><ul class="summary-list">';
+    html+='<div class="summary-section"><h3 class="msg-label">'+label+' ('+items.length+')</h3><ul class="summary-list">';
     items.slice(0,30).forEach(x=>{html+='<li>'+esc(x)+'</li>'});
     if(items.length>30)html+='<li style="color:var(--dim)">\u2026 and '+(items.length-30)+' more</li>';
     html+='</ul></div>';
