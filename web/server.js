@@ -730,18 +730,26 @@ function queuePopNext(sessionId) {
 
 fs.mkdirSync(VOICE_DIR, { recursive: true });
 
-// Classify voice note transcript and auto-create orchestrator task if it's a new idea/direction
-async function classifyAndCapture(transcript, title, sessionId, audioUrl) {
+// Call OpenAI chat completions and return the trimmed content string (or null on failure).
+async function callOpenAI(model, maxTokens, systemPrompt, userContent) {
   const key = process.env.OPENAI_API_KEY;
-  if (!key) return;
+  if (!key) return null;
   const r = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: { "Authorization": "Bearer " + key, "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: "gpt-4o",
-      max_tokens: 200,
-      messages: [
-        { role: "system", content: `You classify voice note transcripts. Decide if this is:
+      model, max_tokens: maxTokens,
+      messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userContent }]
+    })
+  });
+  if (!r.ok) return null;
+  const data = await r.json();
+  return (data.choices?.[0]?.message?.content || "").trim();
+}
+
+// Classify voice note transcript and auto-create orchestrator task if it's a new idea/direction
+async function classifyAndCapture(transcript, title, sessionId, audioUrl) {
+  const content = await callOpenAI("gpt-4o", 200, `You classify voice note transcripts. Decide if this is:
 1. "reply" — a response to an ongoing conversation, a direct instruction to the current chat, a status update, OR meta-commentary about the chat itself
 2. "idea" — a NEW concept, feature idea, architectural direction, bug report, or something that should be tracked as an independent task
 
@@ -760,14 +768,8 @@ If "idea", also extract:
 - project: which project this relates to (narrativehero, crankhero, datahero, llmterminal, mediahero, oshero, or unknown)
 - priority: low, normal, high, or urgent
 
-Respond as JSON: {"type":"reply"} or {"type":"idea","title":"...","description":"...","project":"...","priority":"..."}` },
-        { role: "user", content: transcript.slice(0, 2000) }
-      ]
-    })
-  });
-  if (!r.ok) return;
-  const data = await r.json();
-  const content = (data.choices?.[0]?.message?.content || "").trim();
+Respond as JSON: {"type":"reply"} or {"type":"idea","title":"...","description":"...","project":"...","priority":"..."}`, transcript.slice(0, 2000));
+  if (!content) return;
   let parsed;
   try { parsed = JSON.parse(content); } catch { return; }
   if (parsed.type !== "idea") return;
@@ -855,23 +857,10 @@ app.post("/voice-note", express.raw({ type: ["audio/*", "application/octet-strea
     const transcript = result.text || "";
     if (transcript.length > 10) {
       try {
-        const tr = await fetch("https://api.openai.com/v1/chat/completions", {
-          method: "POST",
-          headers: { "Authorization": "Bearer " + key, "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model: "gpt-4o-mini",
-            max_tokens: 30,
-            messages: [
-              { role: "system", content: "Generate a 3-7 word title summarizing this voice note. No quotes, no punctuation at the end. Just the title." },
-              { role: "user", content: transcript.slice(0, 1000) }
-            ]
-          })
-        });
-        if (tr.ok) {
-          const tj = await tr.json();
-          title = (tj.choices?.[0]?.message?.content || "").trim();
-          console.log(`[voice-note] title: "${title}"`);
-        }
+        const t = await callOpenAI("gpt-4o-mini", 30,
+          "Generate a 3-7 word title summarizing this voice note. No quotes, no punctuation at the end. Just the title.",
+          transcript.slice(0, 1000));
+        if (t) { title = t; console.log(`[voice-note] title: "${title}"`); }
       } catch (e) { console.warn("[voice-note] title gen failed:", e.message); }
     }
     // Async: classify if this voice note contains a new idea/task
