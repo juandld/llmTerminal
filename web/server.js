@@ -903,60 +903,46 @@ try {
   console.error("[email-draft] WARNING: cannot read send-auth token:", e.message);
 }
 
-// Create a new task — proxies to narrativeHero orchestrator queue/create
-app.post("/api/tasks", express.json(), async (req, res) => {
+// Shared proxy: forward a request to the orchestrator and relay the JSON response.
+async function orchProxy(res, url, opts, errLabel) {
   try {
-    const body = req.body || {};
-    if (!body.title) return res.status(400).json({ error: "title required" });
-    const r = await fetch(ORCH_BASE + "/queue/create", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!r.ok) return res.status(r.status).json({ error: "orchestrator create failed", status: r.status });
-    const data = await r.json();
-    res.json(data);
+    const r = await fetch(ORCH_BASE + url, opts);
+    if (!r.ok) return res.status(r.status).json({ error: errLabel || "orchestrator error", status: r.status });
+    res.json(await r.json());
   } catch (err) {
     res.status(502).json({ error: "orchestrator unreachable", detail: String(err.message || err) });
   }
+}
+
+// Create a new task — proxies to narrativeHero orchestrator queue/create
+app.post("/api/tasks", express.json(), async (req, res) => {
+  const body = req.body || {};
+  if (!body.title) return res.status(400).json({ error: "title required" });
+  orchProxy(res, "/queue/create", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }, "orchestrator create failed");
 });
 
 app.get("/api/tasks", async (req, res) => {
-  try {
-    const qs = new URLSearchParams();
-    if (req.query.status) qs.set("status", req.query.status);
-    if (req.query.project_id) qs.set("project_id", req.query.project_id);
-    qs.set("limit", req.query.limit || "100");
-    const r = await fetch(ORCH_BASE + "/queue/items?" + qs);
-    if (!r.ok) return res.status(r.status).json({ error: "orchestrator error" });
-    res.json(await r.json());
-  } catch (err) {
-    res.status(502).json({ error: "orchestrator unreachable", detail: String(err.message || err) });
-  }
+  const qs = new URLSearchParams();
+  if (req.query.status) qs.set("status", req.query.status);
+  if (req.query.project_id) qs.set("project_id", req.query.project_id);
+  qs.set("limit", req.query.limit || "100");
+  orchProxy(res, "/queue/items?" + qs);
 });
 
 app.get("/api/tasks/summary", async (_req, res) => {
-  try {
-    const r = await fetch(ORCH_BASE + "/queue/summary");
-    if (!r.ok) return res.status(r.status).json({ error: "orchestrator error" });
-    res.json(await r.json());
-  } catch (err) {
-    res.status(502).json({ error: "orchestrator unreachable", detail: String(err.message || err) });
-  }
+  orchProxy(res, "/queue/summary");
 });
 
 app.post("/api/tasks/:id/transition", express.json(), async (req, res) => {
-  try {
-    const r = await fetch(ORCH_BASE + "/queue/items/" + req.params.id + "/transition", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(req.body)
-    });
-    if (!r.ok) return res.status(r.status).json({ error: "transition failed" });
-    res.json(await r.json());
-  } catch (err) {
-    res.status(502).json({ error: "orchestrator unreachable", detail: String(err.message || err) });
-  }
+  orchProxy(res, "/queue/items/" + req.params.id + "/transition", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req.body),
+  }, "transition failed");
 });
 
 // ---- Auto-retry blocked tasks every 5 minutes ----
