@@ -8,7 +8,7 @@ const { PROJECTS_DIR } = require("./paths");
 const { loadMessages, saveMessage, loadSessions, saveSessions, db } = require("./store");
 const { broadcastToSession } = require("./ws/broadcast");
 const { runCheapClaude } = require("./cheap-model");
-const { logFileAttribution, buildAttributionMap } = require("./attribution");
+const { logFileAttribution, buildAttributionMap, DRAWER_EXT_WHITELIST, DRAWER_EXCLUDED_DIRS } = require("./attribution");
 const { autoDetectBashFiles, autoCreatePreview } = require("./tools");
 
 function spawnObserver(sessionId, projectName) {

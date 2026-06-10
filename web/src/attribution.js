@@ -106,4 +106,4 @@ function _drawerWalkProjectFull(projectDir) {
   return out;
 }
 
-module.exports = { FILE_ATTRIBUTION_LOG, logFileAttribution, buildAttributionMap, _drawerWalkProjectFull, DRAWER_TIME_BUFFER_MS, DRAWER_RESULT_CAP };
+module.exports = { FILE_ATTRIBUTION_LOG, logFileAttribution, buildAttributionMap, _drawerWalkProjectFull, DRAWER_TIME_BUFFER_MS, DRAWER_RESULT_CAP, DRAWER_EXT_WHITELIST, DRAWER_EXCLUDED_DIRS };
