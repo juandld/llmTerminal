@@ -259,5 +259,3 @@ setInterval(()=>{
     if (changed) { _allSessions = sessions; _renderSidebar(); refreshAttentionCounter(); if(window._updateFabCount)window._updateFabCount(); }
   }).catch(()=>{});
 }, 15000);
-
-// (TTS playback moved to app-tts.js)
