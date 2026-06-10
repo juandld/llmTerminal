@@ -1429,8 +1429,6 @@ setTimeout(() => { autoRetryBlockedTasks(); autoVerifyEmails(); }, 30000);
 setInterval(() => { autoRetryBlockedTasks(); autoVerifyEmails(); }, 5 * 60 * 1000);
 
 // ---- Per-session granted permissions (persisted to disk) ----
-const PERMISSIONS_DIR = path.join(DATA_DIR, "permissions");
-fs.mkdirSync(PERMISSIONS_DIR, { recursive: true });
 
 
 // ---- /api/browser-status ----
@@ -1701,20 +1699,7 @@ app.post("/api/email-draft/log-intent", express.json(), (req, res) => {
 });
 
 
-const sessionPermissions = {}; // sessionId -> Set of permission strings
-
-function loadPermissions(sessionId) {
-  try { return new Set(JSON.parse(fs.readFileSync(path.join(PERMISSIONS_DIR, sessionId + ".json"), "utf8"))); }
-  catch { return new Set(); }
-}
-function savePermissions(sessionId) {
-  const perms = sessionPermissions[sessionId];
-  if (perms) fs.writeFileSync(path.join(PERMISSIONS_DIR, sessionId + ".json"), JSON.stringify([...perms]));
-}
-function ensurePermissionsLoaded(sessionId) {
-  if (!sessionPermissions[sessionId]) sessionPermissions[sessionId] = loadPermissions(sessionId);
-}
-
+const { sessionPermissions, loadPermissions, savePermissions, ensurePermissionsLoaded } = require("./src/permissions");
 // ---- Auto-preview file writes ----
 // When the agent uses Write/Edit/MultiEdit, post a preview to narrativeHero
 // so the file shows up in the Files drawer without the agent having to do it.
