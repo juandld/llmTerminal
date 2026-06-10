@@ -72,33 +72,298 @@ const sendBtn=document.getElementById("sendBtn"), stopBtn=document.getElementByI
 const sbList=document.getElementById("sbList");
 // projSel was removed; provide a synthetic stub so any leftover refs are harmless
 const projSel = { value: "ALL" };
-const modelSel = document.getElementById("modelSel");
-// Populate from localStorage default early so UI matches before WS arrives.
-try { const saved = localStorage.getItem("llmt_default_model") || ""; if (modelSel) modelSel.value = saved; } catch {}
-function applyModelDirty() { if (modelSel) modelSel.classList.toggle("dirty", !!modelSel.value); }
-applyModelDirty();
-if (modelSel) {
-  modelSel.addEventListener("change", () => {
-    const m = modelSel.value || "";
-    try { localStorage.setItem("llmt_default_model", m); } catch {}
-    applyModelDirty();
-    if (ws && ws.readyState === 1) {
-      ws.send(JSON.stringify({ type: "set_model", model: m }));
+// ── Win95 model picker (replaces the old <select>-based selectors) ────────────
+// One overlay (#modelPickerMenu), two trigger buttons (#modelPickerBtn topbar,
+// #omModelPickerBtn in mobile overflow). Smartest-first within each provider.
+const modelPickLabel   = () => document.getElementById("modelPickLabel");
+const omModelPickLabel = () => document.getElementById("omModelPickLabel");
+let _allModelsData = null;
+// Default all collapsed — the menu's whole point is to be compact, click to drill in.
+// On open() we auto-expand the section that contains the currently-selected model.
+const _provExpanded = { claude: false, openai: false, google: false };
+
+function _findModelMeta(id) {
+  if (!_allModelsData) return null;
+  for (const prov of ["claude", "openai", "google"]) {
+    const m = (_allModelsData[prov] || []).find(x => x.id === id);
+    if (m) return { ...m, provider: prov };
+  }
+  return null;
+}
+
+function _displayName(id) {
+  // An empty/null id means the session runs on the CLI default, which is Opus.
+  // Resolve it to the real model so the picker shows concrete intel ("Opus 4.8")
+  // instead of an opaque "Default".
+  const realId = id || "opus";
+  const m = _findModelMeta(realId);
+  return m ? m.name : realId;
+}
+
+function _syncLabels(id) {
+  const eff = localStorage.getItem("llmt_effort") || "max";
+  // Always show the effort level (including "max") so the label is full intel:
+  // "Opus 4.8 · max", never just a bare model name or "Default".
+  const name = _displayName(id) + " · " + (eff === "medium" ? "med" : eff);
+  const meta = _findModelMeta(id);
+  const provider = meta?.provider || "claude";
+  const desktop = modelPickLabel(); if (desktop) desktop.textContent = name;
+  const mobile  = omModelPickLabel(); if (mobile)  mobile.textContent  = name;
+  for (const btn of [document.getElementById("modelPickerBtn"), document.getElementById("omModelPickerBtn")]) {
+    if (btn) {
+      btn.classList.toggle("dirty", !!id && id !== "opus");
+      btn.setAttribute("data-provider", provider);
+      btn.title = provider === "claude"
+        ? "Model for this session"
+        : provider.toUpperCase() + ": chat fallback (tools not wired yet). Use Claude for filesystem/browser/email.";
     }
-    // Sync mobile model selector
-    const omSel = document.getElementById("omModelSel");
-    if (omSel) omSel.value = m;
-  });
+  }
 }
-// Mobile overflow model selector — sync back to desktop
-const omModelSel = document.getElementById("omModelSel");
-if (omModelSel) {
-  try { omModelSel.value = localStorage.getItem("llmt_default_model") || ""; } catch {}
-  omModelSel.addEventListener("change", () => {
-    const m = omModelSel.value || "";
-    if (modelSel) { modelSel.value = m; modelSel.dispatchEvent(new Event("change")); }
-  });
+
+function renderModelMenu() {
+  const list = document.getElementById("modelPickerList");
+  if (!list || !_allModelsData) return;
+  const selected = (localStorage.getItem("llmt_default_model") || "opus");
+  list.innerHTML = "";
+
+  // ── Effort selector (low / medium / high / max) ──
+  const curEffort = localStorage.getItem("llmt_effort") || "max";
+  const effRow = mk("div", "mp-effort-row");
+  const effLabel = mk("span", "mp-effort-label"); effLabel.textContent = "Effort";
+  effRow.appendChild(effLabel);
+  const effSeg = mk("div", "mp-effort-seg");
+  for (const lvl of ["low", "medium", "high", "max"]) {
+    const b = mk("button", "mp-effort-btn" + (lvl === curEffort ? " active" : ""));
+    b.type = "button";
+    b.dataset.effort = lvl;
+    b.textContent = lvl === "medium" ? "med" : lvl;
+    b.addEventListener("click", (e) => { e.stopPropagation(); selectEffort(lvl); });
+    effSeg.appendChild(b);
+  }
+  effRow.appendChild(effSeg);
+  list.appendChild(effRow);
+  const provs = [
+    { key: "claude", label: "Claude (full tools)" },
+    { key: "openai", label: "OpenAI (chat)" },
+    { key: "google", label: "Google (chat)" },
+  ];
+  for (const { key, label } of provs) {
+    const models = _allModelsData[key] || [];
+    const prov = document.createElement("div");
+    prov.className = "win95-prov";
+    prov.dataset.expanded = String(_provExpanded[key]);
+    prov.dataset.key = key;
+    const arrow = document.createElement("span"); arrow.className = "win95-prov-arrow";
+    const labelEl = document.createElement("span"); labelEl.textContent = label + (models.length ? "" : " — no key");
+    prov.appendChild(arrow); prov.appendChild(labelEl);
+    const items = document.createElement("div");
+    items.className = "win95-prov-items";
+    items.hidden = !_provExpanded[key];
+    // For non-Claude providers, prepend an honest one-liner explaining what
+    // they're useful for right now (chat-only fallback for when Claude rate-
+    // limits) and that real tool parity is in flight.
+    if (key === "openai" || key === "google") {
+      const note = document.createElement("div");
+      note.className = "win95-fallback-note";
+      note.textContent = "Chat-only fallback for when Claude is rate-limited. Tool support is in development.";
+      items.appendChild(note);
+    }
+    if (!models.length) {
+      const e = document.createElement("div"); e.className = "win95-empty"; e.textContent = "(add " + key.toUpperCase() + "_API_KEY to enable)";
+      items.appendChild(e);
+    }
+    models.forEach((m, idx) => {
+      const el = document.createElement("div");
+      el.className = "win95-model" + (m.id === selected ? " selected" : "");
+      el.dataset.id = m.id;
+      el.tabIndex = 0;
+      const star = document.createElement("span"); star.className = "win95-model-star";
+      star.textContent = idx === 0 ? "★" : "";
+      star.title = idx === 0 ? "Smartest in " + label : "";
+      const name = document.createElement("span"); name.textContent = m.name;
+      el.appendChild(star); el.appendChild(name);
+      el.addEventListener("click", (e) => { e.stopPropagation(); selectModel(m.id); });
+      items.appendChild(el);
+    });
+    prov.addEventListener("click", () => {
+      _provExpanded[key] = !_provExpanded[key];
+      prov.dataset.expanded = String(_provExpanded[key]);
+      items.hidden = !_provExpanded[key];
+    });
+    list.appendChild(prov);
+    list.appendChild(items);
+  }
 }
+
+// Visibility uses .mp-open class (NOT the [hidden] attribute) so we sidestep
+// any UA-stylesheet quirks AND so mobile browsers reliably dispatch events to
+// covered elements. Close handlers are bound via JS (no inline onclick) and
+// listen to BOTH `click` and `pointerdown` so finger-taps that get swallowed
+// by Safari's touch heuristics still close the menu.
+function _mpIsOpen() {
+  const menu = document.getElementById("modelPickerMenu");
+  return menu && menu.classList.contains("mp-open");
+}
+
+function toggleModelMenu(evt) {
+  if (evt && evt.stopPropagation) evt.stopPropagation();
+  if (evt && evt.preventDefault) evt.preventDefault();
+  if (_mpIsOpen()) { hideModelMenu(); return; }
+  showModelMenu(evt);
+}
+
+function showModelMenu(evt) {
+  const menu = document.getElementById("modelPickerMenu");
+  const backdrop = document.getElementById("modelPickerBackdrop");
+  if (!menu || !backdrop) return;
+  const _curId = localStorage.getItem("llmt_default_model") || "opus";
+  const _meta = _findModelMeta(_curId);
+  const _curProv = _meta?.provider || "claude";
+  for (const k of Object.keys(_provExpanded)) _provExpanded[k] = (k === _curProv);
+  renderModelMenu();
+  const trigger = evt?.currentTarget;
+  if (window.innerWidth > 768 && trigger && trigger.getBoundingClientRect) {
+    const r = trigger.getBoundingClientRect();
+    menu.style.top = (r.bottom + 4) + "px";
+    menu.style.left = Math.max(8, Math.min(r.left, window.innerWidth - 340)) + "px";
+    menu.style.right = "";
+  } else {
+    menu.style.top = "10vh";
+    menu.style.left = "";
+    menu.style.right = "";
+  }
+  menu.classList.add("mp-open");
+  backdrop.classList.add("mp-open");
+  // Belt + suspenders: also clear the legacy `hidden` attribute, since older
+  // versions of this file used it.
+  menu.hidden = false;
+  backdrop.hidden = false;
+  for (const btn of [document.getElementById("modelPickerBtn"), document.getElementById("omModelPickerBtn")]) {
+    if (btn) btn.setAttribute("aria-expanded", "true");
+  }
+}
+
+function hideModelMenu(reason) {
+  const menu = document.getElementById("modelPickerMenu");
+  const backdrop = document.getElementById("modelPickerBackdrop");
+  if (menu) { menu.classList.remove("mp-open"); menu.hidden = true; }
+  if (backdrop) { backdrop.classList.remove("mp-open"); backdrop.hidden = true; }
+  for (const btn of [document.getElementById("modelPickerBtn"), document.getElementById("omModelPickerBtn")]) {
+    if (btn) btn.setAttribute("aria-expanded", "false");
+  }
+  if (reason) console.log("[picker] hide:", reason);
+}
+
+// Bind close handlers AS SOON AS the DOM is ready (or immediately if it
+// already is). Listen to both click + pointerdown to survive Safari touch
+// quirks. The trigger buttons keep their own inline onclick="toggleModelMenu".
+function _bindPickerCloseHandlers() {
+  const x = document.querySelector("#modelPickerMenu .win95-x");
+  if (x && !x._mpBound) {
+    x._mpBound = true;
+    const closeFromX = (e) => { e.preventDefault(); e.stopPropagation(); hideModelMenu("X-button"); };
+    x.addEventListener("click", closeFromX);
+    x.addEventListener("pointerdown", closeFromX);
+  }
+  const bd = document.getElementById("modelPickerBackdrop");
+  if (bd && !bd._mpBound) {
+    bd._mpBound = true;
+    const closeFromBd = (e) => { e.stopPropagation(); hideModelMenu("backdrop"); };
+    bd.addEventListener("click", closeFromBd);
+    bd.addEventListener("pointerdown", closeFromBd);
+  }
+}
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", _bindPickerCloseHandlers);
+} else {
+  _bindPickerCloseHandlers();
+}
+// Document-level catch-all: any pointerdown outside the menu and outside the
+// triggers closes the menu. Capture phase so we run before any inner handler
+// that might stopPropagation.
+function _docCloseHandler(e) {
+  if (!_mpIsOpen()) return;
+  const t = e.target;
+  const menu = document.getElementById("modelPickerMenu");
+  if (menu && menu.contains(t)) return;
+  if (t.closest && (t.closest("#modelPickerBtn") || t.closest("#omModelPickerBtn"))) return;
+  hideModelMenu("outside-pointer");
+}
+document.addEventListener("pointerdown", _docCloseHandler, true);
+document.addEventListener("click", _docCloseHandler, true);
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") hideModelMenu("escape-key"); });
+
+function selectEffort(level) {
+  try { localStorage.setItem("llmt_effort", level); } catch {}
+  if (typeof ws !== "undefined" && ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({ type: "set_effort", effort: level }));
+  }
+  // Update the active state in the open menu without a full re-render
+  document.querySelectorAll("#modelPickerMenu .mp-effort-btn").forEach(b => {
+    b.classList.toggle("active", b.dataset.effort === level);
+  });
+  _syncLabels(localStorage.getItem("llmt_default_model") || "opus");
+}
+
+function selectModel(id) {
+  try { localStorage.setItem("llmt_default_model", id); } catch {}
+  _syncLabels(id);
+  if (typeof ws !== "undefined" && ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({ type: "set_model", model: id }));
+  }
+  // mark in menu DOM
+  document.querySelectorAll("#modelPickerMenu .win95-model").forEach(el => {
+    el.classList.toggle("selected", el.dataset.id === id);
+  });
+  hideModelMenu();
+}
+
+// Close on Escape
+
+
+// Use a self-computed base path because apiUrl() / BASE are declared later in
+// the file (const is in TDZ at this point) and a top-level await would throw
+// "Cannot access 'BASE' before initialization". Same logic as BASE below.
+(async function loadModels() {
+  try {
+    const _base = (location.pathname.replace(/\/+$/, "") || "");
+    const r = await fetch(_base + "/api/models");
+    if (!r.ok) {
+      console.warn("[models] load failed: HTTP", r.status, "from", _base + "/api/models");
+      return;
+    }
+    _allModelsData = await r.json();
+    let saved = "";
+    try { saved = localStorage.getItem("llmt_default_model") || ""; } catch {}
+    if (!saved) {
+      saved = "opus";
+      try { localStorage.setItem("llmt_default_model", saved); } catch {}
+    }
+    _syncLabels(saved);
+    // Push persisted effort to the server so the session honors it from msg 1.
+    try {
+      const eff = localStorage.getItem("llmt_effort") || "max";
+      const _send = () => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "set_effort", effort: eff })); };
+      if (typeof ws !== "undefined" && ws && ws.readyState === 1) _send();
+      else setTimeout(_send, 1500);
+    } catch {}
+  } catch (e) { console.warn("[models] load failed:", e.message); }
+})();
+
+// Exposed so the legacy WS "model_set" event handler keeps working
+window.toggleModelMenu = toggleModelMenu;
+window.hideModelMenu = hideModelMenu;
+window.selectModel = selectModel;
+// Compat shims: code below still references these names. Keep them as no-op stubs
+// that just sync the label, since the real source-of-truth is localStorage + WS.
+const modelSel = { get value(){ return localStorage.getItem("llmt_default_model") || ""; },
+                   set value(v){ try { localStorage.setItem("llmt_default_model", v); } catch {}; _syncLabels(v); },
+                   classList: { toggle(){}, add(){}, remove(){} },
+                   dispatchEvent(){},
+                   addEventListener(){} };
+function applyModelDirty() { _syncLabels(localStorage.getItem("llmt_default_model") || ""); }
+function toggleAllModels() { /* removed — all models always visible */ }
+
 
 let _allSessions = [];
 let _searchQuery = "";
@@ -141,6 +406,39 @@ function _updateNewSessionLabel() {
   btn.title = "Tap: new chat in " + proj + ". Long-press / right-click: pick a different project.";
 }
 const badge=document.getElementById("badge"), ds=document.getElementById("ds"), dsText=document.getElementById("dsText");
+const starBtn=document.getElementById("starBtn");
+
+// Reflect the current session's starred state in the topbar star icon.
+function updateStarBtn() {
+  if (!starBtn) return;
+  if (!session) { starBtn.style.display = "none"; return; }
+  starBtn.style.display = "";
+  const on = !!session.starred;
+  starBtn.textContent = on ? "★" : "☆";
+  starBtn.classList.toggle("topbar-star-on", on);
+  starBtn.title = on ? "Starred — high-priority in the sidebar (tap to unstar)" : "Star — keeps this chat at high priority in the sidebar";
+}
+
+async function toggleSessionStar() {
+  if (!session) return;
+  const next = !session.starred;
+  // Optimistic UI update — flip first, then persist.
+  session.starred = next;
+  updateStarBtn();
+  try {
+    await fetch(apiUrl("/api/sessions/" + session.id + "/state"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ starred: next }),
+    });
+    try { loadSessions(); } catch {}
+  } catch (e) {
+    // Revert on failure
+    session.starred = !next;
+    updateStarBtn();
+    console.warn("[star] toggle failed:", e);
+  }
+}
 
 // Detect base path (works at root or under /terminal/)
 const BASE=location.pathname.replace(/\/+$/,"")||"";
@@ -233,6 +531,63 @@ function recencyBucket(ts) {
 const BUCKET_ORDER = ["Today", "Yesterday", "This week", "This month", "Older"];
 const RECENT_BUCKETS = new Set(["Today", "Yesterday", "This week"]);
 function showSessionInfo_state(_x){} // marker
+
+// Debounced trigger for the Haiku ROI re-score on the top-N sidebar items.
+// Fires at most once per 60s so a re-render storm doesn't fan out into many
+// /api/priority-roi-rescore calls.
+let _rescoreLastFiredAt = 0;
+let _rescoreInflight = false;
+function triggerPriorityRescore(sessionIds) {
+  if (!sessionIds || !sessionIds.length) return;
+  const now = Date.now();
+  if (now - _rescoreLastFiredAt < 60 * 1000) return;
+  if (_rescoreInflight) return;
+  _rescoreLastFiredAt = now;
+  _rescoreInflight = true;
+  fetch(apiUrl("/api/priority-roi-rescore"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session_ids: sessionIds }),
+  })
+    .then(r => r.json()).then(d => {
+      if (d && d.scored > 0) { try { loadSessions(); } catch {} }
+    })
+    .catch(() => {})
+    .finally(() => { _rescoreInflight = false; });
+}
+
+// Tap the priority badge → small inline popover with the breakdown so the
+// score is auditable. No black-box magic — every factor is shown.
+function showPriorityBreakdown(x, anchorEl) {
+  // Close any open popover first
+  document.querySelectorAll(".sb-prio-pop").forEach(e => e.remove());
+  const b = x.priority_breakdown || {};
+  const lines = [
+    `${x.priority_score || 0} = urgency ${b.urgency || 0} × ROI ${b.roi || 0} / 100`,
+    `State: ${b.state || "?"}` + (b.has_deadline ? "  · deadline" : "") + (b.starred ? "  · ★" : ""),
+    b.project_multiplier !== null ? `Project ROI base: ${b.project_multiplier} (${x.project})` : null,
+    (b.matched_people && b.matched_people.length) ? `People: ${b.matched_people.join(", ")}` : null,
+    b.has_money ? "Money / deal mentioned" : null,
+    typeof b.haiku_score === "number"
+      ? `Haiku: ${b.haiku_score}/100 — ${b.haiku_why || ""}`
+      : "Haiku: (no rescore yet)",
+    `Age: ${b.age_days != null ? b.age_days + "d" : "?"}`,
+  ].filter(Boolean);
+  const pop = mk("div", "sb-prio-pop");
+  pop.innerHTML = lines.map(l => `<div>${esc(l)}</div>`).join("");
+  // Position near the anchor — appended to body, fixed-positioned just below
+  document.body.appendChild(pop);
+  const r = anchorEl.getBoundingClientRect();
+  pop.style.top = (r.bottom + 4) + "px";
+  pop.style.right = (window.innerWidth - r.right) + "px";
+  const dismiss = (e) => {
+    if (pop.contains(e.target)) return;
+    pop.remove();
+    document.removeEventListener("click", dismiss, true);
+  };
+  setTimeout(() => document.addEventListener("click", dismiss, true), 0);
+}
+
 function showSessionInfo(x, anchorEl) {
   // Native confirm + action menu — simple for mobile
   const state = computeSessionState(x);
@@ -275,6 +630,8 @@ function computeSessionState(s) {
   // Non-email: manualDone means done
   if (s.manualDone) return "done";
   if (role === "question" || role === "permission_denied") return "blocked";
+  // V1.1: user_waiting — David sent a message but agent hasn't produced output yet
+  if (s.awaitingResponse && role === "user") return "user_waiting";
   // "working" rolls of activity bumps lastActive on each tool_use/tool_result the
   // CLI streams. If we've gone >5 min without any bump, the claude process
   // almost certainly died mid-run — surface as "stalled" so it stops looking
@@ -282,13 +639,15 @@ function computeSessionState(s) {
   if (role === "user" || role === "tool_activity" || role === "tool_result" || role === "permission_granted") {
     return ageMin > 5 ? "stalled" : "working";
   }
-  // Responded: if you've opened the session after the assistant's last message
-  // and let it sit ≥30 min, it auto-flips to done. Otherwise stays "responded"
-  // until the 3-day fallback. Reply detection bumps lastActive past lastViewed,
-  // pulling it back to a needs-attention state automatically.
+  // Responded: assistant replied, awaiting either a continuation from David or
+  // an explicit "done" signal (manualDone, email_sent, contract-check supervisor
+  // marking complete). We used to also flip to "done" when David had viewed the
+  // session AND let it sit ≥30 min, but that false-positived on mid-task pauses
+  // (look away → come back tomorrow → continue). The supervisor's contract-check
+  // is the right place to decide "this conversation is actually finished"; this
+  // UI shouldn't guess. 3-day-dormant fallback remains as a long-tail archive
+  // nudge for sessions truly abandoned.
   if (role === "assistant") {
-    const seenAfterReply = (s.lastViewed || 0) > (s.lastActive || 0);
-    if (seenAfterReply && ageMin > 30) return "done";
     if (ageMin > 3*24*60) return "done";
     return "responded";
   }
@@ -335,14 +694,15 @@ function markSessionDone(sessionId) {
   .catch(() => {});
 }
 const STATE_ICONS = {
-  blocked:   "❗",       // ❗
-  decision:  "⚡",       // ⚡
-  stalled:   "⚠️",       // process exited mid-run, no final response
-  responded: "✓",       // ✓
-  working:   "⏳",       // ⏳
-  done:      "✅",       // ✅
+  blocked:      "❗",       // ❗
+  decision:     "⚡",       // ⚡
+  user_waiting: "◉",       // ◉  David sent a message, agent hasn't started
+  stalled:      "⚠️",       // process exited mid-run, no final response
+  responded:    "✓",       // ✓
+  working:      "⏳",       // ⏳
+  done:         "✅",       // ✅
 };
-const STATE_PRIORITY = { blocked: 0, decision: 1, stalled: 1.5, responded: 2, working: 3, done: 4 };
+const STATE_PRIORITY = { blocked: 0, decision: 1, user_waiting: 1.3, stalled: 1.5, responded: 2, working: 3, done: 4 };
 
 
 // Round-robin through sessions that need attention. Tap = jump to next.
@@ -350,7 +710,7 @@ function attentionSessionsList() {
   return (_allSessions || [])
     .filter(s => !s.archived)
     .map(s => ({ s, st: computeSessionState(s) }))
-    .filter(({st}) => st === "blocked" || st === "decision" || st === "stalled" || st === "responded")
+    .filter(({st}) => st === "blocked" || st === "decision" || st === "user_waiting" || st === "stalled" || st === "responded")
     .sort((a, b) => {
       if (STATE_PRIORITY[a.st] !== STATE_PRIORITY[b.st]) return STATE_PRIORITY[a.st] - STATE_PRIORITY[b.st];
       return (b.s.lastActive || 0) - (a.s.lastActive || 0);
@@ -448,6 +808,22 @@ function makeSbItem(x, currentProject) {
     ti.appendChild(snip);
   }
   d.appendChild(ti);
+  // Priority badge — small right-aligned score, tap → breakdown popover.
+  // Star indicator shows when x.starred is true (manual ROI floor).
+  if (typeof x.priority_score === "number") {
+    const pb = mk("div", "sb-prio");
+    if (x.starred) {
+      const star = mk("span", "sb-prio-star");
+      star.textContent = "★";
+      pb.appendChild(star);
+    }
+    const num = mk("span", "sb-prio-num");
+    num.textContent = String(x.priority_score);
+    pb.appendChild(num);
+    pb.title = "Priority: " + x.priority_score + " (tap for breakdown)";
+    pb.onclick = (e) => { e.stopPropagation(); showPriorityBreakdown(x, pb); };
+    d.appendChild(pb);
+  }
   // \u2713 button: mark a "responded" or "stalled" session done without further fuss.
   // Hidden for blocked/decision/working/done (those need real action, not dismissal).
   if (state === "responded" || state === "stalled") {
@@ -565,9 +941,12 @@ function _renderSidebar() {
     else progressItems.push(s);
   });
 
-  // ─── Section 1: NEEDS YOU (flat, state-priority sorted) ───
+  // ─── Section 1: NEEDS YOU — sorted by priority_score (time × ROI), state
+  // priority breaks ties when scores match, lastActive breaks ties after that.
   if (attentionItems.length) {
     attentionItems.sort((a, b) => {
+      const pa = a.priority_score || 0, pb = b.priority_score || 0;
+      if (pa !== pb) return pb - pa;
       const sa = computeSessionState(a), sb = computeSessionState(b);
       if (STATE_PRIORITY[sa] !== STATE_PRIORITY[sb]) return STATE_PRIORITY[sa] - STATE_PRIORITY[sb];
       return (b.lastActive || 0) - (a.lastActive || 0);
@@ -576,11 +955,23 @@ function _renderSidebar() {
     h.textContent = "\u{1F6A8} NEEDS YOU (" + attentionItems.length + ")";
     sbList.appendChild(h);
     attentionItems.forEach(x => sbList.appendChild(makeSbItem(x, "ALL")));
+    // Fire-and-forget: ask backend to Haiku-rescore the top items so future
+    // refreshes use a value judgment, not just project base + keyword hits.
+    try { triggerPriorityRescore(attentionItems.slice(0, 10).map(s => s.id)); } catch {}
   }
 
   // ─── Section 2: in-progress chats grouped by project ───
+  // Sort within each group by priority_score desc so the most valuable
+  // "responded" sessions surface first inside each bucket.
   const byProj = {};
   progressItems.forEach(x => { (byProj[x.project] = byProj[x.project] || []).push(x); });
+  for (const k of Object.keys(byProj)) {
+    byProj[k].sort((a, b) => {
+      const pa = a.priority_score || 0, pb = b.priority_score || 0;
+      if (pa !== pb) return pb - pa;
+      return (b.lastActive || 0) - (a.lastActive || 0);
+    });
+  }
   const seedKeys = q ? Object.keys(byProj) : Array.from(new Set([..._availableProjects, ...Object.keys(byProj)]));
   const projOrder = seedKeys.sort((a, b) => {
     const aMax = Math.max(...((byProj[a] || []).map(x => x.lastActive || 0)), 0);
@@ -777,6 +1168,7 @@ function connect(project,sessionId){
         refreshPreviews(false);
         startBrowserPoll();
         if (modelSel) { modelSel.value = session.model || ""; applyModelDirty(); }
+        updateStarBtn();
         break;
       case "history":
         // Diff-based rendering: only append messages newer than what's already on screen
@@ -806,7 +1198,7 @@ function connect(project,sessionId){
           if(m.role==="user"&&m.source!=="voice-note") addUser(m.text);
           else if(m.role==="question") addQuestion(m.text);
           else if(m.role==="permission_denied") addPermissionCardFromHistory({tool_name:m.tool_name,tool_input:m.tool_input,message:m.message});
-          else if(m.role==="assistant") addAssistant(m.text);
+          else if(m.role==="assistant") addAssistant(m.text, { source: m.source });
           else if(m.role==="tool_activity") addToolActivityLine(m.tool_name, m.summary);
           else if(m.role==="email_draft") addEmailDraft(m);
           // Tag the newly-appended element with ts for future diffing
@@ -858,15 +1250,17 @@ function connect(project,sessionId){
         if(msg.status==="connected") setStatus("syncing...","thinking");
         break;
       case "thinking":
+        resetLiveBubble();
         showThinking();
         setStatus("thinking...","thinking");
         break;
       case "text":
-        // Claude's response text — show in bubble
+        // Claude's response text — show in bubble (append to existing live bubble if streaming)
         removeThinking();
-        addAssistant(msg.text, {live:true});
+        appendOrCreateAssistant(msg.text);
         break;
       case "tool_use":
+        resetLiveBubble();
         if(msg.name==="AskUserQuestion"){
           removeThinking();
           const input = msg.input||{};
@@ -888,6 +1282,7 @@ function connect(project,sessionId){
         if (msg.client_id) {
           outbox = outbox.filter(x => x.id !== msg.client_id);
           saveOutbox();
+          markUserMessageQueued(msg.client_id);
         }
         _serverQueueDepth = msg.queueDepth || 0;
         renderQueueCount();
@@ -895,10 +1290,35 @@ function connect(project,sessionId){
       case "queue_state":
         _serverQueueDepth = msg.queueDepth || 0;
         renderQueueCount();
+        renderPendingItems(msg.items || []);
         break;
       case "queued_prompt_firing":
-        // Voice notes already have a card in chat — don't duplicate as text
-        if(msg.source!=="voice-note") addUser(msg.text || "", null);
+        // If the bubble was already rendered locally (user typed it while connected),
+        // just lift the "queued" treatment. Otherwise (cross-device, voice note,
+        // automation) render a fresh user bubble now.
+        {
+          let fired = null;
+          if (msg.client_id) {
+            fired = chat.querySelector('.msg.user[data-client-id="'+CSS.escape(msg.client_id)+'"]');
+          }
+          if (!fired && msg.text) {
+            fired = chat.querySelector('.msg.user.queued');
+          }
+          if (fired) {
+            unmarkOldestQueuedUserMessage(msg.text);
+            // Tag with the server-side ts so history replay dedupes against this bubble.
+            if (msg.ts && !fired.dataset.ts) {
+              fired.dataset.ts = msg.ts;
+              if (msg.ts > lastRenderedTs) lastRenderedTs = msg.ts;
+            }
+          } else if (msg.source !== "voice-note") {
+            const d = addUser(msg.text || "", null, msg.client_id || null);
+            if (msg.ts) {
+              d.dataset.ts = msg.ts;
+              if (msg.ts > lastRenderedTs) lastRenderedTs = msg.ts;
+            }
+          }
+        }
         _serverQueueDepth = Math.max(0, (_serverQueueDepth || 0) - 1);
         renderQueueCount();
         setBusy(true);
@@ -929,6 +1349,7 @@ function connect(project,sessionId){
         break;
             case "done":
         removeThinking();
+        resetLiveBubble();
         if(msg.result && !document.querySelector(".msg.assistant:last-child")){
           addAssistant(msg.result, {live:true});
         }
@@ -941,6 +1362,7 @@ function connect(project,sessionId){
         setStatus("ready","active");
         break;
       case "idle":
+        resetLiveBubble();
         setBusy(false);
         setStatus("ready","active");
         break;
@@ -988,8 +1410,9 @@ function send(){
   if(busy){
     const images=pendingImages.map(i=>({data:i.data,mimeType:i.mimeType}));
     const previews=pendingImages.map(i=>i.preview);
-    messageQueue.push({text,images,previews});
-    addQueued(text);
+    const queuedId=genMsgId();
+    messageQueue.push({text,images,previews,clientId:queuedId});
+    addQueued(text,previews,queuedId);
     _clearInput();
     renderQueueCount();
     return;
@@ -1007,13 +1430,13 @@ function send(){
       ws.send(JSON.stringify({type:"prompt",client_id:clientId,text:prompt,images}));
       setBusy(true);
     };
-    addUser(text,previews); _clearInput();
+    addUser(text,previews,clientId); _clearInput();
     return;
   }
   const clientId=genMsgId();
   outbox.push({id:clientId,text,images,ts:Date.now()});saveOutbox();
   ws.send(JSON.stringify({type:"prompt",client_id:clientId,text:prompt,images}));
-  addUser(text,previews);
+  addUser(text,previews,clientId);
   // Tag live-rendered message so history replay doesn't duplicate
   const liveTs=Date.now();
   const last=chat.lastElementChild;
@@ -1024,7 +1447,11 @@ function send(){
 }
 
 // ── Image handling ──
-function addImage(file){
+// Anthropic's many-image rule rejects conversations where ANY image exceeds
+// 2000px on a side once you accumulate several images. We downscale here so
+// one phone screenshot can't poison a long session.
+const MAX_IMAGE_DIM = 2000;
+function _pushImageRaw(file){
   const reader=new FileReader();
   reader.onload=()=>{
     const dataUrl=reader.result;
@@ -1034,6 +1461,32 @@ function addImage(file){
     renderImagePreviews();
   };
   reader.readAsDataURL(file);
+}
+async function addImage(file){
+  try {
+    const bitmap=await createImageBitmap(file);
+    const maxSide=Math.max(bitmap.width,bitmap.height);
+    if(maxSide<=MAX_IMAGE_DIM){
+      if(bitmap.close)bitmap.close();
+      _pushImageRaw(file);
+      return;
+    }
+    const scale=MAX_IMAGE_DIM/maxSide;
+    const w=Math.round(bitmap.width*scale);
+    const h=Math.round(bitmap.height*scale);
+    const canvas=document.createElement("canvas");
+    canvas.width=w;canvas.height=h;
+    canvas.getContext("2d").drawImage(bitmap,0,0,w,h);
+    if(bitmap.close)bitmap.close();
+    const outMime="image/jpeg";
+    const dataUrl=canvas.toDataURL(outMime,0.92);
+    const base64=dataUrl.split(",")[1];
+    pendingImages.push({data:base64,mimeType:outMime,preview:dataUrl});
+    renderImagePreviews();
+  } catch(err){
+    console.error("addImage downscale failed, sending original:",err);
+    _pushImageRaw(file);
+  }
 }
 function handleImgFiles(e){
   const files=e.target.files||[];
@@ -1082,13 +1535,79 @@ function interrupt(){
 }
 
 // ── DOM helpers ──
-function addUser(text,imagePreviews){
+function addUser(text,imagePreviews,clientId){
   const d=mk("div","msg user");
+  if(clientId) d.dataset.clientId=clientId;
   if(text) d.appendChild(document.createTextNode(text));
   if(imagePreviews){
     imagePreviews.forEach(src=>{const img=document.createElement("img");img.src=src;d.appendChild(img)});
   }
   chat.appendChild(d);scrollToBottomForce();
+  return d;
+}
+// Mark a user bubble as awaiting its turn behind an in-progress Claude run.
+function markUserMessageQueued(clientId){
+  if(!clientId) return;
+  const el=chat.querySelector('.msg.user[data-client-id="'+CSS.escape(clientId)+'"]');
+  if(!el || el.classList.contains("queued")) return;
+  el.classList.add("queued");
+  const badge=mk("span","queued-badge");
+  badge.textContent="queued — waiting for current turn";
+  badge.title="This message has been received and will fire automatically when Claude is idle.";
+  el.appendChild(badge);
+}
+// Render the server-side queue (messages typed/voice-noted while Claude is mid-turn)
+// as user bubbles with the "queued" badge. Idempotent: dedupes by client_id (or text
+// for client_id-less items like voice notes from other devices). Called whenever the
+// server emits queue_state, so every tab/device shows the same pending list and the
+// user has a clear visual that the message *will* be considered.
+function renderPendingItems(items){
+  if(!Array.isArray(items)) return;
+  for(const item of items){
+    if(!item || !item.text) continue;
+    if(item.client_id){
+      const existing=chat.querySelector('.msg.user[data-client-id="'+CSS.escape(item.client_id)+'"]');
+      if(existing){
+        if(!existing.classList.contains("queued")) markUserMessageQueued(item.client_id);
+        continue;
+      }
+    } else {
+      // No client_id — dedupe by text against any already-queued bubble
+      const candidates=chat.querySelectorAll('.msg.user.queued');
+      let dup=false;
+      for(const c of candidates){
+        if(c.textContent && c.textContent.includes(item.text.slice(0,40))){dup=true;break;}
+      }
+      if(dup) continue;
+    }
+    const d=mk("div","msg user queued");
+    if(item.client_id) d.dataset.clientId=item.client_id;
+    d.appendChild(document.createTextNode(item.text));
+    const badge=mk("span","queued-badge");
+    const isVoice=item.source==="voice-note";
+    badge.textContent=isVoice ? "queued voice note — will fire when Claude is idle"
+                              : "queued — will fire when Claude is idle";
+    badge.title="Stored on the server. It will be sent automatically when the current turn finishes.";
+    d.appendChild(badge);
+    chat.appendChild(d);
+  }
+  scrollToBottomIfSticky();
+}
+function unmarkOldestQueuedUserMessage(text){
+  // Server's queued_prompt_firing carries text but not client_id. Match the
+  // oldest still-queued bubble (FIFO matches server queue order); fall back to
+  // text match if FIFO is wrong (e.g. mixed-source queue).
+  const all=chat.querySelectorAll('.msg.user.queued');
+  let target=all[0]||null;
+  if(text){
+    for(const el of all){
+      if(el.textContent && el.textContent.includes(text.slice(0,40))){target=el;break;}
+    }
+  }
+  if(!target) return;
+  target.classList.remove("queued");
+  const b=target.querySelector(".queued-badge");
+  if(b) b.remove();
 }
 function addVoiceNoteUser(blob,duration,imagePreviews){
   const d=mk("div","msg user voice-note-msg");
@@ -1141,7 +1660,60 @@ function addVoiceNoteUser(blob,duration,imagePreviews){
   chat.appendChild(d);scrollToBottomForce();
   return d;
 }
+// Renders the supervisor's contract-check wrap-up as a visually distinct
+// "system context" banner — NOT a full assistant bubble. These messages are
+// metadata about the session (the auto-mark-done summary) and never enter
+// Claude's conversation history (they live only in messages.db; Claude resumes
+// from its own session log via --resume).
+function addContractCheckBanner(text){
+  const d = mk("div", "msg system-context");
+  const b = mk("div", "system-context-banner");
+  // Strip the leading "✓ " we add server-side so the banner's own icon is the only one.
+  const clean = (text || "").replace(/^\s*✓\s+/, "");
+  b.innerHTML = '<span class="sc-icon">✓</span>'
+              + '<span class="sc-label">task complete</span>'
+              + '<span class="sc-text">' + esc(clean) + '</span>'
+              + '<span class="sc-note" title="This message is local UI context only — it is NOT sent to Claude on the next turn.">UI only</span>';
+  d.appendChild(b);
+  const liveTs = Date.now();
+  d.dataset.ts = liveTs;
+  if (liveTs > lastRenderedTs) lastRenderedTs = liveTs;
+  chat.appendChild(d);
+  return d;
+}
+
+// Live-streaming accumulator: append token deltas into one bubble
+let _liveBubble = null;
+let _liveText = "";
+function appendOrCreateAssistant(delta) {
+  if (_liveBubble && _liveBubble.parentNode) {
+    _liveText += delta;
+    const b = _liveBubble.querySelector(".bubble");
+    if (b) {
+      // Remove TTS button, update content, re-add TTS button
+      const ttsBtn = b.querySelector(".msg-tts-btn");
+      if (ttsBtn) ttsBtn.remove();
+      b.innerHTML = fmt(_liveText);
+      const btn = mk("button","msg-tts-btn");
+      btn.textContent = "\u{1F50A}";
+      btn.title = "Read aloud";
+      btn.onclick = (e) => { e.stopPropagation(); playTts(bubbleText(_liveBubble)); };
+      b.appendChild(btn);
+    }
+    scrollToBottomIfSticky();
+    preemptTts(delta);
+  } else {
+    _liveText = delta;
+    addAssistant(delta, {live:true});
+    // Grab the bubble we just created
+    _liveBubble = chat.lastElementChild;
+  }
+}
+function resetLiveBubble() { _liveBubble = null; _liveText = ""; }
 function addAssistant(text, opts){
+  // Contract-check wrap-ups arrive as role=assistant with source=contract_check.
+  // Route them to the distinct banner so they don't look like real assistant turns.
+  if (opts && opts.source === "contract_check") return addContractCheckBanner(text);
   const d=mk("div","msg assistant");
   const b=mk("div","bubble");
   b.innerHTML=fmt(text);
@@ -1911,20 +2483,47 @@ async function checkForAudioReview(text){
 
 
 function addTool(name,body){
-  const d=mk("div","msg tool");
-  const n=mk("div","tool-name"); n.textContent=name;
+  // Mark any previously-running tool entry as settled — we're moving on.
+  const prev = chat.querySelector(".msg.tool.running:last-of-type");
+  if (prev) prev.classList.remove("running");
+  const d=mk("div","msg tool running");
+  const n=mk("div","tool-name");
+  n.innerHTML='<span class="tool-spinner" aria-hidden="true">⟳</span><span class="tool-name-text"></span>';
+  n.querySelector(".tool-name-text").textContent = name;
   const b=mk("div","tool-body"); b.textContent=body;
   d.appendChild(n); d.appendChild(b);
   chat.appendChild(d);
   scrollToBottomIfSticky();
 }
 function addSystem(text){const d=mk("div","msg system");d.textContent=text;chat.appendChild(d)}
-function addQueued(text){const d=mk("div","msg system");d.textContent="Queued: "+text.slice(0,60)+(text.length>60?"...":"");chat.appendChild(d);scrollToBottomIfSticky()}
+// Render a locally-queued (client busy) message as a real user bubble with the
+// same dashed-yellow "queued" treatment we use for server-broadcast queue items.
+// Keeps the visual identical whether the queue lives client-side or server-side
+// so David can always see *what* is pending, not just a depth count.
+function addQueued(text,imagePreviews,clientId){
+  const d=mk("div","msg user queued");
+  if(clientId) d.dataset.clientId=clientId;
+  d.dataset.localQueued="1";
+  if(imagePreviews&&imagePreviews.length){
+    imagePreviews.forEach(src=>{const img=document.createElement("img");img.src=src;d.appendChild(img)});
+  }
+  d.appendChild(document.createTextNode(text));
+  const badge=mk("span","queued-badge");
+  badge.textContent="queued — will fire when current turn ends";
+  badge.title="Held client-side because Claude is still mid-turn. It will send automatically as soon as the current response finishes.";
+  d.appendChild(badge);
+  chat.appendChild(d);
+  scrollToBottomIfSticky();
+}
 function renderQueueCount(){
-  const _totalQueue = (messageQueue ? _totalQueue : 0) + (_serverQueueDepth || 0);
+  const total = (messageQueue?.length || 0) + (_serverQueueDepth || 0);
   let el=document.getElementById("queueCount");
   if(!el){el=mk("span","queue-count");el.id="queueCount";document.querySelector(".topbar").appendChild(el)}
-  el.textContent=messageQueue.length?messageQueue.length+" queued":"";
+  el.textContent = total ? (total + " queued") : "";
+  el.classList.toggle("has-queue", total > 0);
+  el.title = total
+    ? "Pending messages waiting for Claude to finish — they will fire automatically."
+    : "";
 }
 function addError(text){const d=mk("div","msg error");d.textContent="Error: "+text;chat.appendChild(d);scrollToBottomForce()}
 
@@ -1996,9 +2595,12 @@ function setBusy(b){
     if(messageQueue.length>0){
       const next=messageQueue.shift();
       renderQueueCount();
-      // Remove the "Queued:" system message
-      const sysMsgs=chat.querySelectorAll(".msg.system");
-      for(const s of sysMsgs){if(s.textContent.startsWith("Queued:"))s.remove()}
+      // Remove the locally-queued bubble for this specific item (matched by
+      // client_id we stamped at queue time). send() will create the real bubble.
+      if(next.clientId){
+        const stale=chat.querySelector('.msg.user.queued[data-local-queued="1"][data-client-id="'+CSS.escape(next.clientId)+'"]');
+        if(stale) stale.remove();
+      }
       // Send it
       pendingImages=next.images?.map((img,i)=>({data:img.data,mimeType:img.mimeType,preview:next.previews?.[i]||""}))||[];
       inp.value=next.text;
@@ -2143,6 +2745,18 @@ function addApiErrorCard(msg){
     setTimeout(()=>send(),50);
   };
   actions.appendChild(retry);
+  // 401 = Claude auth expired. Surface a one-tap re-auth button to the
+  // in-browser flow so David never needs an SSH terminal to recover.
+  const is401 = String(msg.status_code||"") === "401" || /401|authenticat/i.test(msg.message||"");
+  if(is401){
+    body.textContent = "Claude authentication expired — chats are failing. Re-authenticate in your browser (no SSH needed).";
+    const reauth=mk("a","api-err-retry");
+    reauth.textContent="🔑 Re-authenticate Claude";
+    reauth.href=(typeof apiUrl==="function"?apiUrl("/claude-auth.html"):"/terminal/claude-auth.html");
+    reauth.target="_blank"; reauth.rel="noopener";
+    reauth.style.cssText="text-decoration:none;display:inline-flex;align-items:center;justify-content:center;background:var(--accent);color:#000;font-weight:600";
+    actions.insertBefore(reauth, actions.firstChild);
+  }
   card.appendChild(label);card.appendChild(body);
   if(msg.request_id)card.appendChild(meta);
   card.appendChild(actions);
@@ -2581,10 +3195,11 @@ try{
   if(sel&&typeof sel.s==="number"){inp.setSelectionRange(sel.s,sel.e||sel.s)}
 }catch{}
 try{
-  if(localStorage.getItem("llmt_drawer_open")==="true"){
+  const isMobile=window.innerWidth<=768;
+  if(!isMobile&&localStorage.getItem("llmt_drawer_open")==="true"){
     document.getElementById("drawer").classList.remove("hidden");
   }
-  if(localStorage.getItem("llmt_sidebar_open")==="true"){
+  if(!isMobile&&localStorage.getItem("llmt_sidebar_open")==="true"){
     document.getElementById("sidebar").classList.add("show");
   }
   const ff=localStorage.getItem("llmt_file_filter");
@@ -2616,7 +3231,9 @@ document.addEventListener("keydown",(e)=>{
     return;
   }
   // Voice note keyboard: Space to record/send, Escape to cancel
-  if(e.key===" "&&!voiceActive&&document.activeElement!==inp&&!e.metaKey&&!e.ctrlKey){
+  const ae=document.activeElement;
+  const inText=ae&&(ae.tagName==="INPUT"||ae.tagName==="TEXTAREA"||ae.isContentEditable);
+  if(e.key===" "&&!voiceActive&&!inText&&!e.metaKey&&!e.ctrlKey){
     e.preventDefault();toggleVoiceInput();return;
   }
   if(e.key===" "&&voiceActive){

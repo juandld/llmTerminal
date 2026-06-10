@@ -20,7 +20,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent  # web/
 CONFIG    = REPO_ROOT / "config" / "projects.json"
 
-CHROME_BIN = "/home/claude-user/.cache/ms-playwright/chromium-1217/chrome-linux64/chrome"
+CHROME_BIN = "/home/claude-user/.cache/ms-playwright/chromium-1223/chrome-linux64/chrome"
 NGINX_SITE = Path("/etc/nginx/sites-enabled/narrativehero")
 SYSTEMD_DIR = Path("/etc/systemd/system")
 CLAUDE_JSON = Path("/home/claude-user/.claude.json")
@@ -36,6 +36,10 @@ END_JS   = "/* <<< llmTerminal-managed <<< */"
 def render_unit_files(p):
     s, d, vnc, nvnc, cdp = p["slug"], p["display"], p["vnc_port"], p["novnc_port"], p["cdp_port"]
     profile = f"/home/claude-user/.chromium-{s}"
+    # profile_dir picks which sub-profile Chromium opens inside the user-data-dir.
+    # Multiple profiles + no flag => profile picker (CDP reports browser_ui only,
+    # so /api/browser-status returns url=null and llmTerminal hides the link).
+    profile_dir = p.get("profile_dir", "Default")
     units = {}
     units[f"xvfb-{s}.service"] = f"""[Unit]
 Description=Xvfb display :{d} for {s} browser
@@ -118,6 +122,7 @@ Environment=LANG=en_US.UTF-8
 ExecStart={CHROME_BIN} \\
   --no-sandbox \\
   --user-data-dir={profile} \\
+  --profile-directory={profile_dir!r} \\
   --remote-debugging-port={cdp} \\
   --remote-debugging-address=127.0.0.1 \\
   --no-first-run \\

@@ -7,3 +7,7 @@ node_modules/
 *.bak-*
 web/uploads/
 .playwright-mcp/
+
+# clutter / local artifacts
+*.png
+web/llmt.db

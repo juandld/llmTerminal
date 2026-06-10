@@ -9,7 +9,8 @@
       "vnc_port": 5900,
       "novnc_port": 6080,
       "cdp_port": 9222,
-      "color": "#2ECC71"
+      "color": "#2ECC71",
+      "profile_dir": "Profile 1"
     },
     {
       "slug": "crankhero",
@@ -19,7 +20,8 @@
       "vnc_port": 5901,
       "novnc_port": 6081,
       "cdp_port": 9223,
-      "color": "#E74C3C"
+      "color": "#E74C3C",
+      "profile_dir": "Profile 1"
     },
     {
       "slug": "orchestratorhero",
@@ -40,12 +42,22 @@
       "novnc_port": 6083,
       "cdp_port": 9225,
       "color": "#F1C40F"
+    },
+    {
+      "slug": "langhero",
+      "name": "langHero",
+      "project_path": "/home/claude-user/projects/langHero",
+      "display": 103,
+      "vnc_port": 5904,
+      "novnc_port": 6084,
+      "cdp_port": 9226,
+      "color": "#1ABC9C",
+      "profile_dir": "Default"
     }
   ],
   "reserved_colors": {
     "datahero": "#9B59B6",
     "oshero": "#F39C12",
-    "langhero": "#1ABC9C",
     "mediahero": "#E91E63"
   }
 }

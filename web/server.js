@@ -1,5 +1,7 @@
 const express = require("express");
 const { WebSocketServer } = require("ws");
+const mcpDiscover = require("./src/mcp/discover");
+const mcpTranslate = require("./src/mcp/translate");
 const { spawn } = require("child_process");
 const path = require("path");
 const http = require("http");
@@ -23,19 +25,23 @@ app.use((req, res, next) => {
 });
 
 
-// Rewrite index.html on the fly to add ?v=<mtime> cache-busters on script/link tags.
-// This makes every file change a new URL, defeating mobile browser disk cache.
+// Path-based cache busting: rewrites styles.css → _bust/<mtime>-<now>/styles.css
+// CDNs can strip query strings but never strip path segments, so this always works.
 function rewriteCacheBust(html, publicDir) {
   return html.replace(
     /(<(?:script|link)[^>]*?(?:src|href)=")([^"?]+\.(?:js|css))(")/g,
     (m, pre, file, post) => {
       try {
         const st = fs.statSync(path.join(publicDir, file));
-        return pre + file + "?v=" + Math.floor(st.mtimeMs) + post;
+        return pre + "_bust/" + Math.floor(st.mtimeMs) + "-" + Date.now() + "/" + file + post;
       } catch { return m; }
     }
   );
 }
+app.get("/_bust/:hash/*", (req, res, next) => {
+  const file = req.params[0];
+  res.sendFile(path.join(__dirname, "public", file), (err) => { if (err) next(); });
+});
 app.get("/", (req, res) => {
   const pubDir = path.join(__dirname, "public");
   const idx = path.join(pubDir, "index.html");
@@ -49,7 +55,7 @@ app.get("/", (req, res) => {
   }
 });
 
-app.use(express.static(path.join(__dirname, "public")));
+app.use(express.static(path.join(__dirname, "public"), { etag: false, lastModified: false }));
 
 const PROJECTS_DIR = "/home/claude-user/projects";
 const DATA_DIR = "/home/claude-user/.llm-terminal";
@@ -161,6 +167,9 @@ function saveMessage(sessionId, msg) {
     if (s && msg.role) {
       s.lastMessageRole = msg.role;
       s.lastActive = Date.now();
+      // V1.1: Clear awaitingResponse once the agent produces any output —
+      // the session transitions from user_waiting to working/responded.
+      if (msg.role !== "user" && s.awaitingResponse) s.awaitingResponse = false;
       // Short activity snippet for sidebar preview
       const text = (msg.text || "").replace(/\s+/g, " ").trim();
       if (msg.role === "assistant" && text) s.lastSnippet = text.slice(0, 80);
@@ -177,7 +186,12 @@ function saveMessage(sessionId, msg) {
         s.pendingAsks = [];
       }
       if (msg.role === "email_sent") s.manualDone = Date.now();
-      if (msg.role === "user") delete s.manualDone;
+      // Note: we used to clear manualDone on any user message, but that
+      // wiped the contract-check supervisor's verdict the moment David
+      // typed a follow-up. The contract-check fires again after the next
+      // assistant reply — if it re-judges "still done," manualDone is
+      // re-set; if not, it stays cleared via that path. The UI also
+      // offers an explicit unmark button. So we no longer auto-clear here.
       saveSessions(sessions);
     }
   } catch {}
@@ -200,7 +214,24 @@ function saveSessions(s) { fs.writeFileSync(SESSIONS_FILE, JSON.stringify(s, nul
 // Update a single session object in the store (replaces the repeated
 // `saveSessions(loadSessions().map(s => s.id === x.id ? x : s))` pattern).
 function updateSessionInStore(session) {
-  saveSessions(loadSessions().map(s => s.id === session.id ? session : s));
+  // Update-in-place. No-op for sessions that haven't been persisted yet
+  // (pending placeholders that the user hasn't written to). Pending sessions
+  // are promoted to disk explicitly via _persistSessionIfNew on first prompt.
+  const sessions = loadSessions();
+  const idx = sessions.findIndex(s => s.id === session.id);
+  if (idx < 0) return;
+  sessions[idx] = session;
+  saveSessions(sessions);
+}
+
+function _persistSessionIfNew(session) {
+  // Idempotent: writes the session record to disk if it isn't there yet.
+  // The signal that "the user actually started this chat" — called from the
+  // prompt handler before saving the first user message.
+  const sessions = loadSessions();
+  if (sessions.find(s => s.id === session.id)) return;
+  sessions.unshift(session);
+  saveSessions(sessions);
 }
 // Send a JSON payload to a single WebSocket, swallowing errors (client may have disconnected).
 function wsSend(ws, typeOrPayload, data) {
@@ -231,6 +262,14 @@ function broadcastToSession(sessionId, payload) {
 
 // ---- Image uploads ----
 const activeProcs = new Set();
+// Session-level busy state for queue draining. sessionId -> running child proc.
+// Distinct from the per-WS `activeProc` closure: a run outlives the WS that
+// started it (mobile backgrounds the tab mid-turn, the WS drops, but claude keeps
+// going), so "is this session busy?" must be answered per-session, not
+// per-connection. tryDrainQueue and the prompt handler consult this so a
+// reconnected WS neither double-spawns nor strands queued items. Cleared in each
+// run's onDone (process close).
+const activeProcBySession = new Map();
 const UPLOADS_DIR = path.join(DATA_DIR, "uploads");
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 
@@ -247,8 +286,18 @@ setTimeout(() => {
   const sessions = loadSessions();
   for (const session of sessions) {
     const msgs = loadMessages(session.id);
-    if (!msgs.length || msgs[msgs.length - 1].role !== "user") continue;
-    const lastUserMsg = msgs[msgs.length - 1];
+    if (!msgs.length) continue;
+    // Find the most-recent user message. A session needs recovery if that user
+    // message has no real (non-stalled) assistant response after it — covers
+    // both "last msg is user" and "last msg is a stalled marker over a user".
+    let lastUserIdx = -1;
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i].role === "user") { lastUserIdx = i; break; }
+    }
+    if (lastUserIdx === -1) continue;
+    const after = msgs.slice(lastUserIdx + 1);
+    if (after.some(m => m.role === "assistant" && !m.stalled)) continue; // answered
+    const lastUserMsg = msgs[lastUserIdx];
     if (Date.now() - lastUserMsg.ts < 30000) continue; // too fresh, might still be running
 
     console.log("[startup-recovery] retrying stuck session:", session.id);
@@ -264,9 +313,14 @@ setTimeout(() => {
           updateSessionInStore(session);
         }
         if (data.type === "result" && data.result) {
-          saveMessage(session.id, { role: "assistant", text: data.result, ts: Date.now(), recovered: true });
-          console.log("[startup-recovery] recovered:", session.id);
-          broadcastToSession(session.id, { type: "history", messages: loadMessages(session.id) });
+          // Skip api_error results — saving them poisons resume forever.
+          if (data.is_error === true || /^API Error:\s*\d{3}/.test(data.result)) {
+            console.log("[startup-recovery] api_error, skipping save:", session.id, data.result.slice(0,120));
+          } else {
+            saveMessage(session.id, { role: "assistant", text: data.result, ts: Date.now(), recovered: true });
+            console.log("[startup-recovery] recovered:", session.id);
+            broadcastToSession(session.id, { type: "history", messages: loadMessages(session.id) });
+          }
         }
       },
       (code) => { if (code !== 0) console.log("[startup-recovery] failed:", session.id, "code:", code); }
@@ -348,7 +402,487 @@ app.get("/api/projects", (_, res) => {
   });
   res.json(dirs);
 });
+
+app.get("/api/providers", (_req, res) => {
+  res.json({
+    claude: true,
+    openai: !!process.env.OPENAI_API_KEY,
+    google: !!process.env.GOOGLE_API_KEY,
+  });
+});
+
+// ─── Dynamic model discovery ────────────────────────────────────────────────
+// Fetches available models from each provider API, caches for 1 hour.
+// Featured models appear first; the rest are available via "show all".
+// ── Claude alias → real model resolver ──────────────────────────────────────
+// The Claude CLI maps short aliases (opus/sonnet/haiku) to whatever the
+// current binary version points at. We probe each alias's system/init event
+// (first line of stream-json, fires before any inference) to learn the real
+// model id, derive an accurate display label, and persist it. When an alias
+// starts resolving to a NEWER model (e.g. claude-opus-4-8 → 4-9 after a CLI
+// auto-update), we Telegram-notify David: that's a model upgrade.
+const { spawn: _spawnRaw } = require("child_process");
+const CLAUDE_ALIASES = ["fable", "opus", "sonnet", "haiku"];
+const _ALIAS_STATE_PATH = path.join(DATA_DIR, "claude-aliases.json");
+let _claudeAliasModels = {}; // alias -> { id, label }
+try { _claudeAliasModels = JSON.parse(fs.readFileSync(_ALIAS_STATE_PATH, "utf8")); } catch {}
+
+function _prettyClaudeLabel(modelId) {
+  // claude-opus-4-8[1m]  -> "Opus 4.8";  claude-fable-5  -> "Fable 5"
+  const clean = String(modelId || "").replace(/\[.*?\]$/, "");
+  // family + major.minor (opus/sonnet/haiku and any future same-shaped id)
+  let m = clean.match(/claude-([a-z]+)-(\d+)-(\d+)/i);
+  if (m) {
+    const fam = m[1][0].toUpperCase() + m[1].slice(1);
+    return `${fam} ${m[2]}.${m[3]}`;
+  }
+  // family + single version (fable, etc.)
+  m = clean.match(/claude-([a-z]+)-(\d+)$/i);
+  if (m) {
+    const fam = m[1][0].toUpperCase() + m[1].slice(1);
+    return `${fam} ${m[2]}`;
+  }
+  return modelId || "?";
+}
+
+function _probeAlias(alias) {
+  return new Promise((resolve) => {
+    let done = false;
+    const proc = _spawnRaw("/usr/bin/claude", [
+      "-p", ".", "--model", alias, "--output-format", "stream-json", "--verbose",
+      "--dangerously-skip-permissions",
+    ], { env: { HOME: "/home/claude-user", PATH: process.env.PATH, LANG: "en_US.UTF-8" }, uid: 1000, gid: 1000, stdio: ["ignore", "pipe", "ignore"] });
+    let buf = "";
+    const finish = (val) => { if (done) return; done = true; try { proc.kill("SIGKILL"); } catch {} resolve(val); };
+    const timer = setTimeout(() => finish(null), 25000);
+    proc.stdout.on("data", (c) => {
+      buf += c.toString();
+      const nl = buf.indexOf("\n");
+      if (nl >= 0) {
+        try {
+          const obj = JSON.parse(buf.slice(0, nl));
+          if (obj.type === "system" && obj.subtype === "init" && obj.model) {
+            clearTimeout(timer);
+            finish(obj.model);
+          }
+        } catch {}
+      }
+    });
+    proc.on("close", () => { clearTimeout(timer); finish(null); });
+    proc.on("error", () => { clearTimeout(timer); finish(null); });
+  });
+}
+
+async function _notifyTelegram(text) {
+  try {
+    const envTxt = fs.readFileSync("/home/claude-user/projects/narrativeHero/backend/.env", "utf8");
+    const tok = (envTxt.match(/^TELEGRAM_BOT_TOKEN=(.+)$/m) || [])[1];
+    if (!tok) return;
+    const chatId = "7373155120";
+    await fetch(`https://api.telegram.org/bot${tok.trim().replace(/^["']|["']$/g, "")}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, parse_mode: "Markdown", text }),
+    });
+  } catch (e) { console.warn("[alias] telegram notify failed:", e.message); }
+}
+
+async function resolveClaudeAliases() {
+  for (const alias of CLAUDE_ALIASES) {
+    const realId = await _probeAlias(alias);
+    if (!realId) { console.warn("[alias] probe failed for", alias); continue; }
+    const prev = _claudeAliasModels[alias];
+    const label = _prettyClaudeLabel(realId);
+    if (!prev || prev.id !== realId) {
+      console.log(`[alias] ${alias} -> ${realId} (${label})` + (prev ? ` [was ${prev.id}]` : ""));
+      if (prev && prev.id !== realId) {
+        _notifyTelegram(`🆙 *Claude model upgrade*: the \`${alias}\` alias now resolves to *${label}* (\`${realId}\`), was \`${prev.id}\`. The llmTerminal picker label updated automatically.`);
+      }
+      _claudeAliasModels[alias] = { id: realId, label };
+      try { fs.writeFileSync(_ALIAS_STATE_PATH, JSON.stringify(_claudeAliasModels, null, 2)); } catch {}
+    }
+  }
+}
+// Resolve shortly after boot, then every 6h (cheap; picks up CLI auto-updates).
+setTimeout(() => { resolveClaudeAliases().catch(e => console.warn("[alias] resolve error:", e.message)); }, 8000);
+setInterval(() => { resolveClaudeAliases().catch(() => {}); }, 6 * 60 * 60 * 1000);
+
+// Smartest-first rank lists. Anything in TOP_* shows up first in the listed
+// order; anything not in TOP_* falls through to a created-date sort (newer first).
+// Hand-curated so the picker order is predictable when a new provider model lands.
+// Only chat-compatible flagships. -pro and -deep-research variants live on
+// OpenAI's Responses API endpoint and 404 against /v1/chat/completions — they
+// are also filtered out in `skipPatterns` below.
+const OPENAI_TOP = [
+  "gpt-5.5",
+  "gpt-5.4",
+  "gpt-5.3-chat-latest",
+  "gpt-5.2",
+  "gpt-5.1-codex-max", "gpt-5.1",
+  "o3", "o4-mini",
+  "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano",
+  "o3-mini",
+  "gpt-5.4-mini", "gpt-5.4-nano",
+  "gpt-4o", "gpt-4o-mini",
+];
+const GOOGLE_TOP = [
+  "gemini-3.1-pro-preview", "gemini-3-pro-preview",
+  "gemini-pro-latest",
+  "gemini-2.5-pro",
+  "gemini-3.5-flash", "gemini-3.1-flash-lite",
+  "gemini-flash-latest", "gemini-flash-lite-latest",
+  "gemini-2.5-flash", "gemini-2.5-flash-lite",
+  "gemini-2.0-flash", "gemini-2.0-flash-lite",
+];
+const CLAUDE_TOP = [
+  "claude-fable-5",
+  "claude-opus-4-8",
+  "claude-opus-4-7",
+  "claude-opus-4-6",
+  "claude-sonnet-4-6",
+  "claude-haiku-4-5-20251001",
+];
+
+let _modelsCache = null;
+let _modelsCacheTs = 0;
+const MODELS_CACHE_TTL = 60 * 60 * 1000; // 1 hour
+
+function _rankSort(models, topList) {
+  const topIdx = new Map(topList.map((id, i) => [id, i]));
+  return models.slice().sort((a, b) => {
+    const ai = topIdx.has(a.id) ? topIdx.get(a.id) : Infinity;
+    const bi = topIdx.has(b.id) ? topIdx.get(b.id) : Infinity;
+    if (ai !== bi) return ai - bi;
+    return (b.created || 0) - (a.created || 0);
+  });
+}
+
+async function fetchProviderModels() {
+  const now = Date.now();
+  if (_modelsCache && now - _modelsCacheTs < MODELS_CACHE_TTL) return _modelsCache;
+
+  const result = {
+    claude: [],
+    openai: [],
+    google: [],
+  };
+
+  // Fetch Claude models from Anthropic API (same pattern as OpenAI/Google).
+  const anthropicKey = process.env.ANTHROPIC_API_KEY;
+  if (anthropicKey) {
+    try {
+      const r = await fetch("https://api.anthropic.com/v1/models?limit=100", {
+        headers: { "x-api-key": anthropicKey, "anthropic-version": "2023-06-01" },
+      });
+      if (r.ok) {
+        const data = await r.json();
+        const models = (data.data || [])
+          .map(m => ({ id: m.id, name: m.display_name || m.id, created: m.created_at ? new Date(m.created_at).getTime() / 1000 : 0 }));
+        result.claude = _rankSort(models, CLAUDE_TOP);
+      }
+    } catch (e) { console.warn("[models] Anthropic fetch failed:", e.message); }
+  }
+  // Fallback: if no API key or fetch failed, use short alias list so the
+  // picker is never empty. Claude CLI accepts these aliases directly.
+  if (!result.claude.length) {
+    // Use live-resolved alias labels when available so the picker can never
+    // drift from what `--model opus` actually runs. Falls back to a sane
+    // static label only if the probe hasn't completed yet.
+    const _static = { fable: "Fable", opus: "Opus", sonnet: "Sonnet", haiku: "Haiku" };
+    result.claude = ["fable", "opus", "sonnet", "haiku"].map(a => ({
+      id: a,
+      name: (_claudeAliasModels[a] && _claudeAliasModels[a].label) || _static[a],
+    }));
+  }
+
+  const oaiKey = process.env.OPENAI_API_KEY;
+  if (oaiKey) {
+    try {
+      const r = await fetch("https://api.openai.com/v1/models", {
+        headers: { Authorization: "Bearer " + oaiKey },
+      });
+      if (r.ok) {
+        const data = await r.json();
+        const chatPrefixes = /^(gpt-|o\d|chatgpt-)/;
+        // Exclude: non-chat (realtime/audio/search/transcribe/tts/whisper/dall/embed/moderat),
+        // legacy text-completion (davinci/babbage/curie), image gen (gpt-image-*, chatgpt-image),
+        // pure code-completion (codex variants without -chat or -max), instruct-only (-instruct).
+        const skipPatterns = /^(gpt-image|chatgpt-image)|-(realtime|audio|search|transcri|tts|whisper|dall|embed|moderat|davinci|babbage|curie|instruct|pro|pro-\d|deep-research)$|-pro-\d{4}/i;
+        const dated = /-\d{4}-\d{2}-\d{2}$/; // drop date-suffixed snapshots when the alias exists
+        let chats = (data.data || []).filter(m => chatPrefixes.test(m.id) && !skipPatterns.test(m.id));
+        const ids = new Set(chats.map(m => m.id));
+        chats = chats.filter(m => {
+          if (!dated.test(m.id)) return true;
+          const alias = m.id.replace(dated, "");
+          return !ids.has(alias);
+        });
+        result.openai = _rankSort(
+          chats.map(m => ({ id: m.id, name: m.id, created: m.created })),
+          OPENAI_TOP,
+        );
+      }
+    } catch (e) { console.warn("[models] OpenAI fetch failed:", e.message); }
+  }
+
+  const gKey = process.env.GOOGLE_API_KEY;
+  if (gKey) {
+    try {
+      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${gKey}`);
+      if (r.ok) {
+        const data = await r.json();
+        // Exclude: open-weight gemma, audio (lyria, tts), image gen (-image-, nano-banana),
+        // robotics, customtools variants, embedding/code-completion specialties.
+        const skip = /^(gemma|lyria|nano-banana|imagen)|(-image[-]|-image$|-tts[-]|-robotics|-customtools|-thinking-exp|-embedding|-aqa|-text-bison|-deep-research)/i;
+        const models = (data.models || [])
+          .filter(m => (m.supportedGenerationMethods || []).includes("generateContent"))
+          .map(m => ({ id: m.name.replace("models/", ""), name: m.displayName || m.name.replace("models/", "") }))
+          .filter(m => !skip.test(m.id));
+        result.google = _rankSort(models, GOOGLE_TOP);
+      }
+    } catch (e) { console.warn("[models] Google fetch failed:", e.message); }
+  }
+
+  _modelsCache = result;
+  _modelsCacheTs = now;
+  return result;
+}
+
+app.get("/api/models", async (_req, res) => {
+  try {
+    const models = await fetchProviderModels();
+    res.json(models);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+// Force-refresh: DELETE /api/models clears cache
+app.delete("/api/models", (_req, res) => {
+  _modelsCache = null;
+  _modelsCacheTs = 0;
+  res.json({ cleared: true });
+});
+
 const ARCHIVE_INACTIVE_DAYS = 30;
+// ─── Priority scoring ────────────────────────────────────────────────────────
+// Each session gets a deterministic priority_score so the sidebar can rank
+// "what to work on next" by time × ROI rather than just newest-first. The
+// breakdown is exposed alongside so taps on the badge can show the why.
+const PRIORITY_DEFAULTS = {
+  project_roi_multipliers: {
+    crankHero: 100, camoHero: 80, mediaHero: 60,
+    langHero: 40, dataHero: 40, orchestratorHero: 30, llmTerminal: 20,
+  },
+  important_people: [
+    "Birta", "Joi", "Tav", "Brandon", "Studi",
+    "GoodLeap", "Washington National", "Valentina", "SelectQuote",
+  ],
+};
+const PRIORITY_SETTINGS_FILE = path.join(DATA_DIR, "priority_settings.json");
+
+function loadPrioritySettings() {
+  try {
+    const f = JSON.parse(fs.readFileSync(PRIORITY_SETTINGS_FILE, "utf8"));
+    return {
+      project_roi_multipliers: { ...PRIORITY_DEFAULTS.project_roi_multipliers, ...(f.project_roi_multipliers || {}) },
+      important_people: Array.isArray(f.important_people) ? f.important_people : PRIORITY_DEFAULTS.important_people,
+    };
+  } catch { return { ...PRIORITY_DEFAULTS }; }
+}
+
+// Port of frontend computeSessionState — kept in sync so server-side ranking
+// matches the badge color the user sees.
+function computeSessionStateServer(s) {
+  const role = s.lastMessageRole || "";
+  const ageMin = (Date.now() - (s.lastActive || 0)) / 60000;
+  if (role === "email_reply") return s.manualDone ? "done" : "decision";
+  if (role === "email_sent") return "done";
+  if (role === "email_draft" && s.emailOpened) return "done";
+  if (role === "email_draft") return "decision";
+  if (s.manualDone) return "done";
+  if (role === "question" || role === "permission_denied") return "blocked";
+  // V1.1: user_waiting — David sent a message but the agent hasn't produced
+  // any output yet. Only when the last role is "user" (not tool_activity etc.,
+  // which means the agent IS running).
+  if (s.awaitingResponse && role === "user") return "user_waiting";
+  if (role === "user" || role === "tool_activity" || role === "tool_result" || role === "permission_granted") {
+    return ageMin > 5 ? "stalled" : "working";
+  }
+  if (role === "assistant") {
+    if (ageMin > 3 * 24 * 60) return "done";
+    return "responded";
+  }
+  return "";
+}
+
+const STATE_URGENCY = { blocked: 100, decision: 80, user_waiting: 60, responded: 40, stalled: 30, working: 20, done: 0 };
+const DEADLINE_RE = /\b(by|due|before|deadline)\s+(today|tomorrow|EOD|noon|\d{1,2}(?:am|pm)?|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i;
+const MONEY_RE = /\$\s?\d{1,3}(?:,\d{3})*(?:\.\d{2})?\b|\b\d+k\b|\binvoice\b|\bcommission\b|\bpayment\b|\bdeal\b/i;
+
+function computePrioritySession(s, settings) {
+  const state = computeSessionStateServer(s);
+  const ageMs = Date.now() - (s.lastActive || s.created || Date.now());
+  const ageDays = ageMs / (24 * 60 * 60 * 1000);
+  const snippetText = String(s.lastSnippet || "") + " " + String(s.title || "");
+
+  // Urgency — state weight, age decay for stale things, deadline boost, reply boost.
+  let urgency = STATE_URGENCY[state] ?? 30;
+  if (ageDays > 1) urgency *= Math.max(0.2, 1 - (ageDays - 1) * 0.2);
+  const hasDeadline = DEADLINE_RE.test(snippetText);
+  if (hasDeadline) urgency += 20;
+  if (s.lastMessageRole === "email_reply" && !s.manualDone) urgency += 20;
+  urgency = Math.max(0, Math.min(120, urgency));
+
+  // ROI — Haiku-judged score replaces the deterministic ROI when available
+  // (Phase 4), otherwise: project base + people boost + money boost.
+  // Star always sets a floor.
+  const projMult = settings.project_roi_multipliers[s.project];
+  const baseRoi = (typeof projMult === "number") ? projMult : 50;
+  const matchedPeople = settings.important_people.filter(p =>
+    p && snippetText.toLowerCase().includes(p.toLowerCase())
+  );
+  const hasMoney = MONEY_RE.test(snippetText);
+  const haiku = _roiHaikuLookup(s.id);
+  let roi;
+  if (haiku) {
+    // Haiku scores 0-100; lift to the 0-200 ROI scale so it can override
+    // project-base ceilings when the model says "yes this is genuinely valuable."
+    roi = haiku.score * 1.5;
+  } else {
+    roi = baseRoi;
+    if (matchedPeople.length > 0) roi += 15 * matchedPeople.length;
+    if (hasMoney) roi += 15;
+  }
+  if (s.starred) roi = Math.max(roi, 80);
+  roi = Math.max(0, Math.min(200, roi));
+
+  // Combined: urgency × roi / 100, capped at 999 so badges fit
+  const score = Math.max(0, Math.min(999, Math.round((urgency * roi) / 100)));
+  return {
+    score,
+    breakdown: {
+      state,
+      urgency: Math.round(urgency),
+      roi: Math.round(roi),
+      age_days: Math.round(ageDays * 10) / 10,
+      matched_people: matchedPeople,
+      has_deadline: hasDeadline,
+      has_money: hasMoney,
+      starred: !!s.starred,
+      project_multiplier: (typeof projMult === "number") ? projMult : null,
+      haiku_score: haiku ? haiku.score : null,
+      haiku_why: haiku ? haiku.why : null,
+      haiku_age_ms: haiku ? Date.now() - haiku.computed_at : null,
+    },
+  };
+}
+
+// ─── Haiku ROI re-score (Phase 4) ─────────────────────────────────────────────
+// In-memory cache: sessionId -> { score: 0-100, why, computed_at }.
+// 15-min TTL. The frontend triggers a rescore on the top-N visible sessions;
+// computePrioritySession layers the cached value over the deterministic ROI.
+const _roiHaikuCache = new Map();
+const ROI_HAIKU_TTL_MS = 15 * 60 * 1000;
+const ROI_HAIKU_CACHE_FILE = path.join(DATA_DIR, "priority_roi_cache.json");
+
+// Best-effort persist so a server restart doesn't blow away the cache.
+function _persistRoiCache() {
+  try {
+    const dump = {};
+    for (const [k, v] of _roiHaikuCache) dump[k] = v;
+    fs.writeFileSync(ROI_HAIKU_CACHE_FILE, JSON.stringify(dump));
+  } catch {}
+}
+function _loadRoiCache() {
+  try {
+    const d = JSON.parse(fs.readFileSync(ROI_HAIKU_CACHE_FILE, "utf8"));
+    const now = Date.now();
+    for (const [k, v] of Object.entries(d)) {
+      if (v && typeof v.score === "number" && v.computed_at && (now - v.computed_at < ROI_HAIKU_TTL_MS)) {
+        _roiHaikuCache.set(k, v);
+      }
+    }
+  } catch {}
+}
+_loadRoiCache();
+
+function _roiHaikuLookup(sessionId) {
+  const v = _roiHaikuCache.get(sessionId);
+  if (!v) return null;
+  if (Date.now() - v.computed_at > ROI_HAIKU_TTL_MS) {
+    _roiHaikuCache.delete(sessionId);
+    return null;
+  }
+  return v;
+}
+
+app.post("/api/priority-roi-rescore", express.json(), async (req, res) => {
+  const ids = Array.isArray(req.body?.session_ids) ? req.body.session_ids.slice(0, 15) : [];
+  if (!ids.length) return res.json({ scored: 0, skipped: 0 });
+  const sessions = loadSessions();
+  const sessById = new Map(sessions.map(s => [s.id, s]));
+  let scored = 0, skipped = 0;
+  // Fire in series (Haiku is fast; no need to hammer the runner).
+  for (const sid of ids) {
+    if (_roiHaikuLookup(sid)) { skipped++; continue; }
+    const s = sessById.get(sid);
+    if (!s) continue;
+    // Build a compact transcript: last 10 messages.
+    let lines = "";
+    try {
+      const msgs = (typeof loadMessages === "function") ? loadMessages(sid).slice(-10) : [];
+      lines = msgs.map(m => {
+        const r = (m.role || "").toUpperCase();
+        const t = (m.text || m.summary || "").toString().slice(0, 400);
+        return t ? `${r}: ${t}` : null;
+      }).filter(Boolean).join("\n\n");
+    } catch {}
+    if (!lines || lines.length < 30) { skipped++; continue; }
+    const prompt = `You are scoring how valuable it would be for David (a solo founder running multiple businesses) to act on this chat in the next hour. Return JSON ONLY:
+{"score": <0-100>, "why": "<one short sentence>"}
+
+Higher means: live deal, client waiting, money on the table, time-sensitive decision blocking other work.
+Lower means: exploratory, internal cleanup, no external stakeholder, can wait.
+
+Project: ${s.project || "?"}
+Title: ${s.title || "?"}
+
+Recent messages:
+${lines}`;
+    await new Promise(resolve => {
+      runCheapClaude(prompt, "roi-haiku", async (parsed) => {
+        const score = (typeof parsed?.score === "number") ? Math.max(0, Math.min(100, parsed.score)) : null;
+        if (score !== null) {
+          _roiHaikuCache.set(sid, {
+            score,
+            why: String(parsed.why || "").slice(0, 200),
+            computed_at: Date.now(),
+          });
+          scored++;
+        }
+        resolve();
+      });
+      // 8s timeout per session — runCheapClaude has its own 45s but we want to bound the request.
+      setTimeout(resolve, 8000);
+    });
+  }
+  if (scored > 0) _persistRoiCache();
+  res.json({ scored, skipped, cached: _roiHaikuCache.size });
+});
+
+// Priority settings — read/write so the user can tune without redeploying.
+app.get("/api/priority-settings", (_req, res) => res.json(loadPrioritySettings()));
+app.post("/api/priority-settings", express.json(), (req, res) => {
+  const body = req.body || {};
+  const cur = loadPrioritySettings();
+  const next = {
+    project_roi_multipliers: { ...cur.project_roi_multipliers, ...(body.project_roi_multipliers || {}) },
+    important_people: Array.isArray(body.important_people) ? body.important_people : cur.important_people,
+  };
+  try { fs.writeFileSync(PRIORITY_SETTINGS_FILE, JSON.stringify(next, null, 2)); }
+  catch (e) { return res.status(500).json({ error: e.message }); }
+  res.json(next);
+});
+
 app.get("/api/sessions", (req, res) => {
   let s = loadSessions();
   // project="ALL" returns every project; omitted/empty also returns all;
@@ -357,8 +891,18 @@ app.get("/api/sessions", (req, res) => {
   if (proj && proj !== "ALL") s = s.filter(x => x.project === proj);
   // Annotate archived status — soft (computed on the fly), based on lastActive.
   const cutoff = Date.now() - ARCHIVE_INACTIVE_DAYS * 86400 * 1000;
-  s = s.map(x => ({ ...x, archived: (x.lastActive || x.created || 0) < cutoff }));
-  // Sort newest first within the result.
+  const prioritySettings = loadPrioritySettings();
+  s = s.map(x => {
+    const p = computePrioritySession(x, prioritySettings);
+    return {
+      ...x,
+      archived: (x.lastActive || x.created || 0) < cutoff,
+      priority_score: p.score,
+      priority_breakdown: p.breakdown,
+    };
+  });
+  // Sort newest first within the result. (Frontend can re-sort by priority_score
+  // for the NEEDS YOU section without losing date order elsewhere.)
   s.sort((a, b) => (b.lastActive || 0) - (a.lastActive || 0));
   res.json(s);
 });
@@ -409,13 +953,19 @@ app.post("/api/sessions/bulk-archive-done", express.json(), (req, res) => {
 app.post("/api/sessions/:id/state", express.json(), (req, res) => {
   const found = findSessionOr404(req.params.id, res); if (!found) return;
   const { sessions, session: s } = found;
-  if (req.body?.manualDone) {
-    s.manualDone = Date.now();
-  } else {
-    delete s.manualDone;
+  const body = req.body || {};
+  // manualDone: tri-state — if key absent, leave alone; if truthy set; if false clear.
+  if ("manualDone" in body) {
+    if (body.manualDone) { s.manualDone = Date.now(); s.doneSource = "mcp"; }
+    else { delete s.manualDone; delete s.doneSource; }
+  }
+  // starred: persistent manual ROI floor — same tri-state semantics.
+  if ("starred" in body) {
+    if (body.starred) s.starred = true;
+    else delete s.starred;
   }
   saveSessions(sessions);
-  res.json({ ok: true, manualDone: s.manualDone || null });
+  res.json({ ok: true, manualDone: s.manualDone || null, starred: !!s.starred });
 });
 
 // Sets lastViewed=now on a session. Frontend calls this when you open the
@@ -727,6 +1277,18 @@ function queuePopNext(sessionId) {
   console.log("[queue] -1 for", sessionId, "(", items.length, "remaining):", next.text.slice(0, 60));
   return next;
 }
+// Push the current queue contents (texts + client_ids) to every WS client on this
+// session so the chat UI can render pending bubbles instead of just a depth count.
+function broadcastQueueState(sessionId) {
+  if (!sessionId) return;
+  const items = queueLoad(sessionId).map(it => ({
+    text: it.text || "",
+    source: it.source || "prompt",
+    client_id: it.client_id || null,
+    ts: it.ts || null,
+  }));
+  broadcastToSession(sessionId, { type: "queue_state", queueDepth: items.length, items });
+}
 
 fs.mkdirSync(VOICE_DIR, { recursive: true });
 
@@ -849,6 +1411,10 @@ app.post("/voice-note", express.raw({ type: ["audio/*", "application/octet-strea
     const sid = (req.query && req.query.session) || "";
     if (sid && result.text) {
       queueAppend(sid, { text: result.text, source: "voice-note", audioUrl: "/voice-notes/" + name });
+      // Show the pending voice-note bubble to every client on this session.
+      // (If drain fires immediately, that broadcast will overwrite this with the
+      // post-pop state.)
+      try { broadcastQueueState(sid); } catch {}
       // Try to drain immediately if the session isn't currently running anything
       try { tryDrainQueue(sid); } catch (e) { console.error("[queue] drain attempt failed:", e.message); }
     }
@@ -1007,6 +1573,7 @@ const BROWSER_CDP_PORTS = {
   crankhero: 9223,
   orchestratorhero: 9224,
   llmterminal: 9225,
+  langhero: 9226,
 };
 /* <<< llmTerminal-managed <<< */
 const browserActivity = {}; // proj -> { sig, lastChange, firstSeen }
@@ -1018,8 +1585,12 @@ app.get('/api/browser-status', async (req, res) => {
     const r = await fetch('http://127.0.0.1:' + port + '/json', { signal: AbortSignal.timeout(1500) });
     if (!r.ok) throw new Error('cdp ' + r.status);
     const tabs = await r.json();
+    // Accept any user-visible surface: a real page if there is one, else fall back
+    // to browser_ui (e.g. chrome://profile-picker/) so the VNC link still shows and
+    // the user can resolve a stuck picker themselves instead of the link vanishing.
     const pages = tabs.filter(t => t.type === 'page');
-    const top = pages[0];
+    const surfaces = tabs.filter(t => t.type === 'page' || t.type === 'browser_ui');
+    const top = pages[0] || surfaces[0];
     const url = top ? top.url : null;
     const title = top ? top.title : null;
 
@@ -1078,6 +1649,103 @@ server.on('upgrade', (req, socket, head) => {
 // camoHero-only. Shells out to camoHero/scripts/send_gmail_email.py (no --dry-run)
 // after validating the session belongs to the camoHero project. Honors the same
 // pre-send checks (sign-off / URL trust / dedup) as a CLI invocation.
+
+// ── In-browser Claude Code re-auth (direct OAuth code flow) ─────────────────
+// When the Claude token expires (it's long-lived, ~months, but eventually
+// dies), every chat 401s. This lets David re-auth from the phone: we run the
+// standard OAuth authorization-code + PKCE flow OURSELVES — generate the
+// verifier/challenge, hand back the authorize URL, and on code submission POST
+// to claude.ai's token endpoint and write the credentials. Bonus over the CLI's
+// `setup-token`: this returns a refresh token, so future expiries can auto-renew.
+const CLAUDE_OAUTH = {
+  clientId: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+  authorizeUrl: "https://claude.ai/oauth/authorize",
+  tokenUrl: "https://claude.ai/v1/oauth/token",
+  redirectUri: "https://platform.claude.com/oauth/code/callback",
+  scope: "user:inference",
+  credPath: "/home/claude-user/.claude/.credentials.json",
+};
+let _authFlow = null; // { verifier, state }
+
+function _b64url(buf) { return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); }
+function _readTokenExpiry() {
+  try {
+    const c = JSON.parse(fs.readFileSync(CLAUDE_OAUTH.credPath, "utf8"));
+    const o = c.claudeAiOauth || {};
+    return { expiresAt: o.expiresAt || 0, expired: !o.expiresAt || o.expiresAt <= Date.now(), hasRefresh: !!o.refreshToken };
+  } catch { return { expiresAt: 0, expired: true, hasRefresh: false }; }
+}
+
+app.get("/api/claude-auth/status", (_req, res) => { res.json(_readTokenExpiry()); });
+
+app.post("/api/claude-auth/start", express.json(), (req, res) => {
+  try {
+    const verifier = _b64url(crypto.randomBytes(32));
+    const challenge = _b64url(crypto.createHash("sha256").update(verifier).digest());
+    const state = _b64url(crypto.randomBytes(32));
+    _authFlow = { verifier, state, startedAt: Date.now() };
+    const u = new URL(CLAUDE_OAUTH.authorizeUrl);
+    u.searchParams.set("code", "true");
+    u.searchParams.set("client_id", CLAUDE_OAUTH.clientId);
+    u.searchParams.set("response_type", "code");
+    u.searchParams.set("redirect_uri", CLAUDE_OAUTH.redirectUri);
+    u.searchParams.set("scope", CLAUDE_OAUTH.scope);
+    u.searchParams.set("code_challenge", challenge);
+    u.searchParams.set("code_challenge_method", "S256");
+    u.searchParams.set("state", state);
+    res.json({ ok: true, url: u.toString() });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+app.post("/api/claude-auth/submit", express.json(), async (req, res) => {
+  let code = String((req.body && req.body.code) || "").trim();
+  if (!_authFlow) return res.status(400).json({ ok: false, error: "no auth flow in progress — tap Begin again" });
+  if (!code) return res.status(400).json({ ok: false, error: "no code provided" });
+  // claude.ai hands back `<code>#<state>`. Split; tolerate a bare code too.
+  let returnedState = _authFlow.state;
+  if (code.includes("#")) { const parts = code.split("#"); code = parts[0]; returnedState = parts[1] || _authFlow.state; }
+  try {
+    const r = await fetch(CLAUDE_OAUTH.tokenUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        grant_type: "authorization_code",
+        code,
+        state: returnedState,
+        client_id: CLAUDE_OAUTH.clientId,
+        redirect_uri: CLAUDE_OAUTH.redirectUri,
+        code_verifier: _authFlow.verifier,
+      }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || !data.access_token) {
+      console.log("[claude-auth] exchange failed HTTP " + r.status + " " + JSON.stringify(data).slice(0, 300));
+      return res.status(400).json({ ok: false, error: (data.error_description || data.error || ("token endpoint HTTP " + r.status)) + " — re-run from Step 1 (codes are single-use)" });
+    }
+    // Preserve subscriptionType/rateLimitTier from the old creds if present.
+    let prev = {};
+    try { prev = (JSON.parse(fs.readFileSync(CLAUDE_OAUTH.credPath, "utf8")).claudeAiOauth) || {}; } catch {}
+    const expiresAt = Date.now() + (Number(data.expires_in || 0) * 1000);
+    const scopes = (data.scope ? String(data.scope).split(" ") : (prev.scopes || ["user:inference"]));
+    const cred = { claudeAiOauth: {
+      accessToken: data.access_token,
+      refreshToken: data.refresh_token || prev.refreshToken || "",
+      expiresAt,
+      scopes,
+      ...(prev.subscriptionType ? { subscriptionType: prev.subscriptionType } : {}),
+      ...(prev.rateLimitTier ? { rateLimitTier: prev.rateLimitTier } : {}),
+    }};
+    fs.writeFileSync(CLAUDE_OAUTH.credPath, JSON.stringify(cred, null, 2), { mode: 0o600 });
+    try { fs.chownSync(CLAUDE_OAUTH.credPath, 1000, 1000); } catch {}
+    _authFlow = null;
+    console.log("[claude-auth] SUCCESS exp=" + expiresAt + " hasRefresh=" + !!data.refresh_token);
+    res.json({ ok: true, expiresAt, hasRefresh: !!data.refresh_token });
+  } catch (e) {
+    console.log("[claude-auth] submit error: " + e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 app.post("/api/email-draft/send", express.json(), (req, res) => {
   const { sessionId, to, cc, subject, body, fromAccount, threadId, attachments, force } = req.body || {};
   if (!sessionId || !to || !subject || !body) {
@@ -1202,7 +1870,7 @@ const SENT_LOG_PATH = "/home/claude-user/projects/dataHero/.credentials/gmail_se
 
 function _sentLogKey(to, subject) {
   const raw = `${(to || "").toLowerCase().trim()}|${(subject || "").toLowerCase().trim()}`;
-  return _crypto.createHash("sha256").update(raw).digest("hex").slice(0, 24);
+  return crypto.createHash("sha256").update(raw).digest("hex").slice(0, 24);
 }
 function _bodyHash(body) {
   let clean = (body || "").toLowerCase().trim();
@@ -1210,7 +1878,7 @@ function _bodyHash(body) {
     const idx = clean.lastIndexOf(marker);
     if (idx > 0) clean = clean.slice(0, idx);
   }
-  return _crypto.createHash("sha256").update(clean).digest("hex").slice(0, 24);
+  return crypto.createHash("sha256").update(clean).digest("hex").slice(0, 24);
 }
 
 app.post("/api/email-draft/log-intent", express.json(), (req, res) => {
@@ -1285,9 +1953,24 @@ function summarizeToolUse(toolName, input) {
     if (toolName === "Glob") return input.pattern || "";
     if (toolName === "Grep") return (input.pattern || "") + (input.path ? " in " + input.path : "");
     if (toolName === "WebFetch" || toolName === "WebSearch") return input.url || input.query || "";
+    // Playwright MCP browser_*: pick the most identifying field per tool
+    if (toolName === "browser_navigate" || toolName === "browser_navigate_back") return input.url || "";
+    if (toolName === "browser_take_screenshot") return input.filename || input.element || "viewport";
+    if (toolName === "browser_click" || toolName === "browser_hover" || toolName === "browser_drag") return input.element || input.ref || "";
+    if (toolName === "browser_type" || toolName === "browser_fill_form") return (input.element || "") + (input.text ? " ← " + String(input.text).slice(0, 60) : "");
+    if (toolName === "browser_press_key") return input.key || "";
+    if (toolName === "browser_wait_for") return input.text || input.time || "";
+    if (toolName === "browser_evaluate") return (input.function || "").slice(0, 140);
+    if (toolName === "browser_select_option") return (input.element || "") + " → " + (input.values || []).join(",");
+    if (toolName === "browser_resize") return (input.width || "?") + "x" + (input.height || "?");
+    if (toolName.startsWith("browser_")) return Object.keys(input).slice(0, 2).map(k => k + "=" + String(input[k]).slice(0, 30)).join(" ");
     if (toolName.startsWith("mcp__")) {
       const parts = toolName.split("__");
       return (parts[1] || "") + ":" + (parts[2] || "");
+    }
+    // Generic MCP fallback: show the first 1-2 input fields
+    if (input && typeof input === "object" && Object.keys(input).length) {
+      return Object.keys(input).slice(0, 2).map(k => k + "=" + String(input[k]).slice(0, 30)).join(" ");
     }
   } catch {}
   return "";
@@ -1407,10 +2090,20 @@ function autoDetectBashFiles(stdout, sessionId, cwd) {
 }
 
 
-// ── Shared cheap-Claude spawner for supervisor-pattern observers ──
-// Spawns `claude -p` with Haiku, tools disabled, JSON output. Parses the
-// result and calls onParsed(parsed, stderr). Fire-and-forget, 45s timeout.
+// ── Shared cheap-LLM spawner for supervisor-pattern observers ──
+// Provider-agnostic: routes to Claude Haiku (default) or OpenAI gpt-4o-mini
+// based on LLMT_BACKGROUND_PROVIDER env (claude|openai). Both paths emit the
+// same (parsed, errString) callback contract. Fire-and-forget, ~45s budget.
+// Falls back to claude if openai is selected but OPENAI_API_KEY is missing.
 function runCheapClaude(prompt, tag, onParsed) {
+  const want = (process.env.LLMT_BACKGROUND_PROVIDER || "claude").toLowerCase();
+  if (want === "openai" && process.env.OPENAI_API_KEY) {
+    return _runCheapOpenAI(prompt, tag, onParsed);
+  }
+  return _runCheapClaudeCli(prompt, tag, onParsed);
+}
+
+function _runCheapClaudeCli(prompt, tag, onParsed) {
   const args = [
     "-p", prompt,
     "--model", "haiku",
@@ -1440,6 +2133,30 @@ function runCheapClaude(prompt, tag, onParsed) {
     }
   });
   proc.on("error", e => console.error(`[${tag}] spawn error:`, e.message));
+}
+
+// OpenAI-backed equivalent of _runCheapClaudeCli. Reuses callOpenAI() and
+// produces an object parsed from JSON content. Kept side-effect-symmetric
+// with the claude path: silent warn on failure, no throw to the caller.
+async function _runCheapOpenAI(prompt, tag, onParsed) {
+  const SYSTEM = "You return JSON only. No prose, no markdown fences, no commentary. The user prompt fully describes the required JSON shape.";
+  try {
+    const content = await callOpenAI("gpt-4o-mini", 800, SYSTEM, prompt);
+    if (!content) {
+      console.warn(`[${tag}] openai returned empty/null`);
+      return;
+    }
+    const json = content.replace(/^```(?:json)?\s*|\s*```$/g, "").trim();
+    let parsed;
+    try { parsed = JSON.parse(json); }
+    catch (e) {
+      console.warn(`[${tag}] openai parse failed:`, e.message, "raw:", content.slice(0, 300));
+      return;
+    }
+    await onParsed(parsed, "");
+  } catch (e) {
+    console.error(`[${tag}] openai call error:`, e.message);
+  }
 }
 
 // ── End-of-run observer (Tier 2 "supervisor pattern") ──
@@ -1654,6 +2371,259 @@ ${lines}`;
   }
 }
 
+// ─── Contract-check supervisor (set + clear manualDone) ───────────────────
+// Fires after each assistant reply. Haiku judges whether the discrete task
+// the user asked for has wrapped up. Two-way arbiter:
+//   - judged done, not currently marked → set manualDone + write a banner
+//   - judged done, already marked       → no-op (preserve)
+//   - judged NOT done, currently marked → CLEAR manualDone (user re-engaged)
+//   - judged NOT done, not marked       → no-op
+// This is the sole automated source of truth for "task complete." We do NOT
+// auto-clear manualDone on user typing alone (that wiped legitimate verdicts);
+// the contract-check is the only thing allowed to flip the bit programmatically.
+const _contractCheckLastRun = {};
+const CONTRACT_CHECK_COOLDOWN_MS = 30 * 1000;       // 30s — short, re-judges quickly after follow-ups
+const CONTRACT_CHECK_MIN_MESSAGES = 4;
+
+function spawnContractCheck(sessionId, projectName) {
+  try {
+    if (!sessionId) return;
+    const now = Date.now();
+    if (_contractCheckLastRun[sessionId] && (now - _contractCheckLastRun[sessionId]) < CONTRACT_CHECK_COOLDOWN_MS) return;
+    _contractCheckLastRun[sessionId] = now;
+
+    const sessions = loadSessions();
+    const session = sessions.find(s => s.id === sessionId);
+    if (!session) return;
+    const wasDone = !!session.manualDone;
+
+    const all = loadMessages(sessionId);
+    if (all.length < CONTRACT_CHECK_MIN_MESSAGES) return;
+    const recent = all.slice(-20);
+    const last = recent[recent.length - 1];
+    if (!last || last.role !== "assistant") return;
+    const lastText = String(last.text || "").trim();
+    if (!lastText) return;
+    // If the assistant ends with a clarifying question, work is NOT done.
+    // Short-circuit: when already marked done, force-clear immediately (user
+    // typed a follow-up that yielded a question — definitely active again).
+    const endsWithQuestion = lastText.endsWith("?")
+      || /\b(say|tell me|let me know|confirm|which|should i|do you want|would you like)\b[^\n.]*[?]?\s*$/i.test(lastText.slice(-200));
+    if (endsWithQuestion) {
+      if (wasDone) {
+        delete session.manualDone;
+        saveSessions(sessions);
+        try { broadcastToSession(sessionId, { type: "history", messages: loadMessages(sessionId) }); } catch {}
+        console.log("[contract-check]", sessionId.slice(0,8), "→ CLEARED (assistant asked clarifying question)");
+      }
+      return;
+    }
+
+    const lines = buildRecentTranscript(recent, { maxChars: 600 });
+    if (lines.length < 80) return;
+
+    const prompt = `You are deciding whether the agent has FINISHED its current discrete task in this chat. The user just got the assistant's most-recent reply. Output JSON ONLY:
+{"done": true|false, "reason": "short reason", "summary": "<one-line wrap-up of what was finished, ONLY if done=true, max 18 words>"}
+
+Mark done=true when ALL true:
+  - The assistant's last message is a concluding statement, not a question
+  - There is no pending action the agent could continue without user input
+  - The user's most recent ask has been substantively addressed
+  - The agent did not say it is "going to" / "about to" / "next will" do something
+
+Otherwise done=false.
+
+Conversation (NEWEST AT BOTTOM):
+${lines}`;
+
+    console.log("[contract-check] firing for", sessionId.slice(0,8), "(", recent.length, "msgs, wasDone=", wasDone, ")");
+    runCheapClaude(prompt, "contract-check", async (parsed) => {
+      const judged = !!(parsed && parsed.done === true);
+      const sessions2 = loadSessions();
+      const s2 = sessions2.find(x => x.id === sessionId);
+      if (!s2) return;
+      const msgs2 = loadMessages(sessionId);
+      const lastNow = msgs2[msgs2.length - 1];
+      // Abort if conversation moved on (a new message arrived during Haiku latency).
+      if (!lastNow || lastNow.ts !== last.ts) {
+        console.log("[contract-check]", sessionId.slice(0,8), "→ conversation moved on, aborting");
+        return;
+      }
+      if (judged) {
+        if (s2.manualDone) {
+          console.log("[contract-check]", sessionId.slice(0,8), "→ DONE (already marked, preserving)");
+          return;
+        }
+        const summary = String(parsed.summary || "").trim().slice(0, 240);
+        s2.manualDone = Date.now();
+        saveSessions(sessions2);
+        if (summary && !lastText.includes(summary.slice(0, 30))) {
+          try { saveMessage(sessionId, { role: "assistant", text: "✓ " + summary, ts: Date.now(), source: "contract_check" }); }
+          catch (e) { console.warn("[contract-check] append failed:", e.message); }
+        }
+        try { broadcastToSession(sessionId, { type: "history", messages: loadMessages(sessionId) }); } catch {}
+        console.log("[contract-check]", sessionId.slice(0,8), "→ DONE:", summary || "(no summary)");
+      } else {
+        if (s2.manualDone && s2.doneSource !== "mcp") {
+          delete s2.manualDone; delete s2.doneSource;
+          saveSessions(sessions2);
+          try { broadcastToSession(sessionId, { type: "history", messages: loadMessages(sessionId) }); } catch {}
+          console.log("[contract-check]", sessionId.slice(0,8), "→ CLEARED:", parsed?.reason || "(work resumed)");
+        } else if (s2.manualDone && s2.doneSource === "mcp") {
+          console.log("[contract-check]", sessionId.slice(0,8), "→ keeping MCP-set done (Haiku disagreed but llmt_complete takes precedence)");
+        } else {
+          console.log("[contract-check]", sessionId.slice(0,8), "→ not done:", parsed?.reason || "");
+        }
+      }
+    });
+  } catch (e) {
+    console.error("[contract-check] outer error:", e.message);
+  }
+}
+
+// Run a queued prompt with no live WebSocket — full run, saves to disk,
+// broadcasts to any clients that join mid-run. Mirrors sendToSession logic
+// without the WS-specific streaming layer.
+function fireQueueHeadless(sessionId) {
+  if (activeProcBySession.has(sessionId)) return;
+  const next = queuePopNext(sessionId);
+  if (!next) return;
+  const sessions0 = loadSessions();
+  const session = sessions0.find(s => s.id === sessionId);
+  if (!session) { console.error("[queue-headless] session not found:", sessionId); return; }
+  console.log("[queue-headless] firing for", sessionId, ":", next.text.slice(0, 80));
+  session.messageCount = (session.messageCount || 0) + 1;
+  session.lastActive = Date.now();
+  _persistSessionIfNew(session);
+  updateSessionInStore(session);
+  const firingTs = next.ts || Date.now();
+  saveMessage(sessionId, { role: "user", text: next.text, ts: firingTs, source: next.source, client_id: next.client_id });
+  broadcastToSession(sessionId, { type: "queued_prompt_firing", text: next.text, source: next.source, client_id: next.client_id, ts: firingTs });
+  broadcastToSession(sessionId, { type: "thinking", session_id: sessionId });
+  broadcastQueueState(sessionId);
+  const cwd = path.join(PROJECTS_DIR, session.project);
+  const _effort = session.effort || "max";
+  ensurePermissionsLoaded(sessionId);
+  const perms = sessionPermissions[sessionId];
+  const extraAllowedTools = perms ? [...perms] : [];
+  const _provider = getProvider(session.model);
+  const _runFn = _provider === "openai" ? runOpenAI : _provider === "google" ? runGoogle : runClaude;
+  const _runArgs = _provider === "claude"
+    ? { project: session.project, prompt: next.text, claudeSessionId: session.claudeSessionId, cwd, extraAllowedTools, model: session.model, sessionId, effort: _effort }
+    : { prompt: next.text, sessionId, model: session.model, project: session.project, effort: _effort };
+  if (_provider === "claude") killExistingClaudeFor(session.claudeSessionId);
+  let _assistantTextEmittedThisTurn = false;
+  let lastToolUse = null;
+  let gotResult = false;
+  const pendingPreviews = {};
+  const proc = _runFn(
+    _runArgs,
+    (data) => {
+      if (data.type === "system" && data.subtype === "init") {
+        if (data.session_id && !session.claudeSessionId) {
+          session.claudeSessionId = data.session_id;
+          updateSessionInStore(session);
+        }
+        return;
+      }
+      if (data.type === "assistant") {
+        const content = data.message?.content;
+        if (Array.isArray(content)) {
+          for (const block of content) {
+            if (block.type === "text" && block.text) {
+              _assistantTextEmittedThisTurn = true;
+              broadcastToSession(sessionId, { type: "text", text: block.text, session_id: sessionId });
+            }
+            if (block.type === "tool_use") {
+              lastToolUse = { name: block.name, input: block.input, id: block.id };
+              if (["Write","Edit","MultiEdit","NotebookEdit"].includes(block.name))
+                pendingPreviews[block.id] = { tool_name: block.name, input: block.input };
+              if (block.name === "Bash")
+                pendingPreviews[block.id] = { tool_name: "Bash", input: block.input };
+              if (block.name === "Read" && typeof block.input?.file_path === "string"
+                  && block.input.file_path.startsWith("/home/claude-user/projects/"))
+                autoDetectBashFiles(block.input.file_path, sessionId, cwd);
+              if (block.name !== "AskUserQuestion") {
+                const summary = summarizeToolUse(block.name, block.input);
+                saveMessage(sessionId, { role: "tool_activity", tool_name: block.name, summary, ts: Date.now() });
+              }
+              broadcastToSession(sessionId, { type: "tool_use", name: block.name, input: block.input, session_id: sessionId });
+            }
+          }
+        }
+      }
+      if (data.type === "user" && data.message?.content) {
+        const content = Array.isArray(data.message.content) ? data.message.content : [];
+        for (const block of content) {
+          if (block.type === "tool_result" && block.tool_use_id && pendingPreviews[block.tool_use_id]) {
+            const pending = pendingPreviews[block.tool_use_id];
+            delete pendingPreviews[block.tool_use_id];
+            if (!block.is_error) {
+              if (pending.tool_name === "Bash") {
+                const stdout = Array.isArray(block.content) ? (block.content[0]?.text || "") : String(block.content || "");
+                autoDetectBashFiles(stdout, sessionId, cwd);
+              } else {
+                autoCreatePreview(pending, sessionId);
+              }
+            }
+          }
+          if (block.type === "tool_result" && !block.is_error) {
+            try {
+              const txt = Array.isArray(block.content) ? (block.content[0]?.text || "") : String(block.content || "");
+              if (txt && /\/home\/claude-user\/projects\//.test(txt)) autoDetectBashFiles(txt, sessionId, cwd);
+            } catch {}
+          }
+        }
+      }
+      if (data.type === "result") {
+        gotResult = true;
+        const result = data.result || "";
+        const isApiError = data.is_error === true || /^API Error:\s*\d{3}/.test(result);
+        if (isApiError) {
+          broadcastToSession(sessionId, { type: "api_error", message: result.slice(0, 500), session_id: sessionId });
+          saveMessage(sessionId, { role: "api_error", text: result.slice(0, 500), ts: Date.now() });
+        } else {
+          let _resultClean = result.replace(/```email-draft\n[\s\S]*?\n```\s*/g, "").trim();
+          if (_resultClean) {
+            saveMessage(sessionId, { role: "assistant", text: _resultClean, ts: Date.now(), cost: data.total_cost_usd, duration: data.duration_ms });
+            try {
+              const _allSessions2 = loadSessions();
+              const _s2 = _allSessions2.find(x => x.id === sessionId);
+              if (_s2) {
+                const _userMsgs2 = loadMessages(sessionId).filter(m => m.role === "user").length;
+                if ((!_s2.titleGenerated && _userMsgs2 >= 1) || (_s2.titleGenerated && (_userMsgs2 - (_s2.titleUserMsgs || 0)) >= 3))
+                  generateSessionTitle(sessionId);
+              }
+            } catch (e) { console.warn("[title-gen headless]", e.message); }
+          }
+          if (lastToolUse && !_assistantTextEmittedThisTurn) {
+            saveMessage(sessionId, { role: "assistant", text: "_(Agent finished its tool work without a written summary. Re-prompt if you want it to recap or continue.)_", ts: Date.now(), cost: data.total_cost_usd, duration: data.duration_ms, synthetic: "empty-result-after-tools" });
+          }
+          broadcastToSession(sessionId, { type: "done", result, cost: data.total_cost_usd, duration: data.duration_ms, session_id: sessionId });
+        }
+        setTimeout(() => { try { spawnDecisionExtractor(sessionId, session.project); } catch {} }, 800);
+        setTimeout(() => { try { spawnContractCheck(sessionId, session.project); } catch {} }, 1100);
+      }
+    },
+    (code, stderr) => {
+      activeProcBySession.delete(sessionId);
+      if (!gotResult) {
+        const msgs2 = loadMessages(sessionId);
+        const last = msgs2.length ? msgs2[msgs2.length - 1] : null;
+        if (last && new Set(["tool_activity","tool_result","permission_granted"]).has(last.role)) {
+          const note = code === 0
+            ? "⚠️ The agent stopped mid-run without producing a final response. Re-prompt to continue."
+            : "⚠️ The agent process exited (code " + code + ") before producing a final response. Re-prompt to retry.";
+          saveMessage(sessionId, { role: "assistant", text: note, ts: Date.now(), recovered: true, stalled: true });
+        }
+      }
+      broadcastToSession(sessionId, { type: "idle", session_id: sessionId });
+      setTimeout(() => { try { tryDrainQueue(sessionId); } catch (e) { console.error("[queue-headless] next drain:", e.message); } }, 50);
+    }
+  );
+  if (proc) activeProcBySession.set(sessionId, proc);
+}
+
 // Drain the next queued prompt for a session. Called when:
 //   - an active claude run finishes (in sendToSession's onDone)
 //   - a fresh voice-note transcript arrives and we want to fire it ASAP
@@ -1667,21 +2637,32 @@ function tryDrainQueue(sessionId) {
       target = c; break;
     }
   }
-  if (!target) return; // no live client — queue stays put, will drain on next connect
-  if (target._activeProcRef && target._activeProcRef.proc) return; // still busy, wait for onDone
+  if (!target) {
+    // No live client — fire headlessly so queue drains without needing a reconnect
+    fireQueueHeadless(sessionId);
+    return;
+  }
+  if (activeProcBySession.has(sessionId)) return; // a run is active for this session (maybe on another WS) — its onDone will drain
   const next = queuePopNext(sessionId);
   if (!next) return;
   console.log("[queue] firing for", sessionId, ":", next.text.slice(0, 60));
-  // Save the user message + render in chat (mimics what the normal prompt handler does)
-  const sessions = loadSessions();
-  const session = sessions.find(s => s.id === sessionId);
-  if (!session) { console.error("[queue] session not found:", sessionId); return; }
+  // Save the user message + render in chat. Use the WS's in-memory session
+  // (which may be pending/not-yet-on-disk). _persistSessionIfNew flips it to
+  // persisted before we write the message — voice-notes routed via nonce now
+  // create the session record the same way a typed prompt does.
+  const session = target._llmSession;
+  if (!session) { console.error("[queue] no in-memory session on WS for:", sessionId); return; }
   session.messageCount = (session.messageCount || 0) + 1;
   session.lastActive = Date.now();
-  saveSessions(sessions);
-  saveMessage(sessionId, { role: "user", text: next.text, ts: next.ts || Date.now(), source: next.source });
-  try { target.send(JSON.stringify({ type: "queued_prompt_firing", text: next.text, source: next.source })); } catch {}
+  _persistSessionIfNew(session);
+  updateSessionInStore(session);
+  const firingTs = next.ts || Date.now();
+  saveMessage(sessionId, { role: "user", text: next.text, ts: firingTs, source: next.source, client_id: next.client_id });
+  try { target.send(JSON.stringify({ type: "queued_prompt_firing", text: next.text, source: next.source, client_id: next.client_id, ts: firingTs })); } catch {}
   try { target.send(JSON.stringify({ type: "thinking" })); } catch {}
+  // Tell every client on this session that one item just left the queue, so the
+  // pending-bubble list re-renders without the popped item.
+  broadcastQueueState(sessionId);
   target._sendToSession(next.text, false);
 }
 
@@ -1719,6 +2700,13 @@ function _bwrapWrap(project, claudeArgs) {
     "--ro-bind", "/sbin", "/sbin",
     "--ro-bind", "/run/systemd/resolve", "/run/systemd/resolve",
     "--tmpfs", "/home/claude-user",
+    // Make /home/claude-user/projects a read-only tmpfs. The project's own dir
+    // gets re-bound rw below. Any write to other paths under projects/ (e.g. an
+    // agent scaffolding into /home/claude-user/projects/foo/) fails with EROFS
+    // instead of silently disappearing into the parent tmpfs on bwrap exit.
+    "--tmpfs", "/home/claude-user/projects",
+    "--dir", projDir,
+    "--remount-ro", "/home/claude-user/projects",
     "--bind", projDir, projDir,
     "--bind", "/home/claude-user/.claude", "/home/claude-user/.claude",
     "--ro-bind", "/home/claude-user/.claude.json", "/home/claude-user/.claude.json",
@@ -1746,16 +2734,25 @@ function _bwrapWrap(project, claudeArgs) {
 }
 
 // ---- generateSessionTitle ----
-// Async title-rename. Called once per session after the first assistant message.
-// Spawns `claude -p` with tools disabled so the model doesn't try to use Gmail
-// or git to "research" before answering. Fire-and-forget; ~5s.
-function generateSessionTitle(sessionId, userText, assistantText) {
+// Titles a chat from its RECENT user/assistant messages. Fires after the first
+// exchange and then periodically as the chat grows (see the trigger in the result
+// handler), so a long voice-note session that drifts across topics keeps a sidebar
+// title reflecting what it's currently about. Fire-and-forget; ~5-15s. Tools
+// disabled so the model can't wander off researching before it answers.
+const _titlingInProgress = new Set(); // sessionIds with an in-flight title-gen (prevents overlap)
+function generateSessionTitle(sessionId) {
+  if (_titlingInProgress.has(sessionId)) return; // already titling this session
   const sessions0 = loadSessions();
   const session0 = sessions0.find(s => s.id === sessionId);
-  if (!session0 || session0.titleGenerated) return;
+  if (!session0) return;
+  const convoMsgs = loadMessages(sessionId).filter(m =>
+    (m.role === "user" || m.role === "assistant") && m.text && !m.synthetic && !m.stalled);
+  if (!convoMsgs.length) return;
+  const _convo = convoMsgs.slice(-8)
+    .map(m => (m.role === "user" ? "User: " : "Assistant: ") + String(m.text).slice(0, 500))
+    .join("\n\n");
   const prompt = "You are titling a chat conversation. Output ONLY the title — 4 to 6 words, no quotes, no markdown, no period, no preface. DO NOT use any tools. DO NOT ask for clarification. If the conversation is unclear, make your best guess from the available context.\n\n"
-    + "User: " + (userText || "").slice(0, 600) + "\n\n"
-    + "Assistant: " + (assistantText || "").slice(0, 600);
+    + _convo.slice(0, 2500);
   const _titleArgs = [
     "-p", prompt,
     "--dangerously-skip-permissions",
@@ -1763,8 +2760,9 @@ function generateSessionTitle(sessionId, userText, assistantText) {
   ];
   // Title-gen runs in the camoHero sandbox if the session belongs to it,
   // matching the same isolation as the main claude spawn for that project.
-  const _titleSession = loadSessions().find(s => s.id === sessionId);
-  const _titleWrap = _bwrapWrap(_titleSession ? _titleSession.project : "", _titleArgs);
+  const _titleWrap = _bwrapWrap(session0.project || "", _titleArgs);
+  _titlingInProgress.add(sessionId);
+  const _doneTitling = () => _titlingInProgress.delete(sessionId);
   const proc = spawn(_titleWrap.cmd, _titleWrap.args, {
     cwd: "/home/claude-user",
     env: { HOME: "/home/claude-user", TERM: "dumb", LANG: "en_US.UTF-8", PATH: process.env.PATH },
@@ -1776,9 +2774,10 @@ function generateSessionTitle(sessionId, userText, assistantText) {
   let err = "";
   proc.stdout.on("data", c => { out += c.toString(); });
   proc.stderr.on("data", c => { err += c.toString(); });
-  const timer = setTimeout(() => { try { proc.kill("SIGTERM"); } catch {} }, 30000);
+  const timer = setTimeout(() => { try { proc.kill("SIGTERM"); } catch {} _doneTitling(); }, 30000);
   proc.on("close", (code) => {
     clearTimeout(timer);
+    _doneTitling();
     if (code !== 0) {
       console.warn("[title-gen] claude exited non-zero for", sessionId, "code=", code, "err=", err.slice(0, 200));
       return;
@@ -1799,18 +2798,594 @@ function generateSessionTitle(sessionId, userText, assistantText) {
     if (!session) return;
     session.title = title;
     session.titleGenerated = true;
+    // Remember the user-turn count at this titling so the trigger knows when the
+    // chat has grown enough to warrant a refresh.
+    session.titleUserMsgs = loadMessages(sessionId).filter(m => m.role === "user").length;
     saveSessions(sessions);
     console.log("[title-gen] renamed", sessionId, "\u2192", title);
     broadcastToSession(sessionId, { type: "title_updated", sessionId, title });
   });
   proc.on("error", (e) => {
+    clearTimeout(timer);
+    _doneTitling();
     console.warn("[title-gen] spawn error for", sessionId, ":", e.message);
   });
 }
 
 
+// ---- Provider routing ----
+const PROVIDER_MAP = {
+  "": "claude", opus: "claude", sonnet: "claude", haiku: "claude",
+  "gpt-4.1": "openai", "gpt-4.1-mini": "openai", "gpt-4.1-nano": "openai", "o3": "openai", "o4-mini": "openai",
+  "gemini-2.5-pro": "google", "gemini-2.5-flash": "google",
+};
+function getProvider(model) {
+  if (!model) return "claude";
+  if (PROVIDER_MAP[model]) return PROVIDER_MAP[model];
+  if (/^(gpt-|o\d)/.test(model)) return "openai";
+  if (/^gemini-/.test(model)) return "google";
+  if (/^claude-/.test(model)) return "claude";
+  return "claude";
+}
+
+const CHAT_SYSTEM_PROMPT = "When presenting tabular data, ALWAYS use standard markdown pipe tables with a header row and separator row. Example:\n| Column A | Column B |\n| --- | --- |\n| value 1 | value 2 |\nNever use ASCII art tables, plain-text alignment, or code blocks for tabular data. The UI renders markdown tables as styled, mobile-friendly scrollable HTML tables.\n\nAfter you finish calling tools, you MUST end the turn with a short text reply that explains what you did and answers the user'''s actual question. Never end a turn on a tool call alone.";
+
+// ----- Per-project context block for non-Claude providers -----
+// Claude already auto-loads CLAUDE.md (and any --add-dir paths) — we don't
+// touch its path. For OpenAI/Gemini we prepend the same flavor of info to the
+// system prompt so the model knows: which project, where it lives on disk,
+// what the project's conventions are, and what siblings exist.
+function buildProjectContext(project) {
+  if (!project) return "";
+  const cwd = path.join(PROJECTS_DIR, project);
+  const lines = [
+    "# Active project: " + project,
+    "# Working directory: " + cwd,
+    "",
+  ];
+  // CLAUDE.md is the canonical per-project agent brief. Include verbatim.
+  try {
+    const claudeMd = fs.readFileSync(path.join(cwd, "CLAUDE.md"), "utf-8");
+    if (claudeMd.trim()) {
+      lines.push("## CLAUDE.md (project conventions)");
+      // Cap at 18K chars (~4500 tokens) — most CLAUDE.md files are smaller.
+      lines.push(claudeMd.length > 18000 ? claudeMd.slice(0, 18000) + "\n…(truncated)" : claudeMd);
+      lines.push("");
+    }
+  } catch {}
+  // Top-level listing so the model knows what files/dirs exist without
+  // calling a tool first.
+  try {
+    const entries = fs.readdirSync(cwd, { withFileTypes: true })
+      .filter(d => !d.name.startsWith(".") && d.name !== "node_modules" && d.name !== ".venv")
+      .slice(0, 60)
+      .map(d => d.isDirectory() ? d.name + "/" : d.name);
+    if (entries.length) {
+      lines.push("## Top-level entries in working directory");
+      lines.push(entries.join(", "));
+      lines.push("");
+    }
+  } catch {}
+  // Sibling projects — useful for "switch to X" / cross-project references.
+  try {
+    const siblings = fs.readdirSync(PROJECTS_DIR, { withFileTypes: true })
+      .filter(d => d.isDirectory() && !d.name.startsWith(".") && d.name !== project)
+      .map(d => d.name);
+    if (siblings.length) {
+      lines.push("## Sibling projects (also under " + PROJECTS_DIR + "/)");
+      lines.push(siblings.join(", "));
+      lines.push("");
+    }
+  } catch {}
+  return lines.join("\n");
+}
+
+// Build conversation history from SQLite messages for direct-API providers.
+// Returns an array of {role, content} objects (OpenAI format).
+function buildHistory(sessionId, currentPrompt, opts) {
+  opts = opts || {};
+  const includeToolContext = !!opts.includeToolContext;
+  const msgs = loadMessages(sessionId);
+  const skipRoles = new Set(["tool_result", "permission_denied", "permission_granted", "email_draft", "email_sent", "question"]);
+  let charBudget = 400000; // ~100K tokens rough estimate
+
+  // Walk forward this time so we can group tool_activity entries with the
+  // assistant turn that follows them. Then we walk backward over the resulting
+  // list to apply the budget cap and end up newest-first.
+  const stitched = [];
+  let pendingTools = [];
+  for (const m of msgs) {
+    if (m.stalled || m.recovered) continue;
+    if (m.role === "tool_activity") {
+      if (includeToolContext) {
+        const summary = m.summary ? ": " + m.summary : "";
+        pendingTools.push((m.tool_name || "tool") + summary);
+      }
+      continue;
+    }
+    if (skipRoles.has(m.role)) continue;
+    if (m.role !== "user" && m.role !== "assistant") { pendingTools = []; continue; }
+    if (!m.text) { pendingTools = []; continue; }
+    let content = m.text;
+    if (m.role === "assistant" && pendingTools.length) {
+      // Fold the tool activity into the preceding assistant turn so OpenAI /
+      // Gemini see what Claude (or a previous turn) did with tools.
+      content = "[tools used: " + pendingTools.join("; ") + "]\n" + content;
+    }
+    if (m.role === "user") pendingTools = []; // tool activity belongs to the assistant turn that follows it
+    stitched.push({ role: m.role, content });
+    if (m.role === "assistant") pendingTools = [];
+  }
+
+  // Newest-first walk to enforce budget, then reverse back
+  const candidates = [];
+  for (let i = stitched.length - 1; i >= 0; i--) {
+    const c = stitched[i];
+    const cost = c.content.length;
+    if (charBudget - cost < 0 && candidates.length > 0) break;
+    charBudget -= cost;
+    candidates.push(c);
+  }
+  candidates.reverse();
+  candidates.push({ role: "user", content: currentPrompt });
+  return candidates;
+}
+
+// Convert OpenAI-format history to Gemini contents format
+function toGeminiContents(history) {
+  return history.map(m => ({
+    role: m.role === "assistant" ? "model" : "user",
+    parts: [{ text: m.content }],
+  }));
+}
+
+// Lightweight proc-like wrapper around an AbortController for fetch-based providers.
+class FetchProc {
+  constructor(controller) {
+    this.controller = controller;
+    this.pid = -1;
+    this._closeHandlers = [];
+  }
+  kill() { this.controller.abort(); }
+  on(event, handler) {
+    if (event === "close") this._closeHandlers.push(handler);
+  }
+  _emitClose(code) {
+    for (const h of this._closeHandlers) try { h(code); } catch {}
+  }
+}
+
+// ---- Run OpenAI streaming chat completion (with MCP tool-call loop) ----
+function runOpenAI({ prompt, sessionId, model, project, effort }, onData, onDone) {
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) {
+    setTimeout(() => onDone(1, "OPENAI_API_KEY not set — add it to ~/.llm-terminal/env and restart"), 0);
+    return { kill() {}, pid: -1, on() {} };
+  }
+  const controller = new AbortController();
+  const proc = new FetchProc(controller);
+  activeProcs.add(proc);
+  const startTime = Date.now();
+  const projectCwd = project ? path.join(PROJECTS_DIR, project) : null;
+  const MAX_TOOL_ITERATIONS = 12;
+
+  (async () => {
+    try {
+      // 1. Discover MCP tools available in this project (currently: Playwright,
+      //    plus whatever else is wired into .claude.json for this project).
+      const _oaiLogModel = (model || "<default>");
+      const _oaiE = (effort || "max").toLowerCase();
+      const _oaiEffortFlag = /^(o\d|gpt-5)/.test(_oaiLogModel.toLowerCase()) ? (_oaiE === "max" ? "high" : _oaiE) : "default";
+      console.log("[openai] spawn session=" + (sessionId||"?").slice(0,8) + " model=" + _oaiLogModel + " effort=" + _oaiEffortFlag);
+      let mcpTools = [];
+      try {
+        if (projectCwd) mcpTools = await mcpDiscover.discoverTools(projectCwd);
+      } catch (e) {
+        console.warn("[runOpenAI] tool discovery failed:", e.message);
+      }
+      const oaiTools = mcpTools.length ? mcpTranslate.toOpenAITools(mcpTools) : [];
+      const routing = mcpTranslate.buildRouting(mcpTools);
+
+      // 2. Initial conversation: system prompt + replayed user/assistant
+      //    history (without tool history — v1; replay across turns later).
+      const history = buildHistory(sessionId, prompt, { includeToolContext: true });
+      const projectCtx = buildProjectContext(project);
+      const sysPrompt = projectCtx ? (projectCtx + "\n\n" + CHAT_SYSTEM_PROMPT) : CHAT_SYSTEM_PROMPT;
+      const messages = [{ role: "system", content: sysPrompt }, ...history];
+
+      // 3. Outer loop — alternate model→tool→model until the model returns
+      //    a text-only response or we hit the iteration cap.
+      let fullText = "";
+      for (let iter = 0; iter < MAX_TOOL_ITERATIONS; iter++) {
+        const body = {
+          model: model || "gpt-4.1",
+          stream: true,
+          stream_options: { include_usage: true },
+          messages,
+        };
+        // Reasoning effort for reasoning-capable models. o-series + gpt-5
+        // honor reasoning_effort (low|medium|high); older chat models ignore
+        // it. OpenAI has no "max" — map it to "high".
+        const _oaiName = (model || "").toLowerCase();
+        if (/^(o\d|gpt-5)/.test(_oaiName)) {
+          const _e = (effort || "max").toLowerCase();
+          body.reasoning_effort = _e === "max" ? "high" : _e;
+        }
+        if (oaiTools.length > 0) body.tools = oaiTools;
+
+        const res = await fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: { Authorization: "Bearer " + key, "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+          signal: controller.signal,
+        });
+        if (!res.ok) {
+          const errBody = await res.text().catch(() => "");
+          activeProcs.delete(proc);
+          proc._emitClose(1);
+          onDone(1, `OpenAI API ${res.status}: ${errBody.slice(0, 500)}`);
+          return;
+        }
+
+        // Stream this turn: accumulate text deltas + tool_calls deltas.
+        const turnText = [];
+        const toolCalls = []; // indexed array; each {id, type, function:{name, arguments}}
+        const decoder = new TextDecoder();
+        let buf = "";
+        for await (const chunk of res.body) {
+          buf += decoder.decode(chunk, { stream: true });
+          const lines = buf.split("\n");
+          buf = lines.pop();
+          for (const line of lines) {
+            if (!line.startsWith("data: ")) continue;
+            const payload = line.slice(6).trim();
+            if (payload === "[DONE]") continue;
+            try {
+              const obj = JSON.parse(payload);
+              const choice = obj.choices?.[0];
+              if (!choice) continue;
+              const delta = choice.delta || {};
+              if (delta.content) {
+                turnText.push(delta.content);
+                fullText += delta.content;
+                onData({ type: "assistant", message: { content: [{ type: "text", text: delta.content }] } });
+              }
+              if (Array.isArray(delta.tool_calls)) {
+                for (const tc of delta.tool_calls) {
+                  const idx = tc.index || 0;
+                  if (!toolCalls[idx]) toolCalls[idx] = { id: "", type: "function", function: { name: "", arguments: "" } };
+                  if (tc.id) toolCalls[idx].id = tc.id;
+                  if (tc.function?.name) toolCalls[idx].function.name += tc.function.name;
+                  if (tc.function?.arguments) toolCalls[idx].function.arguments += tc.function.arguments;
+                }
+              }
+            } catch {}
+          }
+        }
+
+        // If no tool calls in this turn, we're done (model wrote text + stopped).
+        if (toolCalls.length === 0) break;
+        // If we're about to hit the iteration cap, abandon tools for the final
+        // turn and force a text summary. Same nudge in case loop end without text.
+        if (iter === MAX_TOOL_ITERATIONS - 1) {
+          messages.push({ role: "system", content: "STOP CALLING TOOLS. You have reached the maximum tool iterations for this turn. Reply now in plain text — describe what you accomplished, any issues, and what you would do next. The user is waiting for your written reply." });
+        }
+
+        // Persist the assistant turn into the message history with tool_calls
+        // so the next call sees what we asked for.
+        messages.push({
+          role: "assistant",
+          content: turnText.join("") || null,
+          tool_calls: toolCalls,
+        });
+
+        // Execute each tool call in order, push tool messages back.
+        for (const tc of toolCalls) {
+          const fnName = tc.function.name || "";
+          const route = routing.get(fnName);
+          let argsObj;
+          try { argsObj = JSON.parse(tc.function.arguments || "{}"); } catch { argsObj = {}; }
+
+          const useId = tc.id || `oai-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+          // Emit tool_use so the UI renders it the same way Claude tool calls
+          // do. sendToSession's onData handler saves a tool_activity row from
+          // this event — we do NOT save here to avoid double-logging.
+          onData({ type: "assistant", message: { content: [{ type: "tool_use", name: route ? route.originalName : fnName, input: argsObj, id: useId }] } });
+
+          let resultContent;
+          let isError = false;
+          if (!route) {
+            resultContent = [{ type: "text", text: `Unknown tool: "${fnName}"` }];
+            isError = true;
+          } else {
+            try {
+              const r = await mcpDiscover.callTool(projectCwd, route.server, route.originalName, argsObj, 120000);
+              resultContent = r.content || [];
+              isError = !!r.isError;
+            } catch (e) {
+              resultContent = [{ type: "text", text: `Tool execution error: ${e.message}` }];
+              isError = true;
+            }
+          }
+
+          onData({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: useId, content: resultContent, is_error: isError }] } });
+
+          messages.push({
+            role: "tool",
+            tool_call_id: tc.id,
+            content: mcpTranslate.flattenToolResult(resultContent).slice(0, 16000),
+          });
+        }
+        // Loop back: ask the model what to do next with the tool results.
+      }
+
+      // Final-wrap-up turn: if the model used tools but never emitted a summary,
+      // do one more call with tools removed and a forced-summary system msg so
+      // a closing bubble always lands.
+      if (!fullText.trim() && messages.some(m => m.role === "tool")) {
+        messages.push({ role: "system", content: "You called tools but did not write a final reply to the user. Now reply IN PLAIN TEXT only. Describe what you did, the outcome, and any remaining gaps. Do NOT call any more tools." });
+        try {
+          const finalRes = await fetch("https://api.openai.com/v1/chat/completions", {
+            method: "POST",
+            headers: { Authorization: "Bearer " + key, "Content-Type": "application/json" },
+            body: JSON.stringify({ model: model || "gpt-4.1", stream: true, messages }),
+            signal: controller.signal,
+          });
+          if (finalRes.ok) {
+            const decoder = new TextDecoder();
+            let buf = "";
+            for await (const chunk of finalRes.body) {
+              buf += decoder.decode(chunk, { stream: true });
+              const lines = buf.split("\n");
+              buf = lines.pop();
+              for (const line of lines) {
+                if (!line.startsWith("data: ")) continue;
+                const payload = line.slice(6).trim();
+                if (payload === "[DONE]") continue;
+                try {
+                  const obj = JSON.parse(payload);
+                  const t = obj.choices?.[0]?.delta?.content;
+                  if (t) {
+                    fullText += t;
+                    onData({ type: "assistant", message: { content: [{ type: "text", text: t }] } });
+                  }
+                } catch {}
+              }
+            }
+          }
+        } catch (e) { console.warn("[runOpenAI] forced-summary turn failed:", e.message); }
+      }
+      const duration = Date.now() - startTime;
+      onData({ type: "result", result: fullText, duration_ms: duration, total_cost_usd: null, session_id: null });
+      activeProcs.delete(proc);
+      proc._emitClose(0);
+      onDone(0, "");
+    } catch (err) {
+      activeProcs.delete(proc);
+      proc._emitClose(1);
+      if (err.name === "AbortError") { onDone(1, "Aborted"); return; }
+      onDone(1, err.message || String(err));
+    }
+  })();
+
+  return proc;
+}
+
+// ---- Run Google Gemini streaming chat completion ----
+function runGoogle({ prompt, sessionId, model, project, effort }, onData, onDone) {
+  const key = process.env.GOOGLE_API_KEY;
+  if (!key) {
+    setTimeout(() => onDone(1, "GOOGLE_API_KEY not set — add it to ~/.llm-terminal/env and restart"), 0);
+    return { kill() {}, pid: -1, on() {} };
+  }
+  const controller = new AbortController();
+  const proc = new FetchProc(controller);
+  activeProcs.add(proc);
+  const startTime = Date.now();
+  const projectCwd = project ? path.join(PROJECTS_DIR, project) : null;
+  const geminiModel = model || "gemini-2.5-flash";
+  const MAX_TOOL_ITERATIONS = 20;
+
+  (async () => {
+    try {
+      // Map effort → Gemini thinkingBudget. -1 = dynamic (model picks, up to
+      // its max). Bounded values for lower tiers. Only 2.5+/3.x support it.
+      const _gEff = (effort || "max").toLowerCase();
+      const _gBudget = { low: 2048, medium: 8192, high: 24576, max: -1 }[_gEff] ?? -1;
+      const _gThinkCapable = /^gemini-(2\.5|3)/.test((geminiModel||"").toLowerCase());
+      const _gEffort = _gThinkCapable ? (_gEff + "(thinkingBudget=" + _gBudget + ")") : "default";
+      console.log("[gemini] spawn session=" + (sessionId||"?").slice(0,8) + " model=" + geminiModel + " effort=" + _gEffort);
+      let mcpTools = [];
+      try {
+        if (projectCwd) mcpTools = await mcpDiscover.discoverTools(projectCwd);
+      } catch (e) {
+        console.warn("[runGoogle] tool discovery failed:", e.message);
+      }
+      const ggTools = mcpTools.length ? mcpTranslate.toGoogleTools(mcpTools) : null;
+      const routing = mcpTranslate.buildRouting(mcpTools);
+
+      const history = buildHistory(sessionId, prompt, { includeToolContext: true });
+      const projectCtx = buildProjectContext(project);
+      const sysPrompt = projectCtx ? (projectCtx + "\n\n" + CHAT_SYSTEM_PROMPT) : CHAT_SYSTEM_PROMPT;
+      // Gemini wants `contents` (alternating user/model) plus systemInstruction
+      const contents = toGeminiContents(history);
+
+      let fullText = "";
+      for (let iter = 0; iter < MAX_TOOL_ITERATIONS; iter++) {
+        const body = {
+          contents,
+          systemInstruction: { parts: [{ text: sysPrompt }] },
+          generationConfig: _gThinkCapable
+            ? { temperature: 1.0, thinkingConfig: { thinkingBudget: _gBudget } }
+            : { temperature: 1.0 },
+        };
+        if (ggTools) body.tools = ggTools;
+
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:streamGenerateContent?alt=sse&key=${key}`;
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+          signal: controller.signal,
+        });
+        if (!res.ok) {
+          const errBody = await res.text().catch(() => "");
+          activeProcs.delete(proc);
+          proc._emitClose(1);
+          onDone(1, `Gemini API ${res.status}: ${errBody.slice(0, 500)}`);
+          return;
+        }
+
+        // Stream this turn: accumulate text parts + functionCall parts.
+        // Gemini delivers parts incrementally; each chunk may have parts of
+        // either kind. functionCall parts arrive complete (not delta-fragments
+        // like OpenAI), so accumulation is simpler.
+        const turnText = [];
+        const turnCalls = []; // [{name, args}]
+        const decoder = new TextDecoder();
+        let buf = "";
+        for await (const chunk of res.body) {
+          buf += decoder.decode(chunk, { stream: true });
+          const lines = buf.split("\n");
+          buf = lines.pop();
+          for (const line of lines) {
+            if (!line.startsWith("data: ")) continue;
+            const payload = line.slice(6).trim();
+            if (!payload) continue;
+            try {
+              const obj = JSON.parse(payload);
+              const parts = obj.candidates?.[0]?.content?.parts || [];
+              for (const part of parts) {
+                if (part.text) {
+                  turnText.push(part.text);
+                  fullText += part.text;
+                  onData({ type: "assistant", message: { content: [{ type: "text", text: part.text }] } });
+                }
+                if (part.functionCall) {
+                  // Gemini 3.x ships a thought_signature on the same part as a
+                  // functionCall. When we reply with the matching
+                  // functionResponse we MUST echo the original functionCall
+                  // (with its signature) inside the prior model turn, or the
+                  // next call 400s with "Function call is missing a
+                  // thought_signature in functionCall parts". Capture both.
+                  turnCalls.push({
+                    name: part.functionCall.name || "",
+                    args: part.functionCall.args || {},
+                    thoughtSignature: part.thoughtSignature || null,
+                  });
+                }
+              }
+            } catch {}
+          }
+        }
+
+        if (turnCalls.length === 0) break;
+        if (iter === MAX_TOOL_ITERATIONS - 1) {
+          contents.push({ role: "user", parts: [{ text: "[system] STOP CALLING TOOLS. You have reached the maximum tool iterations. Reply now in plain text describing what you accomplished and any issues." }] });
+        }
+
+        // Push the model turn into the conversation so Gemini sees what it
+        // asked for on the next call.
+        const modelParts = [];
+        if (turnText.length) modelParts.push({ text: turnText.join("") });
+        for (const c of turnCalls) {
+          const part = { functionCall: { name: c.name, args: c.args } };
+          if (c.thoughtSignature) part.thoughtSignature = c.thoughtSignature;
+          modelParts.push(part);
+        }
+        contents.push({ role: "model", parts: modelParts });
+
+        // Execute each tool call, push functionResponse parts back.
+        const userParts = [];
+        for (const tc of turnCalls) {
+          const route = routing.get(tc.name);
+          const useId = `gg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+          onData({ type: "assistant", message: { content: [{ type: "tool_use", name: route ? route.originalName : tc.name, input: tc.args, id: useId }] } });
+
+          let resultContent;
+          let isError = false;
+          if (!route) {
+            resultContent = [{ type: "text", text: `Unknown tool: "${tc.name}"` }];
+            isError = true;
+          } else {
+            try {
+              const r = await mcpDiscover.callTool(projectCwd, route.server, route.originalName, tc.args, 120000);
+              resultContent = r.content || [];
+              isError = !!r.isError;
+            } catch (e) {
+              resultContent = [{ type: "text", text: `Tool execution error: ${e.message}` }];
+              isError = true;
+            }
+          }
+
+          onData({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: useId, content: resultContent, is_error: isError }] } });
+
+          userParts.push({
+            functionResponse: {
+              name: tc.name,
+              response: { content: mcpTranslate.flattenToolResult(resultContent).slice(0, 16000) },
+            },
+          });
+        }
+        contents.push({ role: "user", parts: userParts });
+      }
+
+      // Final wrap-up turn: if Gemini used tools but never wrote text, force a
+      // tool-less summary call so a closing bubble always lands.
+      if (!fullText.trim() && contents.some(c => c.parts?.some(p => p.functionResponse))) {
+        contents.push({ role: "user", parts: [{ text: "[system] You called tools but did not write a final reply to the user. Now reply IN PLAIN TEXT only — describe what you did, the outcome, and any remaining gaps. Do NOT call any more tools." }] });
+        try {
+          const url = `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:streamGenerateContent?alt=sse&key=${key}`;
+          const finalRes = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ contents, systemInstruction: { parts: [{ text: sysPrompt }] }, generationConfig: _gThinkCapable ? { temperature: 1.0, thinkingConfig: { thinkingBudget: _gBudget } } : { temperature: 1.0 } }),
+            signal: controller.signal,
+          });
+          if (finalRes.ok) {
+            const decoder = new TextDecoder();
+            let buf = "";
+            for await (const chunk of finalRes.body) {
+              buf += decoder.decode(chunk, { stream: true });
+              const lines = buf.split("\n");
+              buf = lines.pop();
+              for (const line of lines) {
+                if (!line.startsWith("data: ")) continue;
+                const payload = line.slice(6).trim();
+                if (!payload) continue;
+                try {
+                  const obj = JSON.parse(payload);
+                  const parts = obj.candidates?.[0]?.content?.parts || [];
+                  for (const part of parts) {
+                    if (part.text) {
+                      fullText += part.text;
+                      onData({ type: "assistant", message: { content: [{ type: "text", text: part.text }] } });
+                    }
+                  }
+                } catch {}
+              }
+            }
+          }
+        } catch (e) { console.warn("[runGoogle] forced-summary turn failed:", e.message); }
+      }
+      const duration = Date.now() - startTime;
+      onData({ type: "result", result: fullText, duration_ms: duration, total_cost_usd: null, session_id: null });
+      activeProcs.delete(proc);
+      proc._emitClose(0);
+      onDone(0, "");
+    } catch (err) {
+      activeProcs.delete(proc);
+      proc._emitClose(1);
+      if (err.name === "AbortError") { onDone(1, "Aborted"); return; }
+      onDone(1, err.message || String(err));
+    }
+  })();
+
+  return proc;
+}
+
 // ---- Run claude -p for a single message, stream JSON back ----
-function runClaude({ project, prompt, claudeSessionId, cwd, extraAllowedTools, model, sessionId }, onData, onDone) {
+function runClaude({ project, prompt, claudeSessionId, cwd, extraAllowedTools, model, sessionId, effort }, onData, onDone) {
   ensureProjectTrusted(project);
 
   const SYSTEM_PROMPT_ADD = "When producing an email draft for david@crankwheel.com, you MUST call the mcp__crankhero-draft__draft_email tool rather than typing the draft inline. The tool validates format rules and produces a UI action card for one-tap paste on mobile. Prose drafts are strictly inferior UX.\n\nWhen presenting tabular data, ALWAYS use standard markdown pipe tables with a header row and separator row. Example:\n| Column A | Column B |\n| --- | --- |\n| value 1 | value 2 |\nNever use ASCII art tables, plain-text alignment, or code blocks for tabular data. The UI renders markdown tables as styled, mobile-friendly scrollable HTML tables.\n\nWhen you generate or modify a file the user may want to inspect (PDF, HTML, image, generated doc, invoice, report), call mcp__llmterminal__llmt_show_file with its absolute path so it appears in the user's preview drawer. Don't tell them \"can't render inline\" — pin the file instead.\n\nWhen you finish a discrete task the user asked for and there is nothing more to do unless they reply, call mcp__llmterminal__llmt_complete (optionally with a one-paragraph summary). This explicitly marks the session done so it drops out of the user's NEEDS YOU sidebar. Don't call it mid-task or while waiting on the user.";
@@ -1818,7 +3393,19 @@ function runClaude({ project, prompt, claudeSessionId, cwd, extraAllowedTools, m
   // bypass the canonical data.* layer + use a different identity, leading
   // the agent to flail when answers don't match what data.* would give.
   const HOSTED_GOOGLE_DENY = ["mcp__claude_ai_Gmail__create_draft", "mcp__claude_ai_Gmail__create_label", "mcp__claude_ai_Gmail__get_thread", "mcp__claude_ai_Gmail__label_message", "mcp__claude_ai_Gmail__label_thread", "mcp__claude_ai_Gmail__list_drafts", "mcp__claude_ai_Gmail__list_labels", "mcp__claude_ai_Gmail__search_threads", "mcp__claude_ai_Gmail__unlabel_message", "mcp__claude_ai_Gmail__unlabel_thread", "mcp__claude_ai_Google_Calendar__authenticate", "mcp__claude_ai_Google_Calendar__complete_authentication", "mcp__claude_ai_Google_Drive__authenticate", "mcp__claude_ai_Google_Drive__complete_authentication"];
+  // --effort max unlocks Opus 4.7's full extended-thinking budget. Without
+  // it, Claude defaults to "medium" which leaves a lot of reasoning on the
+  // table — exactly the "smart model, dumb answer" symptom. Haiku ignores
+  // effort levels (no thinking modes) so we skip it for cost; everything
+  // else gets max.
+  const _modelLower = (model || "").toLowerCase();
+  // Haiku has no thinking modes — effort flag is a no-op there, skip it.
+  // Otherwise honor the session's chosen effort (low|medium|high|max),
+  // defaulting to max.
+  const _effort = (effort || "max").toLowerCase();
+  const _applyEffort = !_modelLower.includes("haiku");
   const args = ["-p", prompt, "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions", "--add-dir", "/home/claude-user/projects", "--append-system-prompt", SYSTEM_PROMPT_ADD, "--disallowedTools", ...HOSTED_GOOGLE_DENY];
+  if (_applyEffort) args.push("--effort", _effort);
   // Per-session model override. session.model is set via WS "set_model"
   // and persisted in sessions.json. Aliases (opus/sonnet/haiku) and full
   // names (claude-sonnet-4-6 etc.) both work — claude CLI handles either.
@@ -1837,6 +3424,7 @@ function runClaude({ project, prompt, claudeSessionId, cwd, extraAllowedTools, m
 
   const _wrap = _bwrapWrap(project, args);
   if (project === "camoHero") console.log("[sandbox] spawning camoHero in bwrap");
+  console.log("[claude] spawn session=" + (sessionId||"?").slice(0,8) + " model=" + (model || "<default>") + " effort=" + (_applyEffort ? _effort : "n/a-haiku"));
   const childEnv = { HOME: "/home/claude-user", TERM: "dumb", LANG: "en_US.UTF-8", PATH: process.env.PATH };
   // LLMT_SESSION_ID is read by the llmterminal MCP server so its tools
   // (llmt_show_file, llmt_complete) know which session to update.
@@ -1891,24 +3479,51 @@ wss.on("connection", (ws, req) => {
   let sessions = loadSessions();
   let session = resumeId ? sessions.find(s => s.id === resumeId) : null;
   if (!session) {
-    session = { id: crypto.randomUUID(), project, created: Date.now(), lastActive: Date.now(), messageCount: 0, title: "New session", claudeSessionId: null };
-    sessions.unshift(session);
-    saveSessions(sessions);
+    // In-memory only — we no longer persist on connect. The session record
+    // gets written to sessions.json the first time the user actually does
+    // something (prompt arrives → updateSessionInStore upserts it). If the
+    // user never types, nothing ever lands on disk.
+    // Reuse the requested resumeId when given so the URL hash stays stable
+    // across page reloads in the same draft session.
+    session = {
+      id: resumeId || crypto.randomUUID(),
+      project,
+      created: Date.now(),
+      lastActive: Date.now(),
+      messageCount: 0,
+      title: "New session",
+      claudeSessionId: null,
+    };
   }
 
-  let activeProc = null;
-  ws._activeProcRef = { get proc() { return activeProc; } };
+  let activeProc = null; // per-WS handle to the running child, used for local kill/interrupt; session-level busy state lives in activeProcBySession
 
   ws._llmSessionId = session.id; // tag for watchdog push
+  ws._llmSession = session;      // in-memory reference so out-of-closure code (tryDrainQueue) can reach pending sessions
   ensurePermissionsLoaded(session.id);
 
   ws.send(JSON.stringify({ type: "session", session }));
 
-  // Send recent messages on connect (last 20), with total count for lazy loading
+  // Send recent messages on connect (last 20), with total count for lazy
+  // loading. We ALWAYS also include earlier `email_draft` and `question` rows
+  // (sticky cards) so the user can still tap Open-in-Gmail / answer pending
+  // questions even when the card itself is older than the 20-message window.
+  // Client dedupes by `m.ts` so re-fetches of earlier ranges won't duplicate.
   const INITIAL_LIMIT = 20;
+  const STICKY_ROLES = new Set(["email_draft", "question"]);
   const allMessages = loadMessages(session.id);
-  const initialSlice = allMessages.slice(-INITIAL_LIMIT);
-  ws.send(JSON.stringify({ type: "history", messages: initialSlice, total: allMessages.length, offset: allMessages.length - initialSlice.length }));
+  const recentSlice = allMessages.slice(-INITIAL_LIMIT);
+  const recentSet = new Set(recentSlice);
+  const stickyEarlier = allMessages
+    .slice(0, Math.max(0, allMessages.length - INITIAL_LIMIT))
+    .filter(m => STICKY_ROLES.has(m.role) && !recentSet.has(m));
+  const initialSlice = [...stickyEarlier, ...recentSlice];
+  ws.send(JSON.stringify({
+    type: "history",
+    messages: initialSlice,
+    total: allMessages.length,
+    offset: Math.max(0, allMessages.length - recentSlice.length),
+  }));
 
   // Send current permission state so frontend knows what's already allowed
   const currentPerms = sessionPermissions[session.id];
@@ -1921,9 +3536,18 @@ wss.on("connection", (ws, req) => {
   ws.send(JSON.stringify({ type: "ready" }));
   // If anything was queued while this session was offline, fire the next one now
   setTimeout(() => { try { tryDrainQueue(session.id); } catch {} }, 200);
-  // Tell client current queue depth so it can show "N queued"
-  const _qd = queueLoad(session.id).length;
-  if (_qd > 0) wsSend(ws, "queue_state", { queueDepth: _qd });
+  // Tell client current queue depth + contents so it can render pending bubbles
+  // (not just an "N queued" badge). Always emit so a reconnected client clears
+  // stale pending bubbles if the queue is now empty.
+  {
+    const items = queueLoad(session.id).map(it => ({
+      text: it.text || "",
+      source: it.source || "prompt",
+      client_id: it.client_id || null,
+      ts: it.ts || null,
+    }));
+    wsSend(ws, "queue_state", { queueDepth: items.length, items });
+  }
 
   // Heartbeat: ping client every 20s
   const pingInterval = setInterval(() => {
@@ -1949,9 +3573,22 @@ wss.on("connection", (ws, req) => {
     // explicit api_error. If neither happens before the process closes, the
     // session is stuck on tool_activity — we save a synthetic marker in onDone.
     let gotResult = false;
-    killExistingClaudeFor(session.claudeSessionId);
-    activeProc = runClaude(
-      { project: session.project, prompt: fullPrompt, claudeSessionId: session.claudeSessionId, cwd, extraAllowedTools, model: session.model, sessionId: session.id },
+    // Tracks whether any non-empty assistant text was streamed in this turn.
+    // Closes the race where empty `data.result` could trigger the synthetic
+    // closing marker even after the user already saw streamed text.
+    let _assistantTextEmittedThisTurn = false;
+    const _provider = getProvider(session.model);
+    session.provider = _provider;
+    if (_provider === "claude") killExistingClaudeFor(session.claudeSessionId);
+    const _runFn = _provider === "openai" ? runOpenAI
+                 : _provider === "google" ? runGoogle
+                 : runClaude;
+    const _effort = session.effort || "max";
+    const _runArgs = _provider === "claude"
+      ? { project: session.project, prompt: fullPrompt, claudeSessionId: session.claudeSessionId, cwd, extraAllowedTools, model: session.model, sessionId: session.id, effort: _effort }
+      : { prompt: fullPrompt, sessionId: session.id, model: session.model, project: session.project, effort: _effort };
+    activeProc = _runFn(
+      _runArgs,
       (data) => {
         if (data.type === "system" && data.subtype === "init") {
           if (data.session_id && !session.claudeSessionId) {
@@ -1965,7 +3602,42 @@ wss.on("connection", (ws, req) => {
           if (Array.isArray(content)) {
             for (const block of content) {
               if (block.type === "text" && block.text) {
-                wsSend(ws, "text", { text: block.text });
+                _assistantTextEmittedThisTurn = true;
+                // Detect ```email-draft fenced blocks emitted by the
+                // /draft-email skill. Parse → emit an email_draft action card
+                // → strip the raw fence so it doesn't render as code-block
+                // noise alongside the card (the "doubled" bug).
+                let _emittedText = block.text;
+                const _edRe = /```email-draft\n([\s\S]*?)\n```\s*/g;
+                const _edMatches = [..._emittedText.matchAll(_edRe)];
+                if (_edMatches.length) {
+                  for (const _m of _edMatches) {
+                    try {
+                      const payload = JSON.parse(_m[1]);
+                      if (payload.to && payload.subject && payload.body) {
+                        const draftMsg = { type: "email_draft",
+                          to: payload.to || "", cc: payload.cc || "",
+                          subject: payload.subject || "", body: payload.body || "",
+                          thread_id: payload.thread_id || "",
+                          attachments: Array.isArray(payload.attachments) ? payload.attachments : [],
+                          project: session.project,
+                          ts: Date.now() };
+                        wsSend(ws, draftMsg);
+                        saveMessage(session.id, { role: "email_draft",
+                          to: draftMsg.to, cc: draftMsg.cc,
+                          subject: draftMsg.subject, body: draftMsg.body,
+                          thread_id: draftMsg.thread_id,
+                          attachments: draftMsg.attachments,
+                          project: draftMsg.project,
+                          ts: draftMsg.ts });
+                      }
+                    } catch (e) {
+                      console.error("[email_draft] skill-block parse failed:", e.message);
+                    }
+                  }
+                  _emittedText = _emittedText.replace(_edRe, "").trim();
+                }
+                if (_emittedText) wsSend(ws, "text", { text: _emittedText });
               }
               if (block.type === "tool_use") {
                 lastToolUse = { name: block.name, input: block.input, id: block.id };
@@ -2100,16 +3772,24 @@ wss.on("connection", (ws, req) => {
           // After clearing activeProc below, try to drain the next queued prompt
           setTimeout(() => { try { tryDrainQueue(session.id); } catch (e) { console.error("[queue] drain after result failed:", e.message); } }, 50);
           // Fire-and-forget observer: read recent messages, identify unaddressed asks, register as tasks
-          setTimeout(() => { try { spawnObserver(session.id, session.project); } catch (e) { console.error("[observer] hook failed:", e.message); } }, 500);
+          // [observer] disabled 2026-05-28: was enqueueing duplicate Opus tasks
+          // into orchestratorHero queue with 0% PR-ship rate. Re-enable when
+          // the supervisor is redesigned to output reviewable diffs/PRs.
+          // setTimeout(() => { try { spawnObserver(session.id, session.project); } catch (e) { console.error("[observer] hook failed:", e.message); } }, 500);
           setTimeout(() => { try { spawnDecisionExtractor(session.id, session.project); } catch (e) { console.error("[decision-extractor] hook failed:", e.message); } }, 800);
+          setTimeout(() => { try { spawnContractCheck(session.id, session.project); } catch (e) { console.error("[contract-check] hook failed:", e.message); } }, 1100);
           if (!session.claudeSessionId && data.session_id) {
             session.claudeSessionId = data.session_id;
             updateSessionInStore(session);
           }
-          // Detect Anthropic API errors: CLI emits them as the result text
+          // Detect Anthropic API errors. Two shapes:
+          //  - Legacy: result text starts with "API Error: NNN ..."
+          //  - Modern (e.g. image dimension limit): CLI sets data.is_error=true
+          //    even though subtype is "success"; the rejection text lives in result.
+          //  Either way, do NOT save as an assistant message — would poison resume.
           const result = data.result || "";
           const apiErrorMatch = /API Error:\s*(\d{3})\b[\s\S]*?(request_id"\s*:\s*"([^"]+)")?/.exec(result);
-          const isApiError = /^API Error:\s*\d{3}/.test(result);
+          const isApiError = data.is_error === true || /^API Error:\s*\d{3}/.test(result);
           gotResult = true;
           if (isApiError) {
             const statusCode = apiErrorMatch ? apiErrorMatch[1] : "";
@@ -2121,20 +3801,44 @@ wss.on("connection", (ws, req) => {
               message: result.slice(0, 500),
             });
           } else {
-            if (result) {
-              saveMessage(session.id, { role: "assistant", text: result, ts: Date.now(), cost: data.total_cost_usd, duration: data.duration_ms });
-              // First-exchange title rename (fire-and-forget; runs async)
+            // Strip any ```email-draft fences from the final assistant text —
+            // the card already rendered live; persisting the fence in the
+            // assistant message would re-render it as raw code on reload.
+            let _resultClean = result.replace(/```email-draft\n[\s\S]*?\n```\s*/g, "").trim();
+            if (_resultClean) {
+              saveMessage(session.id, { role: "assistant", text: _resultClean, ts: Date.now(), cost: data.total_cost_usd, duration: data.duration_ms });
+              // Title on the first exchange, then refresh every ~3 user turns so a
+              // drifting/pivoting session keeps a sidebar title that reflects its
+              // current topic. generateSessionTitle builds its own recent context.
               try {
                 const _allSessions = loadSessions();
                 const _s = _allSessions.find(x => x.id === session.id);
-                if (_s && !_s.titleGenerated) {
-                  const _msgs = loadMessages(session.id);
-                  const _firstUser = _msgs.find(m => m.role === "user");
-                  if (_firstUser && _firstUser.text) {
-                    generateSessionTitle(session.id, _firstUser.text, result);
-                  }
+                if (_s) {
+                  const _userMsgs = loadMessages(session.id).filter(m => m.role === "user").length;
+                  const _firstTitle = !_s.titleGenerated && _userMsgs >= 1;
+                  const _refresh = _s.titleGenerated && (_userMsgs - (_s.titleUserMsgs || 0)) >= 3;
+                  if (_firstTitle || _refresh) generateSessionTitle(session.id);
                 }
               } catch (e) { console.warn("[title-gen] trigger failed:", e.message); }
+            } else if (result) {
+              // The whole turn was just the email-draft fence — no other text.
+              // Don't save an empty assistant message, but the closing-bubble
+              // synthetic-marker logic below will surface "(draft above)".
+            }
+            if (lastToolUse && !_assistantTextEmittedThisTurn) {
+              // Tools fired but the model returned no closing text AND no
+              // streamed assistant text either. Surface a marker so the UI
+              // never ends silently on tool_activity. Guarded against the
+              // race where text was streamed but the final `result` field
+              // arrived empty or trailing-whitespace-only.
+              saveMessage(session.id, {
+                role: "assistant",
+                text: "_(Agent finished its tool work without a written summary. Re-prompt if you want it to recap or continue.)_",
+                ts: Date.now(),
+                cost: data.total_cost_usd,
+                duration: data.duration_ms,
+                synthetic: "empty-result-after-tools",
+              });
             }
             wsSend(ws, "done", {
               result,
@@ -2147,6 +3851,7 @@ wss.on("connection", (ws, req) => {
       },
       (code, stderr) => {
         activeProc = null;
+        activeProcBySession.delete(session.id); // run finished — session is idle again
         // Detect a stale claudeSessionId — happens after we move a session
         // between projects (claude's per-project state dir doesn't move with
         // sessions.json). Clear and retry fresh, exactly once.
@@ -2165,12 +3870,24 @@ wss.on("connection", (ws, req) => {
           }
         }
         const msgs = loadMessages(session.id);
-        const lastMsg = msgs.length ? msgs[msgs.length - 1] : null;
-        if (lastMsg && lastMsg.role === "user" && !isRetry) {
-          console.log("[auto-retry] response lost, retrying:", session.id);
-          wsSend(ws, "thinking");
-          sendToSession(lastMsg.text, true);
-          return;
+        // Auto-retry when the process exited without a result and the last user
+        // message has no real assistant response after it — including the case
+        // where the only thing after is tool_activity rows and a stalled marker.
+        if (!isRetry && !gotResult) {
+          let lui = -1;
+          for (let i = msgs.length - 1; i >= 0; i--) {
+            if (msgs[i].role === "user") { lui = i; break; }
+          }
+          if (lui >= 0) {
+            const after = msgs.slice(lui + 1);
+            const answered = after.some(m => m.role === "assistant" && !m.stalled);
+            if (!answered) {
+              console.log("[auto-retry] response lost, retrying:", session.id);
+              wsSend(ws, "thinking");
+              sendToSession(msgs[lui].text, true);
+              return;
+            }
+          }
         }
         if (code !== 0 && stderr) {
           wsSend(ws, "error", { message: stderr.slice(0, 500) });
@@ -2192,8 +3909,18 @@ wss.on("connection", (ws, req) => {
           }
         }
         wsSend(ws, "idle");
+        // Authoritative idle point: the run's process has fully exited and the
+        // session is no longer busy. Drain the next queued prompt now. This is the
+        // RELIABLE trigger — the result-stream drain (search "drain the next queued
+        // prompt") no-ops when the WS dropped mid-turn (common on mobile), since no
+        // live client exists at that instant and nothing re-attempts from completion.
+        setTimeout(() => { try { tryDrainQueue(session.id); } catch (e) { console.error("[queue] drain after close failed:", e.message); } }, 50);
       }
     );
+    // Register session-level busy state so a reconnected WS (or a queued-item drain)
+    // sees this session as busy until the onDone above fires, regardless of which WS
+    // owns the proc. _runFn returns the child synchronously.
+    if (activeProc) activeProcBySession.set(session.id, activeProc);
   }
 
   ws.on("message", (raw) => {
@@ -2213,11 +3940,15 @@ wss.on("connection", (ws, req) => {
             return;
           }
         }
-        if (activeProc) {
-          // Already running — write the new prompt to the persistent queue.
-          // It will auto-fire when the current run completes (see onDone).
+        if (activeProc || activeProcBySession.has(session.id)) {
+          // Already running (on this WS, or on another WS for the same session
+          // after a mobile reconnect) — write the new prompt to the persistent
+          // queue. It will auto-fire when the current run completes (see onDone).
           queueAppend(session.id, { text: msg.text || "", source: "prompt", client_id: msg.client_id });
           wsSend(ws, "queued", { client_id: msg.client_id, queueDepth: queueLoad(session.id).length });
+          // Broadcast new queue contents to every connected client on this session so
+          // other tabs/devices see the pending bubble too.
+          broadcastQueueState(session.id);
           return;
         }
 
@@ -2242,6 +3973,18 @@ wss.on("connection", (ws, req) => {
         session.messageCount++;
         if (session.messageCount === 1) session.title = text.slice(0, 80);
         session.lastActive = Date.now();
+        // V1.2: Clear manualDone on follow-up so the session resurfaces in the
+        // sidebar instead of staying hidden in the "done" pile.
+        if (session.manualDone) {
+          session.manualDone = null;
+          delete session.doneSource;
+        }
+        // V1.1: Flag as awaiting response so the sidebar shows "user_waiting"
+        // until the agent produces a reply. Cleared in saveMessage when an
+        // assistant/tool_activity message arrives.
+        session.awaitingResponse = true;
+        // First substantive action — promote a pending session to disk now.
+        _persistSessionIfNew(session);
         updateSessionInStore(session);
 
         // Save user message
@@ -2269,9 +4012,23 @@ wss.on("connection", (ws, req) => {
           break;
         }
         session.model = m || null;
+        session.provider = getProvider(m);
         updateSessionInStore(session);
-        wsSend(ws, "model_set", { model: session.model });
-        console.log("[model] session", session.id, "->", session.model || "default");
+        wsSend(ws, "model_set", { model: session.model, provider: session.provider });
+        console.log("[model] session", session.id, "->", session.model || "default", "("+session.provider+")");
+        break;
+      }
+      case "set_effort": {
+        const e = String((msg && msg.effort) || "").trim().toLowerCase();
+        const ALLOWED_EFFORT = new Set(["low", "medium", "high", "max"]);
+        if (e && !ALLOWED_EFFORT.has(e)) {
+          wsSend(ws, "error", { message: "Invalid effort level" });
+          break;
+        }
+        session.effort = e || "max";
+        updateSessionInStore(session);
+        wsSend(ws, "effort_set", { effort: session.effort });
+        console.log("[effort] session", session.id, "->", session.effort);
         break;
       }
       case "link_task": {
@@ -2383,7 +4140,7 @@ wss.on("connection", (ws, req) => {
 });
 
 const PORT = process.env.PORT || 7683;
-server.listen(PORT, "0.0.0.0", () => console.log("llmTerminal on port", PORT));
+server.listen(PORT, "127.0.0.1", () => console.log("llmTerminal on port", PORT, "(127.0.0.1 only; reached via nginx/tunnel)"));
 
 // ---- Graceful shutdown ----
 let shuttingDown = false;
