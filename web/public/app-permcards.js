@@ -92,7 +92,8 @@ function addPermissionCardFromHistory(msg){
   chat.appendChild(d);
 }
 
-let sessionPreviews=[], expandedPreviewId=null, fileFilter="all", knownPreviewIds=new Set();
+let sessionPreviews=[], expandedPreviewId=null, knownPreviewIds=new Set();
+let fileFilter=(function(){try{return localStorage.getItem("llmt_file_filter")||"all"}catch{return "all"}})();
 let sortMode=(function(){try{return localStorage.getItem("llmt_file_sort")||"newest"}catch{return "newest"}})(); // newest|oldest|name|type
 
 // Map a preview entry to a {kind, icon, label} based on type or filename extension.

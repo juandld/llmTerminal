@@ -758,3 +758,8 @@ async function checkForAudioReview(text){
     }
   }
 }
+
+// Render persisted file-attachment tray on load (if any survived from a prior session).
+// Deferred to DOMContentLoaded: renderSelectedTray uses mk() from app-ui-misc.js, which
+// loads after this file — all classic scripts have executed by the time this fires.
+document.addEventListener("DOMContentLoaded",()=>{try{renderSelectedTray()}catch{}});
