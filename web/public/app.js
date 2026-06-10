@@ -381,54 +381,7 @@ inp.addEventListener("keydown",(e)=>{
 
 // -- Swipe gestures removed: conflicted with iOS back/forward and text selection.
 //    Use the hamburger (☰) and Files buttons to open drawers.
-// Bubble context menu (long-press) - Copy + Read aloud via /api/tts (fallback: SpeechSynthesis)
-function bubbleText(el){
-  const src = el.classList.contains("bubble") ? el : (el.querySelector(".bubble") || el);
-  const clone = src.cloneNode(true);
-  clone.querySelectorAll("img, button, .perm-label, .perm-tool, .perm-detail, .perm-actions, .api-err-actions").forEach(n=>n.remove());
-  return (clone.innerText || clone.textContent || "").trim();
-}
-function closeBubbleMenu(){document.querySelectorAll(".bubble-menu").forEach(m=>m.remove())}
-function showBubbleMenu(ev, el){
-  ev.preventDefault();
-  closeBubbleMenu();
-  const text = bubbleText(el);
-  if(!text) return;
-  const menu = mk("div","bubble-menu");
-  const cBtn = mk("button","bm-btn"); cBtn.dataset.act="copy"; cBtn.textContent="\u{1F4CB} Copy text";
-  const tBtn = mk("button","bm-btn"); tBtn.dataset.act="tts";  tBtn.textContent="\u{1F50A} Read aloud";
-  menu.appendChild(cBtn); menu.appendChild(tBtn);
-  document.body.appendChild(menu);
-  const px = (ev.touches && ev.touches[0] ? ev.touches[0].clientX : (ev.clientX||window.innerWidth/2));
-  const py = (ev.touches && ev.touches[0] ? ev.touches[0].clientY : (ev.clientY||window.innerHeight/2));
-  const mw = menu.offsetWidth || 200, mh = menu.offsetHeight || 96;
-  const vw = window.innerWidth, vh = window.innerHeight;
-  const left = Math.min(Math.max(8, px - mw/2), vw - mw - 8);
-  const top  = py - mh - 10 > 8 ? py - mh - 10 : Math.min(py + 10, vh - mh - 8);
-  menu.style.left = left + "px";
-  menu.style.top  = top  + "px";
-  menu.onclick = async (e)=>{
-    const btn = e.target.closest("[data-act]"); if(!btn) return;
-    e.stopPropagation();
-    if(btn.dataset.act === "copy"){
-      try{ await navigator.clipboard.writeText(text); btn.textContent = "\u2713 Copied"; }
-      catch(err){
-        try{ const ta=document.createElement("textarea"); ta.value=text; ta.style.position="fixed"; ta.style.opacity="0"; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove(); btn.textContent="\u2713 Copied"; }
-        catch(_){ btn.textContent = "Copy failed"; }
-      }
-      setTimeout(closeBubbleMenu, 700);
-    } else if(btn.dataset.act === "tts"){
-      // Call sync within the click to preserve iOS user-gesture for audio.
-      playTts(text);
-      closeBubbleMenu();
-    }
-  };
-  setTimeout(()=>{
-    const closer=(e)=>{ if(!e.target.closest(".bubble-menu")) closeBubbleMenu(); };
-    document.addEventListener("click", closer, {once:true});
-    document.addEventListener("touchstart", closer, {once:true, passive:true});
-  }, 50);
-}
+// (bubble context menu moved to app-bubble-menu.js)
 
 // ── Task Board (orchestrator proxy) ──
 let taskCache=[], taskFilter="actionable";
