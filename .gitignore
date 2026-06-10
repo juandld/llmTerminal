@@ -3,6 +3,7 @@
 
 # llmTerminal additions
 node_modules/
+web/node_modules
 *.bak
 *.bak-*
 web/uploads/
