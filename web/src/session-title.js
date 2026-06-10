@@ -3,6 +3,9 @@
 const { loadMessages, loadSessions, saveSessions, updateSessionInStore } = require("./store");
 const { broadcastToSession } = require("./ws/broadcast");
 const { runCheapClaude } = require("./cheap-model");
+const { spawn } = require("child_process");
+const { _bwrapWrap } = require("./bwrap");
+const _titlingInProgress = new Set();
 
 function generateSessionTitle(sessionId) {
   if (_titlingInProgress.has(sessionId)) return; // already titling this session
@@ -76,16 +79,5 @@ function generateSessionTitle(sessionId) {
   });
 }
 
-
-// ---- Provider routing ----
-const {
-  getProvider, buildProjectContext, buildHistory, toGeminiContents,
-  FetchProc, CHAT_SYSTEM_PROMPT,
-} = require("./providers/context");
-// ---- Run OpenAI streaming chat completion (with MCP tool-call loop) ----
-
-// ---- Run Google Gemini streaming chat completion ----
-
-// ---- Run claude -p for a single message, stream JSON back ----
 
 module.exports = { generateSessionTitle };

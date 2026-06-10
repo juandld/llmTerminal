@@ -2,6 +2,7 @@
 // ARCHITECTURE.md §4). spawnObserver mines what the run did; spawnDecisionExtractor
 // records decisions; spawnContractCheck verifies the run actually finished;
 // reconcileFileAttribution settles which files it touched. Extracted 2026-06-10.
+const path = require("path");
 const { loadMessages, saveMessage, loadSessions, saveSessions, db } = require("./store");
 const { broadcastToSession } = require("./ws/broadcast");
 const { runCheapClaude } = require("./cheap-model");
