@@ -1,6 +1,8 @@
 // OpenAI streaming chat-completion runner (with MCP tool-call loop).
 // Extracted from server.js (refactor 2026-06-10, phase 13). Streams via the
 // onData/onDone callbacks; the WS handler owns persistence/broadcast.
+const path = require("path");
+const { PROJECTS_DIR } = require("../paths");
 const mcpDiscover = require("../mcp/discover");
 const mcpTranslate = require("../mcp/translate");
 const { buildHistory, buildProjectContext, FetchProc, CHAT_SYSTEM_PROMPT } = require("./context");

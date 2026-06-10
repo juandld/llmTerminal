@@ -1,5 +1,7 @@
 // Google Gemini streaming runner (with MCP tool-call loop). Extracted from
 // server.js (refactor 2026-06-10, phase 14). Streams via onData/onDone.
+const path = require("path");
+const { PROJECTS_DIR } = require("../paths");
 const mcpDiscover = require("../mcp/discover");
 const mcpTranslate = require("../mcp/translate");
 const { buildHistory, buildProjectContext, FetchProc, CHAT_SYSTEM_PROMPT, toGeminiContents } = require("./context");
