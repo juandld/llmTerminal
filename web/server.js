@@ -11,6 +11,8 @@ const crypto = require("crypto");
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
+const { setWss, wsSend, findSessionOr404, broadcastToSession } = require("./src/ws/broadcast");
+setWss(wss);
 
 app.use(express.json());
 
@@ -64,32 +66,6 @@ const {
 } = require("./src/store");
 
 // Send a JSON payload to a single WebSocket, swallowing errors (client may have disconnected).
-function wsSend(ws, typeOrPayload, data) {
-  try {
-    const payload = typeof typeOrPayload === "string"
-      ? Object.assign({ type: typeOrPayload }, data || {})
-      : typeOrPayload;
-    ws.send(JSON.stringify(payload));
-  } catch {}
-}
-// Look up a session by id, sending a 404 response if missing.
-// Returns { sessions, session } or null (after responding with 404).
-function findSessionOr404(id, res) {
-  const sessions = loadSessions();
-  const session = sessions.find(x => x.id === id);
-  if (!session) { res.status(404).json({ ok: false, error: "not found" }); return null; }
-  return { sessions, session };
-}
-// Push a JSON payload to all WS clients subscribed to a given session.
-function broadcastToSession(sessionId, payload) {
-  const msg = JSON.stringify(payload);
-  for (const client of wss.clients) {
-    if (client.readyState === 1 && client._llmSessionId === sessionId) {
-      try { client.send(msg); } catch {}
-    }
-  }
-}
-
 // ---- Image uploads ----
 const activeProcs = new Set();
 // Session-level busy state for queue draining. sessionId -> running child proc.
