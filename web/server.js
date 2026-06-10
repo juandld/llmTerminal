@@ -76,17 +76,7 @@ const activeProcs = new Set();
 // reconnected WS neither double-spawns nor strands queued items. Cleared in each
 // run's onDone (process close).
 const activeProcBySession = new Map();
-const UPLOADS_DIR = path.join(DATA_DIR, "uploads");
-fs.mkdirSync(UPLOADS_DIR, { recursive: true });
-
-function saveUploadedImage(base64Data, mimeType) {
-  const ext = (mimeType || "image/png").includes("jpeg") || (mimeType || "").includes("jpg") ? ".jpg" : ".png";
-  const name = "img_" + Date.now() + "_" + crypto.randomBytes(4).toString("hex") + ext;
-  const filePath = path.join(UPLOADS_DIR, name);
-  fs.writeFileSync(filePath, Buffer.from(base64Data, "base64"));
-  return filePath;
-}
-
+const { saveUploadedImage } = require("./src/uploads");
 // ---- Startup recovery: fix any sessions stuck from before restart ----
 setTimeout(() => {
   const sessions = loadSessions();
