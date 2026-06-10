@@ -177,7 +177,11 @@
   .topbar-overflow-btn:hover{color:var(--accent);border-color:var(--accent)}
   .topbar-overflow-btn .overflow-dot{position:absolute;top:5px;right:5px;width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 6px var(--green);display:none}
   .topbar-overflow-btn.has-browser .overflow-dot{display:block}
-  .topbar-overflow-menu{position:absolute;top:100%;right:0;margin-top:6px;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:6px;min-width:200px;box-shadow:0 8px 24px rgba(0,0,0,.5);z-index:20;display:none;flex-direction:column;gap:2px}
+  /* fixed, not absolute: .topbar-nav is overflow:hidden (clips the collapsed
+     buttons), which also fully clips an absolute dropdown hanging below the
+     bar — the menu "opens" but is invisible and untappable. fixed escapes the
+     clip. top = safe-area + mobile topbar height (40px) + 4px gap. */
+  .topbar-overflow-menu{position:fixed;top:calc(env(safe-area-inset-top, 0px) + 44px);right:8px;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:6px;min-width:200px;max-height:calc(100vh - 70px - env(safe-area-inset-top, 0px));overflow-y:auto;box-shadow:0 8px 24px rgba(0,0,0,.5);z-index:20;display:none;flex-direction:column;gap:2px}
   .topbar-overflow-menu.open{display:flex}
   .topbar-overflow-menu button,.topbar-overflow-menu a{background:transparent;border:none;color:var(--text);padding:10px 14px;text-align:left;font-family:var(--mono);font-size:13px;cursor:pointer;border-radius:6px;display:flex;align-items:center;gap:8px;text-decoration:none;min-height:44px;width:100%;box-sizing:border-box}
   .topbar-overflow-menu button:hover,.topbar-overflow-menu button:active,.topbar-overflow-menu a:hover,.topbar-overflow-menu a:active{background:var(--border)}
@@ -244,6 +248,8 @@
     .topbar-collapsible{display:none!important}
     .topbar-overflow{display:inline-flex}
     .topbar-overflow-btn .overflow-dot{display:none!important}
+    /* topbar is ~55px here (vs 40px mobile) — drop the fixed menu below it */
+    .topbar-overflow-menu{top:59px}
   }
   @media (max-width:768px){.topbar-btn{min-height:44px;min-width:44px;padding:6px 12px}}
   .chat-search{display:flex;align-items:center;gap:10px;padding:8px 14px;background:var(--surface);border-bottom:1px solid var(--border)}
