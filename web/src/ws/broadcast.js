@@ -5,6 +5,7 @@ const { loadSessions } = require("../store");
 
 let _wss = null;
 function setWss(wss) { _wss = wss; }
+function getWss() { return _wss; }
 
 function wsSend(ws, typeOrPayload, data) {
   try {
@@ -33,4 +34,4 @@ function broadcastToSession(sessionId, payload) {
   }
 }
 
-module.exports = { setWss, wsSend, findSessionOr404, broadcastToSession };
+module.exports = { setWss, getWss, wsSend, findSessionOr404, broadcastToSession };
