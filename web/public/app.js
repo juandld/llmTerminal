@@ -289,8 +289,8 @@ try{
   if(!isMobile&&localStorage.getItem("llmt_sidebar_open")==="true"){
     document.getElementById("sidebar").classList.add("show");
   }
-  const ff=localStorage.getItem("llmt_file_filter");
-  if(ff){fileFilter=ff}
+  // (fileFilter restore moved to app-permcards.js — it owns the `let fileFilter` binding;
+  //  assigning here at parse time created an orphan window.fileFilter the later `let` shadowed)
   const sq=localStorage.getItem("llmt_drawer_search");
   if(sq){const el=document.getElementById("drawerSearch");if(el)el.value=sq}
 }catch{}
@@ -306,7 +306,7 @@ if(dsEl)dsEl.addEventListener("input",()=>{try{localStorage.setItem("llmt_drawer
 // Chat search listeners
 const chatSearchInput=document.getElementById("chatSearchInput");
 if(chatSearchInput){
-  chatSearchInput.addEventListener("input",runChatSearch);
+  chatSearchInput.addEventListener("input",e=>runChatSearch(e));
   chatSearchInput.addEventListener("keydown",(e)=>{if(e.key==="Escape"){toggleChatSearch();inp.focus()}});
 }
 document.addEventListener("keydown",(e)=>{
@@ -433,40 +433,8 @@ function showBubbleMenu(ev, el){
 // ── Task Board (orchestrator proxy) ──
 let taskCache=[], taskFilter="actionable";
 // (task-board fns moved to app-tasks.js)
-// Manual long-press detection (iOS Safari often suppresses contextmenu on selectable text)
-(function(){
-  let timer=null, sx=0, sy=0, targetEl=null;
-  const DUR=500, MOVE=10;
-  chat.addEventListener("touchstart",(e)=>{
-    if(e.touches.length!==1) return;
-    const t=e.target.closest(".msg.user, .msg.assistant .bubble, .msg.assistant");
-    if(!t) return;
-    sx=e.touches[0].clientX; sy=e.touches[0].clientY; targetEl=t;
-    if(timer) clearTimeout(timer);
-    timer=setTimeout(()=>{
-      timer=null;
-      const fakeEv={preventDefault:()=>{},touches:[{clientX:sx,clientY:sy}],clientX:sx,clientY:sy};
-      showBubbleMenu(fakeEv, targetEl);
-    }, DUR);
-  },{passive:true});
-  chat.addEventListener("touchmove",(e)=>{
-    if(!timer) return;
-    const dx=e.touches[0].clientX-sx, dy=e.touches[0].clientY-sy;
-    if(Math.hypot(dx,dy)>MOVE){ clearTimeout(timer); timer=null; }
-  },{passive:true});
-  const cancel=()=>{ if(timer){clearTimeout(timer); timer=null;} };
-  chat.addEventListener("touchend",cancel,{passive:true});
-  chat.addEventListener("touchcancel",cancel,{passive:true});
-})();
-
-chat.addEventListener("contextmenu",(e)=>{
-  const el = e.target.closest(".msg.user, .msg.assistant .bubble, .msg.assistant");
-  if(!el) return;
-  showBubbleMenu(e, el);
-});
-
-
+// (long-press + contextmenu wiring moved to app-bubble-menu.js)
 
 init();
-// Render persisted file-attachment tray on load (if any survived from a prior session)
-try { renderSelectedTray(); } catch {}
+// (persisted file-attachment tray render moved to app-drawer.js — calling it here at parse
+//  time threw a swallowed ReferenceError because app-drawer.js loads after app.js)
