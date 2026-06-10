@@ -352,16 +352,66 @@
   .drawer-search{width:100%;padding:6px 10px;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:var(--mono);font-size:11px;outline:none}
   .drawer-search:focus{border-color:var(--accent)}
   .drawer-search::placeholder{color:var(--dim)}
-  .drawer-filters{display:flex;gap:4px}
+  .drawer-filters{display:flex;gap:4px;flex-wrap:wrap;align-items:center}
   .drawer-filters button,.fp-actions button,.ar-seg .ar-actions button{background:var(--bg);border:1px solid var(--border);color:var(--dim);padding:2px 8px;border-radius:6px;font-size:10px;cursor:pointer;font-family:var(--mono)}
   .drawer-filters button.active{color:var(--accent);border-color:var(--accent)}
+  .drawer-sort{background:var(--bg);border:1px solid var(--border);color:var(--dim);padding:2px 6px;border-radius:6px;font-size:10px;cursor:pointer;font-family:var(--mono);min-height:24px}
+  .drawer-sort:focus{outline:none;border-color:var(--accent);color:var(--accent)}
   .drawer-list{flex:1;overflow-y:auto;padding:8px}
   .drawer-empty{color:var(--dim);font-size:11px;text-align:center;padding:20px 10px}
   .drawer-count{font-size:10px;color:var(--dim)}
 
-  .fp-card{border:1px solid var(--border);border-radius:10px;overflow:hidden;margin-bottom:8px;transition:border-color .15s}
+  .fp-card{border:1px solid var(--border);border-radius:10px;overflow:hidden;margin-bottom:8px;transition:border-color .15s;border-left-width:3px;border-left-style:solid}
   .fp-card:hover{border-color:#444}
   .fp-card.active{border-color:var(--accent)}
+  .fp-card.fp-selected{border-color:#2c9c4d;box-shadow:inset 0 0 0 1px #2c9c4d}
+  /* File-kind color accents — left border indicates type at a glance */
+  .fp-card.fp-kind-audio   {border-left-color:#a78bfa}    /* violet */
+  .fp-card.fp-kind-voice   {border-left-color:#c084fc}    /* purple */
+  .fp-card.fp-kind-video   {border-left-color:#f87171}    /* red */
+  .fp-card.fp-kind-image   {border-left-color:#fbbf24}    /* amber */
+  .fp-card.fp-kind-pdf     {border-left-color:#ef4444}    /* red-orange */
+  .fp-card.fp-kind-text    {border-left-color:#60a5fa}    /* blue */
+  .fp-card.fp-kind-data    {border-left-color:#34d399}    /* emerald */
+  .fp-card.fp-kind-code    {border-left-color:#22d3ee}    /* cyan */
+  .fp-card.fp-kind-web     {border-left-color:#818cf8}    /* indigo */
+  .fp-card.fp-kind-email   {border-left-color:#fb923c}    /* orange */
+  .fp-card.fp-kind-document{border-left-color:#94a3b8}    /* slate */
+  .fp-card.fp-kind-other   {border-left-color:#64748b}    /* gray */
+  .fp-icon{font-size:14px;line-height:1;flex-shrink:0;min-width:18px;text-align:center}
+  .fp-check{display:inline-flex;align-items:center;cursor:pointer;padding:2px;min-width:24px;min-height:24px;justify-content:center}
+  .fp-check input[type=checkbox]{width:16px;height:16px;cursor:pointer;accent-color:#2c9c4d;margin:0}
+  /* Per-row unpin button — one click to remove a stale or unwanted file pin without expanding the card */
+  .fp-row-x{background:none;border:none;color:var(--dim);cursor:pointer;font-size:16px;line-height:1;padding:0 6px;min-width:24px;border-radius:6px;margin-left:4px}
+  .fp-row-x:hover{color:#c2453d;background:rgba(194,69,61,.08)}
+  .fp-audio-wrap{padding:6px 0}
+  .fp-audio-wrap audio{display:block;background:var(--surface2);border-radius:6px}
+  /* Selected files tray — appears above the input bar when user has checkmarks in the drawer */
+  .fp-selected-tray{display:flex;flex-direction:column;gap:6px;padding:8px 12px;background:rgba(44,156,77,.08);border-top:1px solid #2c9c4d33;font-size:11px}
+  .fp-tray-head{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+  .fp-tray-label{color:#2c9c4d;font-weight:600;margin-right:4px}
+  .fp-tray-chips{display:flex;flex-wrap:wrap;gap:4px;align-items:center;max-height:60px;overflow:hidden;transition:max-height .15s ease}
+  .fp-tray-chips-expanded{max-height:240px;overflow-y:auto}
+  .fp-tray-chip{display:inline-flex;align-items:center;gap:4px;background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:2px 4px 2px 8px;font-family:var(--mono);font-size:10px;color:var(--text);cursor:pointer;transition:border-color .15s,background .15s}
+  .fp-tray-chip:hover{border-color:#666}
+  .fp-tray-chip.fp-chip-playing{border-color:#a78bfa;background:#a78bfa15;color:#a78bfa}
+  .fp-chip-icon{display:inline-block;margin-right:2px;animation:fp-icon-pulse 1.2s ease-in-out infinite}
+  @keyframes fp-icon-pulse{0%,100%{opacity:1}50%{opacity:.4}}
+  .fp-tray-x{background:none;border:none;color:var(--dim);cursor:pointer;font-size:14px;line-height:1;padding:0 4px;border-radius:50%;min-width:20px;min-height:20px}
+  .fp-tray-x:hover{color:#c2453d}
+  .fp-tray-clear{background:none;border:1px solid var(--border);color:var(--dim);cursor:pointer;font-size:10px;padding:2px 8px;border-radius:6px;margin-left:auto;font-family:var(--mono)}
+  .fp-tray-clear:hover{color:var(--text);border-color:#444}
+  .fp-tray-play{background:#a78bfa1a;border:1px solid #a78bfa66;color:#a78bfa;cursor:pointer;font-size:10px;padding:3px 10px;border-radius:6px;font-family:var(--mono);font-weight:600}
+  .fp-tray-play:hover{background:#a78bfa33;border-color:#a78bfa}
+  .fp-tray-more{background:none;border:1px dashed var(--border);color:var(--dim);cursor:pointer;font-size:10px;padding:2px 8px;border-radius:12px;font-family:var(--mono)}
+  .fp-tray-more:hover{color:var(--text);border-color:var(--accent)}
+  .fp-now-playing{display:flex;align-items:center;gap:4px;padding:6px 8px;background:#a78bfa12;border:1px solid #a78bfa55;border-radius:8px;font-size:11px;color:var(--text)}
+  .fp-np-label{flex:1;font-family:var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#a78bfa}
+  .fp-np-btn{background:none;border:1px solid #a78bfa44;color:#a78bfa;cursor:pointer;font-size:12px;line-height:1;padding:4px 8px;border-radius:6px;min-width:32px;min-height:32px}
+  .fp-np-btn:hover{background:#a78bfa22;border-color:#a78bfa}
+  /* Currently-playing row in the file drawer */
+  .fp-card.fp-playing{border-color:#a78bfa !important;box-shadow:inset 0 0 0 1px #a78bfa,0 0 10px #a78bfa33;animation:fp-card-pulse 1.8s ease-in-out infinite}
+  @keyframes fp-card-pulse{0%,100%{box-shadow:inset 0 0 0 1px #a78bfa,0 0 10px #a78bfa33}50%{box-shadow:inset 0 0 0 1px #a78bfa,0 0 18px #a78bfa66}}
   .fp-head{display:flex;align-items:center;gap:6px;padding:8px 10px;background:var(--bg);cursor:pointer}
   .fp-head .fp-icon{font-size:14px}
   .fp-head .fp-title{font-weight:600;font-size:11px;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -493,6 +543,19 @@
     .drawer-head button{font-size:20px;min-width:44px;min-height:44px;display:grid;place-items:center}
     .drawer-search{font-size:13px;padding:8px 12px}
     .drawer-filters button{font-size:11px;padding:4px 10px;min-height:32px}
+    .drawer-sort{font-size:11px;padding:4px 8px;min-height:32px}
+
+    /* Selected files tray + now-playing strip: thumb-friendly on mobile */
+    .fp-selected-tray{padding:10px 12px;font-size:12px;gap:8px}
+    .fp-tray-label{font-size:12px}
+    .fp-tray-chip{font-size:11px;padding:4px 6px 4px 10px;min-height:30px}
+    .fp-tray-x{font-size:16px;min-width:30px;min-height:30px}
+    .fp-tray-clear,.fp-tray-play,.fp-tray-more{font-size:11px;padding:6px 12px;min-height:36px}
+    .fp-tray-chips{max-height:72px}
+    .fp-tray-chips-expanded{max-height:50vh}
+    .fp-now-playing{padding:8px 10px;font-size:12px;gap:6px}
+    .fp-np-label{font-size:12px}
+    .fp-np-btn{font-size:14px;padding:8px 10px;min-width:40px;min-height:40px}
 
     /* Sidebar: tappable items */
     .sb-item{padding:10px 12px;min-height:44px}

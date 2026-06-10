@@ -109,8 +109,8 @@
         <div class="drawer-filters" id="decisionsFilters">
           <button class="active" data-dv="timeline" onclick="setDecisionsView('timeline')">Timeline</button>
           <button data-dv="tree" onclick="setDecisionsView('tree')">Tree</button>
-          <button data-dv-scope="session" class="active" onclick="setDecisionsScope('session')" title="This chat">This chat</button>
-          <button data-dv-scope="project" onclick="setDecisionsScope('project')" title="All chats in this project">Project</button>
+          <button data-dv-scope="session" onclick="setDecisionsScope('session')" title="This chat">This chat</button>
+          <button data-dv-scope="project" class="active" onclick="setDecisionsScope('project')" title="All chats in this project">Project</button>
         </div>
       </div>
       <div class="drawer-list" id="decisionsList"><div class="drawer-empty">No decisions recorded yet</div></div>
@@ -120,9 +120,20 @@
         <div class="drawer-title-row"><h2>Files</h2><span class="drawer-count" id="drawerCount"></span><button onclick="toggleDrawer()">&times;</button></div>
         <input class="drawer-search" id="drawerSearch" type="text" placeholder="Search files..." oninput="renderDrawer()">
         <div class="drawer-filters" id="drawerFilters">
-          <button class="active" onclick="setFileFilter('all')">All</button>
-          <button onclick="setFileFilter('email')">Emails</button>
-          <button onclick="setFileFilter('document')">Docs</button>
+          <button class="active" data-fscope="chat" onclick="setFileScope('chat')" title="Files made in this chat">This chat</button>
+          <button data-fscope="project" onclick="setFileScope('project')" title="Files made in any chat in this project">Project</button>
+          <span style="width:1px;background:var(--border);margin:0 2px"></span>
+          <button class="active" data-ftype="all" onclick="setFileFilter('all')">All</button>
+          <button data-ftype="email" onclick="setFileFilter('email')">Emails</button>
+          <button data-ftype="document" onclick="setFileFilter('document')">Docs</button>
+          <button data-ftype="voice" onclick="setFileFilter('voice')" title="Voice notes recorded in this chat">Voice</button>
+          <span style="flex:1"></span>
+          <select id="drawerSortSel" class="drawer-sort" onchange="setSortMode(this.value)" title="Sort">
+            <option value="newest">Newest</option>
+            <option value="oldest">Oldest</option>
+            <option value="name">Name</option>
+            <option value="type">Type</option>
+          </select>
         </div>
       </div>
       <div class="drawer-list" id="drawerList"><div class="drawer-empty">No files yet</div></div>

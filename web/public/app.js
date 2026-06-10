@@ -1,4 +1,5 @@
 let ws=null, session=null, busy=false, historyOffset=0, grantedPerms=new Set();
+let currentVoiceNonce=null; // WS-bound capability for voice-note uploads; cleared on disconnect
 let sentHistory=[], historyIdx=-1, currentDraft="";
 let lastRenderedTs=0;
 try{const sh=localStorage.getItem("llmt_input_history");if(sh)sentHistory=JSON.parse(sh)||[];}catch{}
@@ -18,6 +19,8 @@ function genMsgId(){return(self.crypto&&crypto.randomUUID)?crypto.randomUUID():"
 let lastServerMsgTs=Date.now();
 let staleTimer=null;
 let isSynced=false;
+let reconnectTimer=null;  // tracks pending auto-reconnect so we can cancel on session switch
+let connectEpoch=0;       // incremented on every connect(); stale handlers check this before acting
 function flushOutbox(){
   if(!ws||ws.readyState!==1) return;
   for(const item of outbox){
@@ -1060,9 +1063,23 @@ function renderDoneSection(items) {
 }
 
 
+// Detach ALL handlers from a WebSocket before closing so in-flight messages
+// can't race into the next session's view. Without this, a message arriving
+// on the old socket after we've already switched `session` global runs the
+// onmessage handler against the new session — and renders old content in
+// the new chat. ("Voice note from another chat populated my new chat" bug.)
+function _detachWs(wsRef){
+  if(!wsRef) return;
+  try { wsRef.onmessage = null; } catch {}
+  try { wsRef.onclose   = null; } catch {}
+  try { wsRef.onerror   = null; } catch {}
+  try { wsRef.onopen    = null; } catch {}
+  try { wsRef.close(); } catch {}
+}
 function _teardownAndConnect(project, sessionId){
-  if(ws) ws.close();
-  chat.innerHTML=""; session=null; ws=null; busy=false; removeThinking();
+  if(reconnectTimer){clearTimeout(reconnectTimer);reconnectTimer=null;}
+  _detachWs(ws);
+  chat.innerHTML=""; session=null; ws=null; busy=false; lastRenderedTs=0; removeThinking();
   try { localStorage.setItem("llmt_project", project); } catch {}
   setBusy(false);
   connect(project, sessionId);
@@ -1115,11 +1132,38 @@ function resumeSession(s){
 }
 async function delSession(id){
   await fetch(apiUrl("/api/sessions/"+id),{method:"DELETE"});
-  if(session?.id===id){if(ws)ws.close();chat.innerHTML="";session=null;}
+  if(session?.id===id){
+    if(reconnectTimer){clearTimeout(reconnectTimer);reconnectTimer=null;}
+    _detachWs(ws);
+    chat.innerHTML="";session=null;ws=null;lastRenderedTs=0;
+  }
   loadSessions();
 }
 
 function connect(project,sessionId){
+  // Per-chat cleanup: when switching to a DIFFERENT session, stop any in-flight
+  // audio playback and clear the file selection (the "now playing" strip and
+  // the attached-files tray are both per-chat). Same-session reconnects don't
+  // trigger this; first-page-load (session === null) doesn't either.
+  const isSessionSwitch = session && session.id && sessionId && session.id !== sessionId;
+  if (isSessionSwitch) {
+    try { stopPlayback(); } catch {}
+    if (selectedPreviewIds.size) {
+      selectedPreviewIds.clear();
+      _lastSelectedId = null;
+      _saveSelection();
+      try { renderSelectedTray(); } catch {}
+    }
+  }
+  // Cancel any pending reconnect and bump epoch so stale handlers become no-ops
+  if(reconnectTimer){clearTimeout(reconnectTimer);reconnectTimer=null;}
+  const epoch=++connectEpoch;
+  // Close any lingering WS without triggering its onclose reconnect
+  if(ws) try{ws.onclose=null;ws.close();}catch{}
+  // Protocol-level guard: lock to this connection's session_id once the server
+  // identifies it. Any later message whose session_id doesn't match is dropped —
+  // even if a stale WS's handlers were forgotten by _detachWs.
+  let lockedSessionId = null;
   const proto=location.protocol==="https:"?"wss":"ws";
   let url=proto+"://"+location.host+BASE+"/ws?project="+project;
   if(sessionId) url+="&session="+sessionId;
@@ -1136,6 +1180,13 @@ function connect(project,sessionId){
   ws.onmessage=(e)=>{
     lastServerMsgTs=Date.now();
     const msg=JSON.parse(e.data);
+    // Stale-WS guard: if this connection has already been locked to a session_id,
+    // refuse any message arriving with a different one. Kills the "another chat's
+    // message rendered into my new chat" race at the protocol level.
+    if (lockedSessionId && msg.session_id && msg.session_id !== lockedSessionId) {
+      try { console.warn("[ws] dropped stale msg", msg.type, "for", msg.session_id, "expected", lockedSessionId); } catch {}
+      return;
+    }
     switch(msg.type){
       case "ping":
         try{ws.send(JSON.stringify({type:"pong",ts:msg.ts}))}catch{}
@@ -1160,6 +1211,8 @@ function connect(project,sessionId){
         break;
       case "session":
         session=msg.session;
+        lockedSessionId = session.id;
+        currentVoiceNonce = msg.voiceNonce || null;
         localStorage.setItem("llmt_session", session.id);
         localStorage.setItem("llmt_project", session.project);
         location.hash = session.id;
@@ -1174,6 +1227,16 @@ function connect(project,sessionId){
         // Diff-based rendering: only append messages newer than what's already on screen
         removeThinking();
         historyOffset = msg.offset || 0;
+        // Reconnect with stale DOM? Clear and re-render from authoritative history.
+        // Live-streamed messages use client-side timestamps that don't match the
+        // server's save-time ts, so timestamp-based dedup silently fails and causes
+        // duplicates (the "double message on phone unlock" bug).  A clean re-render
+        // from the server's history is the only reliable path.
+        const chatHadContent = !!chat.querySelector(".msg");
+        if(chatHadContent){
+          chat.innerHTML="";
+          lastRenderedTs=0;
+        }
         // Ensure a load-more bar if needed (don't duplicate)
         if(historyOffset > 0 && !chat.querySelector(".load-more-bar")){
           const bar=mk("div","load-more-bar");
@@ -1181,20 +1244,9 @@ function connect(project,sessionId){
           bar.onclick=()=>loadMore();
           chat.prepend(bar);
         }
-        // First reconnect ever? Compute lastRenderedTs from existing DOM (in case client was reloaded mid-session)
-        if(lastRenderedTs===0){
-          const stamped=chat.querySelectorAll("[data-ts]");
-          stamped.forEach(el=>{
-            const t=parseInt(el.dataset.ts||"0",10);
-            if(t>lastRenderedTs)lastRenderedTs=t;
-          });
-        }
-        // If chat is completely empty, fall back to bulk render (fresh session)
-        const chatIsEmpty = !chat.querySelector(".msg");
         let newestTs=lastRenderedTs;
         (msg.messages||[]).forEach(m=>{
           const ts=m.ts||0;
-          if(!chatIsEmpty && ts && ts<=lastRenderedTs) return; // already rendered
           if(m.role==="user"&&m.source!=="voice-note") addUser(m.text);
           else if(m.role==="question") addQuestion(m.text);
           else if(m.role==="permission_denied") addPermissionCardFromHistory({tool_name:m.tool_name,tool_input:m.tool_input,message:m.message});
@@ -1210,8 +1262,7 @@ function connect(project,sessionId){
         });
         lastRenderedTs=newestTs;
         setBusy(false);
-        // Restore scroll only on fresh rebuild
-        if(chatIsEmpty) setTimeout(restoreChatScroll,0);
+        setTimeout(restoreChatScroll,0);
         break;
       case "history_prepend":
         const oldH=chat.scrollHeight;
@@ -1380,8 +1431,17 @@ function connect(project,sessionId){
   };
   ws.onclose=()=>{
     setStatus("reconnecting...","thinking"); ws=null;
-    // Auto-reconnect — session history will sync on reconnect
-    setTimeout(()=>{if(!ws&&session) connect(session.project,session.id)},2000);
+    currentVoiceNonce=null; // server already revoked it; clear locally so we don't POST with a known-bad token
+    // Auto-reconnect — but only if this connection is still the current epoch
+    const closedEpoch=epoch;
+    reconnectTimer=setTimeout(()=>{
+      reconnectTimer=null;
+      if(closedEpoch!==connectEpoch) return; // session switched since this ws closed
+      if(!ws&&session){
+        chat.innerHTML=""; lastRenderedTs=0;
+        connect(session.project,session.id);
+      }
+    },2000);
   };
   ws.onerror=()=>setStatus("error","");
   // Staleness watcher: if server hasn't sent anything for 25s show slow, 45s force reconnect
@@ -1397,9 +1457,30 @@ function connect(project,sessionId){
 function _clearInput(){
   inp.value=""; inp.style.height="44px"; localStorage.removeItem("llmt_draft"); clearImages();
 }
+
+// ── Phone wake / tab resume: force-reconnect so chat is always fresh ──
+document.addEventListener("visibilitychange",()=>{
+  if(document.hidden) return;
+  // Page just became visible (phone unlocked, tab refocused)
+  if(!session) return;
+  const wsAlive = ws && ws.readyState===WebSocket.OPEN;
+  const stale = Date.now()-lastServerMsgTs > 10000; // >10s since last server msg
+  if(!wsAlive || stale){
+    const sid=session.id, proj=session.project; // capture before any async weirdness
+    console.log("[visibility] page visible, reconnecting (wsAlive="+wsAlive+", stale="+stale+", session="+sid+")");
+    chat.innerHTML=""; lastRenderedTs=0;
+    connect(proj,sid); // connect() already cleans up old ws
+  }
+});
+
 function send(){
-  const text=inp.value.trim();
+  const rawText=inp.value.trim();
+  // Prepend attached-file context if user has checkmarks in the drawer.
+  // After send, the selection clears (next message starts fresh).
+  const preamble = _attachedFilesPreamble();
+  const text = preamble ? (preamble + (rawText || "(no message — attached files for context)")) : rawText;
   if(!text&&pendingImages.length===0) return;
+  if (preamble) { selectedPreviewIds.clear(); _saveSelection(); renderDrawer(); renderSelectedTray(); }
   // Request notification permission on first send (idempotent if already decided)
   requestNotifPermission();
   // Push to input history (for ArrowUp recall)
@@ -1424,13 +1505,11 @@ function send(){
   if(!ws||ws.readyState!==1){
     const clientId=genMsgId();
     outbox.push({id:clientId,text,images,ts:Date.now()});saveOutbox();
-    connect(_defaultProject(),session?.id);
-    ws.onopen=()=>{
-      setStatus("connected","active");lastServerMsgTs=Date.now();
-      ws.send(JSON.stringify({type:"prompt",client_id:clientId,text:prompt,images}));
-      setBusy(true);
-    };
+    // Reconnect — outbox will be flushed when "ready" arrives (no ws.onopen overwrite,
+    // which would race the flush and double-send the prompt)
+    connect(session?.project||_defaultProject(),session?.id);
     addUser(text,previews,clientId); _clearInput();
+    setBusy(true);
     return;
   }
   const clientId=genMsgId();
@@ -1932,13 +2011,345 @@ function addPermissionCardFromHistory(msg){
 }
 
 let sessionPreviews=[], expandedPreviewId=null, fileFilter="all", knownPreviewIds=new Set();
+let sortMode=(function(){try{return localStorage.getItem("llmt_file_sort")||"newest"}catch{return "newest"}})(); // newest|oldest|name|type
+
+// Map a preview entry to a {kind, icon, label} based on type or filename extension.
+// Drives both the visible icon and the .fp-kind-* CSS class for the color accent.
+function fileKindMeta(p) {
+  const t = p && p.type;
+  if (t === "email")    return { kind: "email",    icon: "✉",  label: "Email"    };
+  if (t === "document") return { kind: "document", icon: "📄", label: "Doc"      };
+  if (t === "voice")    return { kind: "voice",    icon: "🎙", label: "Voice"    };
+  const path = (p?.content?.body_text || "").replace(/^FILE_PATH:/, "");
+  const name = (path || p?.title || "").toLowerCase();
+  const ext = (name.match(/\.([a-z0-9]+)$/) || [])[1] || "";
+  if (/^(mp3|m4a|wav|ogg|opus|aac|flac)$/.test(ext))       return { kind: "audio", icon: "🎵", label: "Audio" };
+  if (/^(mp4|mov)$/.test(ext))                              return { kind: "video", icon: "🎬", label: "Video" };
+  if (ext === "webm") return { kind: "audio", icon: "🎵", label: "Audio" }; // webm here is almost always voice/audio
+  if (/^(png|jpg|jpeg|gif|svg|webp)$/.test(ext))            return { kind: "image", icon: "🖼", label: "Image" };
+  if (ext === "pdf")                                         return { kind: "pdf",   icon: "📕", label: "PDF"   };
+  if (/^(md|txt)$/.test(ext))                                return { kind: "text",  icon: "📝", label: "Text"  };
+  if (/^(json|yaml|yml|csv|toml|xml)$/.test(ext))            return { kind: "data",  icon: "📊", label: "Data"  };
+  if (/^(py|js|ts|tsx|jsx|svelte|sh|rb|go|rs)$/.test(ext))   return { kind: "code",  icon: "⚡", label: "Code"  };
+  if (/^(html|htm)$/.test(ext))                              return { kind: "web",   icon: "🌐", label: "Web"   };
+  return { kind: "other", icon: "📎", label: "File" };
+}
+
+function setSortMode(m) {
+  if (!["newest","oldest","name","type"].includes(m)) return;
+  sortMode = m;
+  try { localStorage.setItem("llmt_file_sort", m); } catch {}
+  const sel = document.getElementById("drawerSortSel");
+  if (sel) sel.value = m;
+  renderDrawer();
+}
+// Files the user has check-marked in the drawer to attach to the next message.
+let selectedPreviewIds = (function(){
+  try { return new Set(JSON.parse(localStorage.getItem("llmt_selected_previews")||"[]")); } catch { return new Set(); }
+})();
+let _lastSelectedId = null;          // anchor for shift-click range select
+let _currentDrawerOrder = [];        // ids in the order currently rendered (for range)
+function _saveSelection(){ try{ localStorage.setItem("llmt_selected_previews", JSON.stringify([...selectedPreviewIds])); }catch{} }
+function toggleFileSelection(id, ev){
+  ev = ev || window.event;
+  const isShift = ev && ev.shiftKey;
+  if (isShift && _lastSelectedId && _lastSelectedId !== id && _currentDrawerOrder.length) {
+    const i1 = _currentDrawerOrder.indexOf(_lastSelectedId);
+    const i2 = _currentDrawerOrder.indexOf(id);
+    if (i1 >= 0 && i2 >= 0) {
+      const a = Math.min(i1, i2), b = Math.max(i1, i2);
+      // Windows-style range select: every row in [anchor..current] becomes selected,
+      // unconditionally. The anchor (_lastSelectedId) does NOT move so subsequent
+      // shift-clicks extend from the same starting point.
+      for (let i = a; i <= b; i++) selectedPreviewIds.add(_currentDrawerOrder[i]);
+      _saveSelection();
+      renderDrawer();
+      renderSelectedTray();
+      return;
+    }
+  }
+  // Plain click — toggle this row and move the anchor to it.
+  if (selectedPreviewIds.has(id)) selectedPreviewIds.delete(id);
+  else selectedPreviewIds.add(id);
+  _lastSelectedId = id;
+  _saveSelection();
+  renderDrawer();
+  renderSelectedTray();
+}
+
+// ---- Sequential audio playback for selected files ----
+let _playbackQueue = [];
+let _playbackIndex = -1;
+let _playbackEl = null;
+
+function _selectedAudioQueue(){
+  // Iterate selectedPreviewIds (NOT _currentDrawerOrder) so files hidden by the
+  // active filter still play. The drawer order is used only for sorting.
+  const items = [];
+  for (const id of selectedPreviewIds) {
+    const p = sessionPreviews.find(x => x.id === id);
+    if (!p) continue;
+    const meta = fileKindMeta(p);
+    if (meta.kind !== "audio" && meta.kind !== "voice") continue;
+    const bt = (p.content?.body_text) || "";
+    if (!bt.startsWith("FILE_PATH:")) continue;
+    const fp = bt.slice("FILE_PATH:".length);
+    items.push({ id, url: apiUrl("/api/file?path=" + encodeURIComponent(fp)), title: p.title || fp.split("/").pop() });
+  }
+  // Sort by current drawer order when possible (so playback follows the sort
+  // mode the user sees), unattributed entries trail at the end.
+  const orderIdx = new Map(_currentDrawerOrder.map((id, i) => [id, i]));
+  items.sort((a, b) => {
+    const ia = orderIdx.has(a.id) ? orderIdx.get(a.id) : Number.MAX_SAFE_INTEGER;
+    const ib = orderIdx.has(b.id) ? orderIdx.get(b.id) : Number.MAX_SAFE_INTEGER;
+    return ia - ib;
+  });
+  return items;
+}
+
+function playSelectedAudio(){
+  const q = _selectedAudioQueue();
+  if (!q.length) return;
+  _playbackQueue = q;
+  _playbackIndex = 0;
+  _playCurrent();
+}
+
+function _playCurrent(){
+  if (_playbackIndex < 0 || _playbackIndex >= _playbackQueue.length) { stopPlayback(); return; }
+  const cur = _playbackQueue[_playbackIndex];
+  console.log("[playback] track", _playbackIndex + 1, "/", _playbackQueue.length, "→", cur.title);
+  // Tear down the previous element FIRST and null out all listeners, so the
+  // cleanup itself (removeAttribute src + load()) can't fire an error event
+  // that re-enters our skip-on-error handler and double-advances the index.
+  if (_playbackEl) {
+    try {
+      _playbackEl.onended = null;
+      _playbackEl.onerror = null;
+      _playbackEl.onplay  = null;
+      _playbackEl.onpause = null;
+      _playbackEl.pause();
+      _playbackEl.removeAttribute("src");
+      _playbackEl.load();
+    } catch {}
+  }
+  _playbackEl = new Audio();
+  _playbackEl.onended = () => { _playbackIndex++; _playCurrent(); };
+  _playbackEl.onerror = (e) => {
+    console.warn("[playback] error on", cur.url, e);
+    _playbackIndex++;
+    _playCurrent();
+  };
+  _playbackEl.onplay  = () => renderSelectedTray();
+  _playbackEl.onpause = () => renderSelectedTray();
+  _playbackEl.src = cur.url;
+  _playbackEl.load();
+  const playPromise = _playbackEl.play();
+  if (playPromise && playPromise.catch) {
+    playPromise.catch(err => console.warn("[playback] play() rejected:", err && err.message || err));
+  }
+  renderSelectedTray();
+}
+
+function stopPlayback(){
+  if (_playbackEl) {
+    try {
+      _playbackEl.onended = null;
+      _playbackEl.onerror = null;
+      _playbackEl.onplay  = null;
+      _playbackEl.onpause = null;
+      _playbackEl.pause();
+      _playbackEl.removeAttribute("src");
+      _playbackEl.load();
+    } catch {}
+    _playbackEl = null;
+  }
+  _playbackQueue = [];
+  _playbackIndex = -1;
+  renderSelectedTray();
+}
+
+function skipPrev(){ if (_playbackIndex > 0) { _playbackIndex--; _playCurrent(); } }
+function skipNext(){ _playbackIndex++; _playCurrent(); }
+function pauseToggle(){
+  if (!_playbackEl) return;
+  if (_playbackEl.paused) _playbackEl.play().catch(()=>{}); else _playbackEl.pause();
+  renderSelectedTray();
+}
+function clearFileSelection(){ selectedPreviewIds.clear(); _saveSelection(); renderDrawer(); renderSelectedTray(); }
+function _selectedPreviewPaths(){
+  // Map selected ids back to absolute paths (FILE_PATH-type only) or fall back to title.
+  const out = [];
+  for (const id of selectedPreviewIds) {
+    const p = sessionPreviews.find(x=>x.id===id);
+    if (!p) continue;
+    const bt = (p.content?.body_text) || "";
+    if (bt.startsWith("FILE_PATH:")) out.push({ id, path: bt.slice("FILE_PATH:".length), title: p.title });
+    else out.push({ id, path: null, title: p.title });
+  }
+  return out;
+}
+function _attachedFilesPreamble(){
+  const sel = _selectedPreviewPaths();
+  if (!sel.length) return "";
+  const lines = sel.map(s => "  - " + (s.path || s.title));
+  return "Attached files (from drawer, treat as context for this message):\n" + lines.join("\n") + "\n\n";
+}
+let _trayExpanded = false;
+function _toggleTrayExpand(){ _trayExpanded = !_trayExpanded; renderSelectedTray(); }
+
+// Surgically highlight the currently-playing row in the file drawer. Avoids a
+// full renderDrawer (which would reset scroll and feel jumpy).
+function _updatePlayingHighlight(){
+  const playingId = (_playbackIndex >= 0 && _playbackQueue.length) ? _playbackQueue[_playbackIndex]?.id : null;
+  document.querySelectorAll('.fp-card.fp-playing').forEach(el => el.classList.remove('fp-playing'));
+  if (playingId) {
+    const el = document.querySelector('.fp-card[data-pid="' + (window.CSS && CSS.escape ? CSS.escape(playingId) : playingId.replace(/"/g, '\\"')) + '"]');
+    if (el) el.classList.add('fp-playing');
+  }
+}
+
+function renderSelectedTray(){
+  let tray = document.getElementById("fpSelectedTray");
+  const playingId = (_playbackIndex >= 0 && _playbackQueue.length) ? _playbackQueue[_playbackIndex]?.id : null;
+  const playing = !!playingId;
+  if (!selectedPreviewIds.size && !playing) { if (tray) tray.remove(); _updatePlayingHighlight(); return; }
+  if (!tray) {
+    tray = mk("div", "fp-selected-tray");
+    tray.id = "fpSelectedTray";
+    const bar = document.querySelector(".input-bar");
+    if (bar && bar.parentNode) bar.parentNode.insertBefore(tray, bar);
+  }
+  const sel = _selectedPreviewPaths();
+  const audioCount = _selectedAudioQueue().length;
+
+  // Reorder so the currently-playing chip is first when collapsed — guarantees
+  // it stays visible no matter how many other files are selected.
+  let display = sel;
+  if (playingId) {
+    const idx = sel.findIndex(s => s.id === playingId);
+    if (idx > 0) display = [sel[idx], ...sel.slice(0, idx), ...sel.slice(idx + 1)];
+  }
+
+  const MAX_CHIPS = 4;
+  const overflow = display.length - MAX_CHIPS;
+  const collapsed = !_trayExpanded && overflow > 0;
+  const visible = collapsed ? display.slice(0, MAX_CHIPS) : display;
+
+  // Header row: label + action buttons (always visible, doesn't wrap)
+  let html = '<div class="fp-tray-head">';
+  html +=   '<span class="fp-tray-label">📎 ' + sel.length + ' file' + (sel.length===1?'':'s') + '</span>';
+  if (audioCount > 0 && !playing) {
+    html += '<button class="fp-tray-play" onclick="playSelectedAudio()" title="Play selected audio (Enter)">▶ Play ' + audioCount + '</button>';
+  }
+  html +=   '<button class="fp-tray-clear" onclick="clearFileSelection()">clear</button>';
+  html += '</div>';
+
+  // Chip row (collapsible)
+  html += '<div class="fp-tray-chips' + (collapsed ? '' : ' fp-tray-chips-expanded') + '">';
+  for (const s of visible) {
+    const isP = s.id === playingId;
+    const name = (s.path ? s.path.split("/").pop() : s.title) || "";
+    html += '<span class="fp-tray-chip' + (isP ? ' fp-chip-playing' : '') + '" title="' + esc(s.path||s.title) + '" onclick="' + (isP?'pauseToggle()':"playSingleFromId('"+s.id+"')") + '">'
+         +    (isP ? '<span class="fp-chip-icon">▶</span>' : '')
+         +    esc(name.slice(0, 32))
+         +    ' <button class="fp-tray-x" onclick="event.stopPropagation();toggleFileSelection(\'' + s.id + '\')" aria-label="Remove">×</button>'
+         +  '</span>';
+  }
+  if (collapsed) {
+    html += '<button class="fp-tray-more" onclick="_toggleTrayExpand()">+' + overflow + ' more</button>';
+  } else if (overflow > 0) {
+    html += '<button class="fp-tray-more" onclick="_toggleTrayExpand()">show less</button>';
+  }
+  html += '</div>';
+
+  // Now-playing strip (only when playing)
+  if (playing) {
+    const cur = _playbackQueue[_playbackIndex];
+    const isPaused = _playbackEl && _playbackEl.paused;
+    html += '<div class="fp-now-playing">'
+         +    '<span class="fp-np-label">'+(isPaused?"⏸":"▶")+' '+(_playbackIndex+1)+'/'+_playbackQueue.length+' · '+esc((cur?.title||"").slice(0, 40))+'</span>'
+         +    '<button class="fp-np-btn" onclick="skipPrev()" title="Previous" aria-label="Previous">⏮</button>'
+         +    '<button class="fp-np-btn" onclick="pauseToggle()" title="Play/Pause" aria-label="Play/Pause">'+(isPaused?"▶":"⏸")+'</button>'
+         +    '<button class="fp-np-btn" onclick="skipNext()" title="Next" aria-label="Next">⏭</button>'
+         +    '<button class="fp-np-btn" onclick="stopPlayback()" title="Stop" aria-label="Stop">✕</button>'
+         +  '</div>';
+  }
+  tray.innerHTML = html;
+  _updatePlayingHighlight();
+}
+
+// Jump playback to a specific selected file (clicked from a tray chip).
+function playSingleFromId(id) {
+  const q = _selectedAudioQueue();
+  const idx = q.findIndex(item => item.id === id);
+  if (idx < 0) return;
+  _playbackQueue = q;
+  _playbackIndex = idx;
+  _playCurrent();
+}
+let fileScope=(function(){try{return localStorage.getItem("llmt_file_scope")||"chat"}catch{return "chat"}})(); // chat | project
 
 async function refreshPreviews(showNewInline){
   if(!session) return;
   try{
-    const res=await fetch("/api/previews?session_id="+session.id).then(r=>r.json());
-    const oldIds=new Set(sessionPreviews.map(p=>p.id));
-    sessionPreviews=res.previews||[];
+    const scopeQs = (fileScope === "project" && session.project)
+      ? "project=" + encodeURIComponent(session.project)
+      : "session_id=" + encodeURIComponent(session.id);
+    // Fetch in parallel:
+    //   /api/previews   = DB-backed: emails / documents / agent-set labels for files
+    //   /api/drawer-files = filesystem-derived: actual file pins (reconciled at fetch time)
+    // The drawer-files endpoint is the new source of truth for file rows; the DB endpoint
+    // contributes label overrides + non-file previews (emails, structured drafts).
+    const [dbRes, fsRes] = await Promise.all([
+      fetch(apiUrl("/api/previews?" + scopeQs)).then(r => r.json()).catch(() => ({ previews: [] })),
+      fetch(apiUrl("/api/drawer-files?" + scopeQs)).then(r => r.json()).catch(() => ({ files: [] })),
+    ]);
+    const dbPreviews = dbRes.previews || [];
+    const fsFiles = fsRes.files || [];
+
+    // Build a path -> dbPreview lookup so filesystem files can pick up agent-set labels
+    const dbByPath = new Map();
+    for (const p of dbPreviews) {
+      const bt = p?.content?.body_text || "";
+      if (bt.startsWith("FILE_PATH:")) dbByPath.set(bt.slice("FILE_PATH:".length).trim(), p);
+    }
+
+    // Materialize filesystem files into preview-shaped objects
+    const fsPreviews = fsFiles.map(f => {
+      const fromDb = dbByPath.get(f.path);
+      // Voice notes are user-recorded audio prompts — they belong in the chat thread,
+      // not in the default "Files" view. Tag them as type:"voice" so the drawer can
+      // hide them unless the user explicitly toggles the Voice filter pill.
+      const isVoice = f.kind === "voice";
+      return {
+        // Use the DB id if present (so attach-selection survives), else synthesize
+        id: fromDb ? fromDb.id : ("fs:" + f.path),
+        type: isVoice ? "voice" : "file",
+        title: (fromDb && fromDb.title && fromDb.title !== "Untitled") ? fromDb.title : f.title,
+        content: { body_text: "FILE_PATH:" + f.path },
+        session_id: f.source_session_id,
+        project: fromDb?.project || null,
+        created_at: new Date(f.mtime_ms).toISOString(),
+        updated_at: new Date(f.mtime_ms).toISOString(),
+        attachments: [],
+        // Carry the source session info (useful in Project view to show which chat made it)
+        _source_session_title: f.source_session_title,
+        _from_fs: true,
+      };
+    });
+
+    // Non-file DB previews (emails, documents, drafts) — those keep DB-only authority
+    const nonFileDbPreviews = dbPreviews.filter(p => {
+      const bt = p?.content?.body_text || "";
+      return !bt.startsWith("FILE_PATH:");
+    });
+
+    // Merge — fsPreviews first (newest mtime), then non-file DB previews
+    const merged = [...fsPreviews, ...nonFileDbPreviews];
+
+    const oldIds = new Set(sessionPreviews.map(p => p.id));
+    sessionPreviews = merged;
     renderDrawer();
     // Badge
     const badge=document.getElementById("filesBadge");
@@ -2001,8 +2412,21 @@ function reviewPreview(id,action){
 function setFileFilter(f){
   fileFilter=f;
   try{localStorage.setItem("llmt_file_filter",f)}catch{}
-  document.querySelectorAll("#drawerFilters button").forEach(b=>b.classList.toggle("active",b.textContent.toLowerCase().startsWith(f==="all"?"all":f)));
+  document.querySelectorAll("#drawerFilters [data-ftype]").forEach(b=>b.classList.toggle("active", b.dataset.ftype === f));
   renderDrawer();
+}
+function setFileScope(scope){
+  if (scope !== "chat" && scope !== "project") return;
+  fileScope = scope;
+  try{ localStorage.setItem("llmt_file_scope", scope) }catch{}
+  document.querySelectorAll("#drawerFilters [data-fscope]").forEach(b=>b.classList.toggle("active", b.dataset.fscope === scope));
+  refreshPreviews(false);
+}
+function _syncFileScopeButtons(){
+  document.querySelectorAll("#drawerFilters [data-fscope]").forEach(b=>b.classList.toggle("active", b.dataset.fscope === fileScope));
+  document.querySelectorAll("#drawerFilters [data-ftype]").forEach(b=>b.classList.toggle("active", b.dataset.ftype === fileFilter));
+  const sel = document.getElementById("drawerSortSel");
+  if (sel) sel.value = sortMode;
 }
 
 function highlightText(text, query){
@@ -2106,6 +2530,11 @@ function fileBodyHtml(bodyText, title, query) {
            + '<button class="fm-btn" onclick="' + openModal + '" style="font-size:12px;margin-bottom:6px">&#x26F6; Full screen</button>'
            + '<img src="' + esc(url) + '" style="max-width:100%;border-radius:6px;display:block" loading="lazy"></div>';
     }
+    if (['mp3','wav','m4a','ogg','webm','aac','flac','opus'].includes(ext)) {
+      // Inline audio player — no need to open a new tab for audio review.
+      return '<div class="fp-audio-wrap"><audio controls preload="metadata" src="' + esc(url) + '" style="width:100%"></audio>'
+           + '<div style="font-size:10px;color:var(--dim);margin-top:4px;word-break:break-all">' + esc(fp) + '</div></div>';
+    }
     return '<a class="fp-att" href="' + esc(url) + '" target="_blank" rel="noopener noreferrer">&#8599; ' + esc(fp.split('/').pop()) + '</a>';
   }
   return '<div class="fp-body">' + (query ? highlightText(bodyText, query) : esc(bodyText)) + '</div>';
@@ -2122,38 +2551,87 @@ function renderDrawer(){
   const countEl=document.getElementById("drawerCount");
   const query=(document.getElementById("drawerSearch")?.value||"").trim();
   let filtered=sessionPreviews;
-  if(fileFilter!=="all") filtered=filtered.filter(p=>p.type===fileFilter);
+  // Voice notes (user-recorded audio prompts) are hidden from the default "All"
+  // view — they live in the chat thread and only show here when explicitly filtered.
+  if(fileFilter==="all") filtered=filtered.filter(p=>p.type!=="voice");
+  else if(fileFilter!=="all") filtered=filtered.filter(p=>p.type===fileFilter);
   if(query) filtered=filtered.filter(p=>matchesSearch(p,query));
   countEl.textContent=filtered.length+"/"+sessionPreviews.length+" files (filter="+(fileFilter||"all")+")";
   if(!filtered.length){list.innerHTML='<div class="drawer-empty">'+(query?"No matches":"No files in this session")+'</div>';return;}
   list.innerHTML="";
-  // Sort newest first
-  filtered=filtered.slice().sort((a,b)=>(b.created_at||"").localeCompare(a.created_at||""));
-  // Group by time bucket
-  const now=Date.now();
-  const groups={};const order=["Last hour","Today","Yesterday","This week","Older"];
-  order.forEach(o=>groups[o]=[]);
-  filtered.forEach(p=>{
-    const t=p.created_at?new Date(p.created_at).getTime():0;
-    const age=now-t;
-    let bucket="Older";
-    if(age<3600000)bucket="Last hour";
-    else if(age<86400000)bucket="Today";
-    else if(age<172800000)bucket="Yesterday";
-    else if(age<604800000)bucket="This week";
-    groups[bucket].push(p);
-  });
+
+  // Sort + group based on sortMode
+  const _ts = p => p.created_at ? new Date(p.created_at).getTime() : 0;
+  const cmpNewest = (a,b) => _ts(b) - _ts(a);
+  const cmpOldest = (a,b) => _ts(a) - _ts(b);
+  const cmpName   = (a,b) => (a.title||"").localeCompare(b.title||"", undefined, {sensitivity:"base"});
+  const cmpType   = (a,b) => {
+    const ka = fileKindMeta(a).label, kb = fileKindMeta(b).label;
+    return ka === kb ? cmpName(a,b) : ka.localeCompare(kb);
+  };
+  if (sortMode === "newest")      filtered = filtered.slice().sort(cmpNewest);
+  else if (sortMode === "oldest") filtered = filtered.slice().sort(cmpOldest);
+  else if (sortMode === "name")   filtered = filtered.slice().sort(cmpName);
+  else if (sortMode === "type")   filtered = filtered.slice().sort(cmpType);
+
+  // Grouping aligns with the sort: time buckets for newest/oldest, alpha for name, type label for type.
+  const groups = {};
+  const order = [];
+  function pushGroup(name, p) {
+    if (!groups[name]) { groups[name] = []; order.push(name); }
+    groups[name].push(p);
+  }
+  if (sortMode === "newest" || sortMode === "oldest") {
+    const now = Date.now();
+    const buckets = ["Last hour","Today","Yesterday","This week","Older"];
+    buckets.forEach(b => { groups[b]=[]; order.push(b); });
+    filtered.forEach(p => {
+      const t = _ts(p);
+      const age = now - t;
+      let bucket = "Older";
+      if (age < 3600000) bucket = "Last hour";
+      else if (age < 86400000) bucket = "Today";
+      else if (age < 172800000) bucket = "Yesterday";
+      else if (age < 604800000) bucket = "This week";
+      groups[bucket].push(p);
+    });
+    if (sortMode === "oldest") order.reverse();
+  } else if (sortMode === "type") {
+    filtered.forEach(p => pushGroup(fileKindMeta(p).label, p));
+  } else { // name
+    filtered.forEach(p => {
+      const ch = (p.title||"?").charAt(0).toUpperCase();
+      pushGroup(/[A-Z]/.test(ch) ? ch : "#", p);
+    });
+  }
+
+  // Capture the flat rendered order so shift-click range select and playback
+  // sequence both follow the visible sort.
+  _currentDrawerOrder = order.flatMap(b => (groups[b]||[]).map(p => p.id));
+
   order.forEach(bucket=>{
-    if(!groups[bucket].length)return;
+    if(!groups[bucket]||!groups[bucket].length)return;
     const grp=mk("div","drawer-group");
     const h=mk("div","drawer-group-h");h.textContent=bucket+" ("+groups[bucket].length+")";
     grp.appendChild(h);
     groups[bucket].forEach(p=>{
-    const card=mk("div","fp-card"+(expandedPreviewId===p.id?" active":""));
-    const icon=p.type==="email"?"✉️":p.type==="document"?"📄":"📎";
+    const isSel = selectedPreviewIds.has(p.id);
+    const meta = fileKindMeta(p);
+    const card=mk("div","fp-card fp-kind-"+meta.kind+(expandedPreviewId===p.id?" active":"")+(isSel?" fp-selected":""));
+    card.setAttribute("data-pid", p.id);
+    const icon=meta.icon;
     const snippet=fileSnippet(p.content?.body_text||'');
     const ago=timeAgo(p.created_at);
-    let html='<div class="fp-head"><span class="fp-icon">'+icon+'</span><span class="fp-title">'+highlightText(p.title||"Untitled",query)+'</span><span class="fp-time">'+ago+'</span><span class="fp-type">'+esc(p.type||"file")+'</span></div>';
+    let html='<div class="fp-head">'
+      +'<label class="fp-check" onclick="event.stopPropagation()"><input type="checkbox" '+(isSel?"checked":"")+' onclick="event.stopPropagation();toggleFileSelection(\''+p.id+'\',event)" aria-label="Attach to next message; shift+click to range select"></label>'
+      +'<span class="fp-icon">'+icon+'</span><span class="fp-title">'+highlightText(p.title||"Untitled",query)+'</span><span class="fp-time">'+ago+'</span><span class="fp-type">'+esc(meta.label)+'</span>';
+    // Filesystem-derived rows: no × (the row is a view of the filesystem; can't be removed
+    // from the drawer without deleting the file itself, which we don't do from the UI).
+    // DB-backed rows (emails, agent-labeled previews): × deletes the DB record.
+    if (!p._from_fs) {
+      html += '<button class="fp-row-x" onclick="event.stopPropagation();deletePreview(\''+p.id+'\')" title="Unpin from drawer" aria-label="Unpin">×</button>';
+    }
+    html += '</div>';
     if(expandedPreviewId!==p.id&&snippet) html+='<div class="fp-snippet">'+highlightText(snippet,query)+'</div>';
     if(expandedPreviewId===p.id){
       html+='<div class="fp-detail">';
@@ -2181,6 +2659,7 @@ function renderDrawer(){
     });
     list.appendChild(grp);
   });
+  _updatePlayingHighlight();
 }
 
 function copyPreviewText(id){
@@ -2195,8 +2674,9 @@ function toggleDrawer(){
   const dw=document.getElementById("drawer");
   dw.classList.toggle("hidden");
   try{localStorage.setItem("llmt_drawer_open",String(!dw.classList.contains("hidden")))}catch{}
-  // If opening the drawer, refresh previews so user sees latest files
+  // If opening the drawer, sync filter button styling from persisted state, then refresh
   if(!dw.classList.contains("hidden")){
+    try{ _syncFileScopeButtons(); }catch{}
     try{refreshPreviews(false);}catch{}
   }
 }
@@ -2204,7 +2684,7 @@ function toggleDrawer(){
 // ── Decisions drawer (timeline / tree of agent decisions) ──
 let _decisions = [];
 let _decisionsView  = (function(){try{return localStorage.getItem("llmt_decisions_view")||"timeline"}catch{return "timeline"}})();
-let _decisionsScope = (function(){try{return localStorage.getItem("llmt_decisions_scope")||"session"}catch{return "session"}})();
+let _decisionsScope = (function(){try{return localStorage.getItem("llmt_decisions_scope")||"project"}catch{return "project"}})();
 const _decisionsExpanded = new Set();
 
 function _bumpDecisionsViewCount(view){
@@ -3104,10 +3584,16 @@ async function sendVoiceNote(blob){
   try{
     setVnStatus("Uploading…","vn-s-active");
     const sid=(session&&session.id)||"";
+    // Prefer the WS-bound nonce — it proves this upload is from the currently-open
+    // socket. Falls back to bare session= only if nonce hasn't arrived yet (server
+    // logs that path as deprecated).
+    const qs = currentVoiceNonce
+      ? "?nonce="+encodeURIComponent(currentVoiceNonce)
+      : (sid?"?session="+encodeURIComponent(sid):"");
     // Track upload progress via XMLHttpRequest for real upload %
     const data=await new Promise((resolve,reject)=>{
       const xhr=new XMLHttpRequest();
-      xhr.open("POST","./voice-note"+(sid?"?session="+encodeURIComponent(sid):""));
+      xhr.open("POST","./voice-note"+qs);
       xhr.setRequestHeader("Content-Type",blob.type||"audio/mp4");
       xhr.upload.onprogress=(e)=>{
         if(e.lengthComputable){
@@ -3229,6 +3715,17 @@ document.addEventListener("keydown",(e)=>{
     if(bar.classList.contains("hidden"))toggleChatSearch();
     else document.getElementById("chatSearchInput").focus();
     return;
+  }
+  // Enter when audio is selected → play the queue. Bypassed when typing or
+  // when modifier keys are involved (Cmd-Enter, Shift-Enter, etc.).
+  if (e.key === "Enter" && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
+    const t = e.target;
+    const isTyping = t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable);
+    if (!isTyping && selectedPreviewIds.size && _selectedAudioQueue().length) {
+      e.preventDefault();
+      playSelectedAudio();
+      return;
+    }
   }
   // Voice note keyboard: Space to record/send, Escape to cancel
   const ae=document.activeElement;
@@ -3899,3 +4396,5 @@ chat.addEventListener("contextmenu",(e)=>{
 
 
 init();
+// Render persisted file-attachment tray on load (if any survived from a prior session)
+try { renderSelectedTray(); } catch {}

@@ -328,6 +328,51 @@ setTimeout(() => {
   }
 }, 5000);
 
+// ---- Periodic stalled-session janitor ----
+// Catches sessions stranded by hard-kill (SIGKILL of the parent server, OOM, etc.)
+// where the per-process onClose handler never fired. The startup recovery only
+// retries sessions whose last message is "user"; this one closes the gap for
+// sessions whose last message is mid-tool (tool_activity / tool_result /
+// permission_granted) with no live subprocess and no recent activity.
+const STALLED_SWEEP_INTERVAL_MS = 5 * 60 * 1000;   // every 5 min
+const STALLED_AGE_THRESHOLD_MS  = 5 * 60 * 1000;   // last activity > 5 min ago
+const _STALLED_STUCK_ROLES = new Set(["tool_activity", "tool_result", "permission_granted"]);
+
+function sweepStalledSessions() {
+  try {
+    const sessions = loadSessions();
+    if (!sessions || !sessions.length) return;
+    // Build the "sessions with an active subprocess" set by walking live WS clients.
+    const liveSessionIds = new Set();
+    for (const c of wss.clients) {
+      if (c.readyState === 1 && c._activeProcRef && c._activeProcRef.proc) {
+        if (c._llmSessionId) liveSessionIds.add(c._llmSessionId);
+      }
+    }
+    const now = Date.now();
+    let marked = 0;
+    for (const s of sessions) {
+      if (liveSessionIds.has(s.id)) continue;
+      const msgs = loadMessages(s.id);
+      if (!msgs.length) continue;
+      const last = msgs[msgs.length - 1];
+      if (!last || !_STALLED_STUCK_ROLES.has(last.role)) continue;
+      if (!last.ts || now - last.ts < STALLED_AGE_THRESHOLD_MS) continue;
+      const note = "⚠️ The agent stopped mid-run and was reaped by the stalled-session sweeper. Re-prompt to continue.";
+      saveMessage(s.id, { role: "assistant", text: note, ts: now, recovered: true, stalled: true });
+      try { broadcastToSession(s.id, { type: "history", messages: loadMessages(s.id) }); } catch {}
+      console.log("[stalled-sweep] marked stalled:", s.id, "(last role:", last.role + ", age:", Math.round((now - last.ts) / 1000) + "s)");
+      marked++;
+    }
+    if (marked > 0) console.log("[stalled-sweep] marked", marked, "stalled session(s)");
+  } catch (e) {
+    console.error("[stalled-sweep] error:", e.message);
+  }
+}
+
+setTimeout(sweepStalledSessions, 60 * 1000); // first sweep 60s after boot (after startup-recovery has run)
+setInterval(sweepStalledSessions, STALLED_SWEEP_INTERVAL_MS).unref();
+
 // ---- Gmail Pub/Sub Webhook (replaces 5-min polling timer) ----
 const GMAIL_POLLER_SCRIPT = path.join(__dirname, "scripts", "gmail-reply-poller.py");
 let _gmailPollerRunning = false;
@@ -660,6 +705,229 @@ app.delete("/api/models", (_req, res) => {
   _modelsCache = null;
   _modelsCacheTs = 0;
   res.json({ cleared: true });
+});
+// ---- File attribution log ----
+// Sidecar append-only JSONL tracking which session wrote which file. Written
+// synchronously at tool_result success time — independent of messages.db
+// persistence (which can die on server kill) and the orchestratorHero previews
+// DB (which depends on an HTTP roundtrip that can fail silently). This log is
+// the authoritative answer to "which chat made this file?" for the drawer.
+//
+// Format (one per line): {"path":"/abs/path","session_id":"...","tool":"Write|Edit|Bash|...","ts":<ms>}
+const FILE_ATTRIBUTION_LOG = path.join(DATA_DIR, "file_attribution.jsonl");
+
+function logFileAttribution(filePath, sessionId, tool) {
+  if (!filePath || !sessionId) return;
+  try {
+    const line = JSON.stringify({ path: filePath, session_id: sessionId, tool: tool || "", ts: Date.now() }) + "\n";
+    fs.appendFileSync(FILE_ATTRIBUTION_LOG, line);
+  } catch (e) { console.error("[file-attr] append failed:", e.message); }
+}
+
+// Build the unified attribution map by merging three sources, last-write-wins by ts.
+// Called per /api/drawer-files request; the work is bounded (one full pass of
+// tool_activity rows + one JSONL read) and small enough not to need caching.
+function buildAttributionMap() {
+  const m = new Map(); // filePath -> { sessionId, ts, source }
+  // (1) tool_activity Write/Edit/MultiEdit/NotebookEdit rows in messages.db.
+  //     summary field for these tools is exactly the file_path.
+  try {
+    const rows = db.prepare("SELECT session_id, ts, data FROM messages WHERE role = 'tool_activity'").all();
+    for (const r of rows) {
+      let d; try { d = JSON.parse(r.data); } catch { continue; }
+      const tn = d.tool_name;
+      if (tn !== "Write" && tn !== "Edit" && tn !== "MultiEdit" && tn !== "NotebookEdit") continue;
+      const fp = (d.summary || "").trim();
+      if (!fp.startsWith("/")) continue;
+      const existing = m.get(fp);
+      if (!existing || r.ts > existing.ts) m.set(fp, { sessionId: r.session_id, ts: r.ts, source: "tool_activity" });
+    }
+  } catch (e) { console.error("[file-attr] tool_activity scan failed:", e.message); }
+  // (2) The sidecar JSONL — last-write-wins overrides DB when present (more recent).
+  try {
+    if (fs.existsSync(FILE_ATTRIBUTION_LOG)) {
+      const txt = fs.readFileSync(FILE_ATTRIBUTION_LOG, "utf8");
+      for (const line of txt.split("\n")) {
+        if (!line) continue;
+        let r; try { r = JSON.parse(line); } catch { continue; }
+        if (!r.path || !r.session_id) continue;
+        const ts = r.ts || 0;
+        const existing = m.get(r.path);
+        if (!existing || ts >= existing.ts) m.set(r.path, { sessionId: r.session_id, ts, source: "jsonl" });
+      }
+    }
+  } catch (e) { console.error("[file-attr] log read failed:", e.message); }
+  return m;
+}
+
+// ---- /api/drawer-files ----
+// Filesystem-derived view of files relevant to a session (or all sessions in a project).
+// This is the source of truth for the drawer's file pins — it lists files that ACTUALLY
+// EXIST under the session's project dir AND were created/modified during the session's
+// active lifetime. No stale pins (file deleted → not in result); no missing pins (file
+// created → in result); no cross-project leaks (file outside project dir → not in result).
+//
+// Inputs: ?session_id=X  OR  ?project=X
+// Output: { files: [{ path, title, mtime_ms, ext, source_session_id, source_session_title }] }
+//
+// The DB (orchestratorHero /api/previews) is still consulted for agent-set labels and
+// non-file previews (emails / documents) — those are merged client-side.
+const DRAWER_EXT_WHITELIST = new Set([
+  ".mp3",".wav",".m4a",".ogg",".webm",".aac",".flac",".opus",  // audio
+  ".mp4",".mov",".webm",                                        // video
+  ".pdf",".png",".jpg",".jpeg",".gif",".svg",                   // images / docs
+  ".html",".htm",".md",".csv",".txt",".json",".yaml",".yml",    // text
+  ".py",".js",".ts",".svelte",".sh",                            // code
+]);
+const DRAWER_EXCLUDED_DIRS = new Set([
+  "node_modules","venv","__pycache__",".svelte-kit",".git",".next","dist","build",
+  ".pytest_cache","image_cache","tts-cache",".cache",".npm",".local","previews",
+  "snapshots","backup","backups",".tmp","tmp","__snapshots__",".bak",
+]);
+const DRAWER_TIME_BUFFER_MS = 2 * 60 * 1000; // still used as a small buffer for voice-note timestamp matching
+const DRAWER_RESULT_CAP = 200;
+
+// Walk a project dir and collect ALL candidate files matching ext/exclude rules.
+// No time-window filtering — attribution decides membership downstream.
+function _drawerWalkProjectFull(projectDir) {
+  const out = [];
+  const stack = [projectDir];
+  while (stack.length && out.length < DRAWER_RESULT_CAP * 8) {
+    const dir = stack.pop();
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+    for (const ent of entries) {
+      if (ent.name.startsWith(".") && ent.name !== ".env") continue;
+      const full = path.join(dir, ent.name);
+      if (ent.isDirectory()) {
+        if (DRAWER_EXCLUDED_DIRS.has(ent.name)) continue;
+        stack.push(full);
+        continue;
+      }
+      if (!ent.isFile()) continue;
+      const ext = path.extname(ent.name).toLowerCase();
+      if (!DRAWER_EXT_WHITELIST.has(ext)) continue;
+      let stat;
+      try { stat = fs.statSync(full); } catch { continue; }
+      out.push({ path: full, ext, mtime_ms: stat.mtimeMs, size: stat.size });
+    }
+  }
+  return out;
+}
+
+app.get("/api/drawer-files", (req, res) => {
+  const session_id = req.query.session_id || "";
+  const project = req.query.project || "";
+  if (!session_id && !project) return res.json({ files: [] });
+
+  const all = loadSessions();
+  let targets = [];
+  if (session_id) targets = all.filter(s => s.id === session_id);
+  else if (project) targets = all.filter(s => s.project === project);
+  if (!targets.length) return res.json({ files: [] });
+
+  const targetIds = new Set(targets.map(s => s.id));
+  const projectsToWalk = new Set(targets.map(s => s.project).filter(Boolean));
+  const allSessionsById = new Map(all.map(s => [s.id, s]));
+
+  // Attribution sources (1) tool_activity rows (2) sidecar JSONL log
+  const attribution = buildAttributionMap();
+
+  // Chat-scope (session_id query) requires POSITIVE attribution — the file
+  // must have a record in tool_activity or the JSONL log linking it to this
+  // session. Project-scope (project query) shows every file in the project
+  // dir, attributed where possible and unattributed where not.
+  const isProjectScope = !!project;
+
+  const fileMap = new Map();
+
+  for (const proj of projectsToWalk) {
+    const projDir = path.join(PROJECTS_DIR, proj);
+    if (!fs.existsSync(projDir)) continue;
+    const allFsFiles = _drawerWalkProjectFull(projDir);
+    for (const f of allFsFiles) {
+      const attr = attribution.get(f.path);
+      const owner = attr ? attr.sessionId : null;
+      if (isProjectScope) {
+        // Project view: include all files. If attributed and attribution maps
+        // to a session OUTSIDE this project, that's a stale record — show the
+        // file but mark unattributed.
+        const ownerIsInProject = owner && allSessionsById.get(owner)?.project === proj;
+        fileMap.set(f.path, {
+          path: f.path,
+          ext: f.ext,
+          mtime_ms: f.mtime_ms,
+          size: f.size,
+          title: path.basename(f.path),
+          source_session_id: ownerIsInProject ? owner : null,
+          source_session_title: ownerIsInProject ? (allSessionsById.get(owner)?.title || "") : "",
+          attributed_by: ownerIsInProject ? attr.source : null,
+        });
+      } else {
+        // Chat scope: strict — file must be attributed to one of the target sessions.
+        if (!owner || !targetIds.has(owner)) continue;
+        const sess = allSessionsById.get(owner);
+        fileMap.set(f.path, {
+          path: f.path,
+          ext: f.ext,
+          mtime_ms: f.mtime_ms,
+          size: f.size,
+          title: path.basename(f.path),
+          source_session_id: owner,
+          source_session_title: sess?.title || "",
+          attributed_by: attr.source,
+        });
+      }
+    }
+  }
+
+  // Voice notes: still matched by filename timestamp to a session's window —
+  // they live outside the project dir and the agent doesn't write them, the
+  // /voice-note endpoint does. The JSONL log can supplement this in future
+  // (the endpoint can call logFileAttribution at write time).
+  try {
+    const vnDir = path.join(DATA_DIR, "voice-notes");
+    if (fs.existsSync(vnDir)) {
+      for (const fname of fs.readdirSync(vnDir)) {
+        const m = fname.match(/^vn_(\d+)_/);
+        if (!m) continue;
+        const vnTs = parseInt(m[1], 10);
+        const full = path.join(vnDir, fname);
+        // Primary: JSONL attribution if present
+        let owner = attribution.get(full)?.sessionId || null;
+        // Fallback: filename ts matched against any TARGET session's window
+        if (!owner) {
+          for (const sess of targets) {
+            const ws = sess.created || 0;
+            const we = sess.lastActive || Date.now();
+            if (vnTs >= ws - DRAWER_TIME_BUFFER_MS && vnTs <= we + DRAWER_TIME_BUFFER_MS) {
+              owner = sess.id;
+              break;
+            }
+          }
+        }
+        if (!owner || !targetIds.has(owner)) continue;
+        try {
+          const stat = fs.statSync(full);
+          const sess = allSessionsById.get(owner);
+          fileMap.set(full, {
+            path: full,
+            ext: path.extname(fname).toLowerCase(),
+            mtime_ms: vnTs,
+            size: stat.size,
+            title: fname,
+            source_session_id: owner,
+            source_session_title: sess?.title || "",
+            kind: "voice",
+            attributed_by: attribution.get(full) ? "jsonl" : "filename-ts",
+          });
+        } catch {}
+      }
+    }
+  } catch (e) { console.error("[drawer-files] voice-note scan failed:", e.message); }
+
+  const arr = [...fileMap.values()].sort((a, b) => b.mtime_ms - a.mtime_ms).slice(0, DRAWER_RESULT_CAP);
+  res.json({ files: arr });
 });
 
 const ARCHIVE_INACTIVE_DAYS = 30;
@@ -1235,6 +1503,53 @@ app.post("/tts", async (req, res) => {
 
 // ---- Voice note upload + Whisper transcription ----
 const VOICE_DIR = path.join(DATA_DIR, "voice-notes");
+
+// ---- Voice-note nonces (per-WS short-lived capability tokens) ----
+// Each live WebSocket gets a nonce that proves "this voice-note POST is coming
+// from the WS that is currently open for this session." When the WS closes, the
+// nonce dies. This prevents a phone with a stale session id in memory from
+// shipping voice notes to a real-but-no-longer-active chat.
+//
+// Map: nonce (32-hex string) -> { sessionId, ws, createdAt }
+const voiceNonces = new Map();
+const VOICE_NONCE_TTL_MS = 30 * 60 * 1000; // 30 min safety net; primary kill is ws.close
+
+function issueVoiceNonce(sessionId, ws) {
+  const nonce = crypto.randomBytes(16).toString("hex");
+  voiceNonces.set(nonce, { sessionId, ws, createdAt: Date.now() });
+  return nonce;
+}
+
+function resolveVoiceNonce(nonce) {
+  if (!nonce) return null;
+  const entry = voiceNonces.get(nonce);
+  if (!entry) return null;
+  if (Date.now() - entry.createdAt > VOICE_NONCE_TTL_MS) {
+    voiceNonces.delete(nonce);
+    return null;
+  }
+  // WS may be readyState 1 (OPEN), 2 (CLOSING), or 3 (CLOSED). Only 1 is valid.
+  if (entry.ws && entry.ws.readyState !== 1) {
+    voiceNonces.delete(nonce);
+    return null;
+  }
+  return entry;
+}
+
+function revokeNoncesForWs(ws) {
+  for (const [k, v] of voiceNonces) {
+    if (v.ws === ws) voiceNonces.delete(k);
+  }
+}
+
+// Periodic sweep — defensive, in case a ws close handler ever fails to fire.
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of voiceNonces) {
+    if (now - v.createdAt > VOICE_NONCE_TTL_MS) voiceNonces.delete(k);
+    else if (v.ws && v.ws.readyState !== 1) voiceNonces.delete(k);
+  }
+}, 5 * 60 * 1000).unref();
 const QUEUE_DIR = path.join(DATA_DIR, "queue");
 fs.mkdirSync(QUEUE_DIR, { recursive: true });
 
@@ -1364,6 +1679,31 @@ Respond as JSON: {"type":"reply"} or {"type":"idea","title":"...","description":
 app.post("/voice-note", express.raw({ type: ["audio/*", "application/octet-stream"], limit: "25mb" }), async (req, res) => {
   try {
     if (!req.body || req.body.length === 0) return res.status(400).json({ error: "no audio data" });
+    // Resolve the routing target UP FRONT, before saving audio or burning Whisper
+    // credits. An invalid nonce / missing session should fail fast.
+    const _nonce = (req.query && req.query.nonce) || "";
+    const _sidParam = (req.query && req.query.session) || "";
+    let _routedSid = "";
+    let _routingMode = "";
+    if (_nonce) {
+      const resolved = resolveVoiceNonce(_nonce);
+      if (!resolved) {
+        console.warn(`[voice-note] REJECTED before save — nonce=${_nonce.slice(0,8)}… expired or WS closed`);
+        return res.status(401).json({ error: "voice nonce invalid — the chat session may have closed. Refresh the chat and try again.", stale_nonce: true });
+      }
+      _routedSid = resolved.sessionId;
+      _routingMode = "nonce";
+    } else if (_sidParam) {
+      const allSessions = loadSessions();
+      if (!allSessions.some(s => s.id === _sidParam)) {
+        console.warn(`[voice-note] REJECTED before save — ghost session_id=${_sidParam.slice(0,8)}…`);
+        return res.status(404).json({ error: "session_id not found — voice note not routed. Refresh the chat and try again.", ghost_session_id: _sidParam });
+      }
+      console.warn(`[voice-note] DEPRECATED: bare ?session=${_sidParam.slice(0,8)}… without nonce. Client is on old code.`);
+      _routedSid = _sidParam;
+      _routingMode = "legacy-session";
+    }
+    // (no routing target = drop-and-transcribe-only; allowed for compatibility)
     const ct = (req.headers["content-type"] || "").toLowerCase();
     const ext = ct.includes("webm") ? ".webm"
               : ct.includes("mp4") || ct.includes("m4a") || ct.includes("aac") || ct.includes("x-m4a") ? ".m4a"
@@ -1408,16 +1748,20 @@ app.post("/voice-note", express.raw({ type: ["audio/*", "application/octet-strea
     // If sessionId provided, write the transcript directly to that session's persistent queue.
     // This guarantees the prompt is recorded server-side even if the client crashes / refreshes
     // before sending it.
-    const sid = (req.query && req.query.session) || "";
-    if (sid && result.text) {
-      queueAppend(sid, { text: result.text, source: "voice-note", audioUrl: "/voice-notes/" + name });
+    // Routing target was resolved up front (_routedSid: WS-bound nonce, or legacy ?session=).
+    if (_routedSid && result.text) {
+      console.log(`[voice-note] routing to session=${_routedSid.slice(0,8)}… (mode=${_routingMode})`);
+      queueAppend(_routedSid, { text: result.text, source: "voice-note", audioUrl: "/voice-notes/" + name });
       // Show the pending voice-note bubble to every client on this session.
       // (If drain fires immediately, that broadcast will overwrite this with the
       // post-pop state.)
-      try { broadcastQueueState(sid); } catch {}
+      try { broadcastQueueState(_routedSid); } catch {}
       // Try to drain immediately if the session isn't currently running anything
-      try { tryDrainQueue(sid); } catch (e) { console.error("[queue] drain attempt failed:", e.message); }
+      try { tryDrainQueue(_routedSid); } catch (e) { console.error("[queue] drain attempt failed:", e.message); }
+      // Robust attribution: link the saved audio file to the session in the sidecar log
+      logFileAttribution(filePath, _routedSid, "voice-note");
     }
+    const sid = _routedSid; // for downstream classifyAndCapture()
     // Generate a short title from the transcript
     let title = "";
     const transcript = result.text || "";
@@ -1989,11 +2333,16 @@ function autoCreatePreview({ tool_name, input }, sessionId) {
     const title = path.basename(filePath);
     const mapKey = sessionId + ":" + filePath;
     const existingId = previewMap[mapKey];
+    // Carry the source project so the drawer's "Project" toggle can aggregate
+    // across sibling chats. Failing to resolve project is non-fatal — preview
+    // still lands under session_id (chat-scoped view still works).
+    const _proj = (loadSessions().find(s => s.id === sessionId) || {}).project || null;
     const body = JSON.stringify({
       type: "file",
       title,
       content: { body_text: content },
       session_id: sessionId,
+      project: _proj,
     });
     // PUT to update if we already created a preview for this file, else POST
     const method = existingId ? "PUT" : "POST";
@@ -2062,6 +2411,12 @@ function autoDetectBashFiles(stdout, sessionId, cwd) {
   }
   for (const filePath of found) {
     if (!fs.existsSync(filePath)) continue;
+    // Cross-project leak guard: only pin a file if it lives under the session's
+    // own project dir. A crankHero chat that happens to see langHero file paths
+    // in Bash output does NOT pin them. "Files MADE in this chat" per David's model.
+    if (cwd && cwd.startsWith('/home/claude-user/projects/') && !filePath.startsWith(cwd)) continue;
+    // Robust attribution: log immediately, before any HTTP work that can fail.
+    logFileAttribution(filePath, sessionId, 'Bash');
     const mapKey = sessionId + ':' + filePath;
     if (previewMap[mapKey]) continue;
     const ext = path.extname(filePath).toLowerCase();
@@ -2073,7 +2428,8 @@ function autoDetectBashFiles(stdout, sessionId, cwd) {
       try { bodyText = fs.readFileSync(filePath, 'utf8'); } catch { continue; }
     }
     const title = path.basename(filePath);
-    const body = JSON.stringify({ type: 'file', title, content: { body_text: bodyText }, session_id: sessionId });
+    const _proj = (loadSessions().find(s => s.id === sessionId) || {}).project || null;
+    const body = JSON.stringify({ type: 'file', title, content: { body_text: bodyText }, session_id: sessionId, project: _proj });
     const req = http.request({
       hostname: '127.0.0.1', port: 8000, path: '/api/previews', method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
@@ -2371,6 +2727,49 @@ ${lines}`;
   }
 }
 
+// ── File-attribution reconciler (supervisor-pattern observer #4) ──
+// After each agent run, walk the project dir for files modified during the run
+// (mtime >= runStartTs) that have no positive attribution. Attribute them to
+// the session that just ran. Catches files created by async subprocesses
+// (Python scripts, etc.) whose paths never appeared in tool_use stdout/cmd.
+// This is the "supervisor catches what fell through the cracks" pattern —
+// programmatic enforcement of the file-attribution contract.
+function reconcileFileAttribution(sessionId, projectName, runStartTs) {
+  try {
+    if (!sessionId || !projectName) return;
+    const projDir = path.join(PROJECTS_DIR, projectName);
+    if (!fs.existsSync(projDir)) return;
+    const existing = buildAttributionMap();
+    let added = 0;
+    const stack = [projDir];
+    while (stack.length && added < 500) {
+      const dir = stack.pop();
+      let entries;
+      try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+      for (const ent of entries) {
+        if (ent.name.startsWith(".") && ent.name !== ".env") continue;
+        const full = path.join(dir, ent.name);
+        if (ent.isDirectory()) {
+          if (DRAWER_EXCLUDED_DIRS.has(ent.name)) continue;
+          stack.push(full);
+          continue;
+        }
+        if (!ent.isFile()) continue;
+        const ext = path.extname(ent.name).toLowerCase();
+        if (!DRAWER_EXT_WHITELIST.has(ext)) continue;
+        let stat; try { stat = fs.statSync(full); } catch { continue; }
+        if (stat.mtimeMs < runStartTs) continue;       // not from this run
+        if (existing.has(full)) continue;              // already attributed
+        logFileAttribution(full, sessionId, "post-run-reconcile");
+        added++;
+      }
+    }
+    if (added > 0) console.log("[file-reconcile]", sessionId, "→ attributed", added, "unreported file(s)");
+  } catch (e) {
+    console.error("[file-reconcile] error:", e.message);
+  }
+}
+
 // ─── Contract-check supervisor (set + clear manualDone) ───────────────────
 // Fires after each assistant reply. Haiku judges whether the discrete task
 // the user asked for has wrapped up. Two-way arbiter:
@@ -2381,6 +2780,10 @@ ${lines}`;
 // This is the sole automated source of truth for "task complete." We do NOT
 // auto-clear manualDone on user typing alone (that wiped legitimate verdicts);
 // the contract-check is the only thing allowed to flip the bit programmatically.
+//
+// NOTE: the file-pin half of the contract is enforced in real-time by
+// autoCreatePreview + autoDetectBashFiles + the filesystem-derived drawer;
+// reconcileFileAttribution() above catches the stragglers post-run.
 const _contractCheckLastRun = {};
 const CONTRACT_CHECK_COOLDOWN_MS = 30 * 1000;       // 30s — short, re-judges quickly after follow-ups
 const CONTRACT_CHECK_MIN_MESSAGES = 4;
@@ -2400,6 +2803,10 @@ function spawnContractCheck(sessionId, projectName) {
     const all = loadMessages(sessionId);
     if (all.length < CONTRACT_CHECK_MIN_MESSAGES) return;
     const recent = all.slice(-20);
+
+    // Quick prefilter: skip if the last message isn't from the assistant, or if
+    // the assistant is clearly mid-conversation (ends with a question mark, ends
+    // with a request for input). Saves Haiku calls on obvious not-done states.
     const last = recent[recent.length - 1];
     if (!last || last.role !== "assistant") return;
     const lastText = String(last.text || "").trim();
@@ -3410,10 +3817,11 @@ function runClaude({ project, prompt, claudeSessionId, cwd, extraAllowedTools, m
   // and persisted in sessions.json. Aliases (opus/sonnet/haiku) and full
   // names (claude-sonnet-4-6 etc.) both work — claude CLI handles either.
   // Validate to a small allowlist so no surprise CLI flags slip through.
+  // DEFAULT: claude-opus-4-7 (David: "highest effort and highest model" — every
+  // chat starts on opus unless explicitly downgraded via the model dropdown).
   const ALLOWED_MODEL_RE = /^[a-z][a-z0-9.-]{1,80}$/;
-  if (model && ALLOWED_MODEL_RE.test(model)) {
-    args.push("--model", model);
-  }
+  const chosenModel = (model && ALLOWED_MODEL_RE.test(model)) ? model : "claude-opus-4-7";
+  args.push("--model", chosenModel);
   if (claudeSessionId) {
     args.push("--resume", claudeSessionId);
   }
@@ -3426,9 +3834,11 @@ function runClaude({ project, prompt, claudeSessionId, cwd, extraAllowedTools, m
   if (project === "camoHero") console.log("[sandbox] spawning camoHero in bwrap");
   console.log("[claude] spawn session=" + (sessionId||"?").slice(0,8) + " model=" + (model || "<default>") + " effort=" + (_applyEffort ? _effort : "n/a-haiku"));
   const childEnv = { HOME: "/home/claude-user", TERM: "dumb", LANG: "en_US.UTF-8", PATH: process.env.PATH };
-  // LLMT_SESSION_ID is read by the llmterminal MCP server so its tools
-  // (llmt_show_file, llmt_complete) know which session to update.
+  // LLMT_SESSION_ID + LLMT_PROJECT_NAME are read by the llmterminal MCP server
+  // so its tools (llmt_show_file, llmt_complete) know which session to update
+  // and can enforce project-level isolation for file previews.
   if (sessionId) childEnv.LLMT_SESSION_ID = sessionId;
+  if (project) childEnv.LLMT_PROJECT_NAME = project;
   const proc = spawn(_wrap.cmd, _wrap.args, {
     cwd,
     env: childEnv,
@@ -3502,7 +3912,30 @@ wss.on("connection", (ws, req) => {
   ws._llmSession = session;      // in-memory reference so out-of-closure code (tryDrainQueue) can reach pending sessions
   ensurePermissionsLoaded(session.id);
 
-  ws.send(JSON.stringify({ type: "session", session }));
+  // Wrap ws.send so every outgoing message carries this connection's session_id.
+  // The frontend uses this to reject any message arriving on a stale WS — even if
+  // _detachWs() forgot to null the handlers, the message can't render in the
+  // wrong chat's view. Defense in depth at the protocol level.
+  const _origSend = ws.send.bind(ws);
+  ws.send = function(data) {
+    try {
+      if (typeof data === "string" && data.charCodeAt(0) === 123) { // starts with "{"
+        const obj = JSON.parse(data);
+        if (obj && typeof obj === "object" && obj.session_id === undefined) {
+          obj.session_id = ws._llmSessionId;
+          data = JSON.stringify(obj);
+        }
+      }
+    } catch {}
+    return _origSend(data);
+  };
+
+  // Issue a voice-note nonce tied to this WS. The frontend uses this on
+  // /voice-note POSTs so the upload proves it's coming from the currently-open
+  // WS, not just any client that knows a session id.
+  const voiceNonce = issueVoiceNonce(session.id, ws);
+  ws._voiceNonce = voiceNonce; // for cleanup
+  ws.send(JSON.stringify({ type: "session", session, voiceNonce }));
 
   // Send recent messages on connect (last 20), with total count for lazy
   // loading. We ALWAYS also include earlier `email_draft` and `question` rows
@@ -3577,6 +4010,10 @@ wss.on("connection", (ws, req) => {
     // Closes the race where empty `data.result` could trigger the synthetic
     // closing marker even after the user already saw streamed text.
     let _assistantTextEmittedThisTurn = false;
+    // Capture the run-start time so the post-run reconciliation pass can spot
+    // any in-project files modified during this run that didn't get attribution
+    // through the live tool_use stream (Python subprocess writes, async edits).
+    const runStartTs = Date.now();
     const _provider = getProvider(session.model);
     session.provider = _provider;
     if (_provider === "claude") killExistingClaudeFor(session.claudeSessionId);
@@ -3649,14 +4086,11 @@ wss.on("connection", (ws, req) => {
                 if (block.name === "Bash") {
                   pendingPreviews[block.id] = { tool_name: "Bash", input: block.input };
                 }
-                // Read on a project-dir file: register a preview immediately from
-                // the tool_use input. Read's tool_result returns the file CONTENT,
-                // not the path, so the existing tool_result path-scan misses it.
-                // Reusing autoDetectBashFiles handles binary files (PDF/PNG) correctly.
-                if (block.name === "Read" && typeof block.input?.file_path === "string"
-                    && block.input.file_path.startsWith("/home/claude-user/projects/")) {
-                  autoDetectBashFiles(block.input.file_path, session.id, path.join(PROJECTS_DIR, session.project));
-                }
+                // NOTE: previously we pinned files on Read too, but per David's model
+                // the chat drawer should only contain files MADE IN this chat (Write/Edit
+                // outputs, voice notes recorded here). Reading a file for context does
+                // not mean it belongs to this chat — that just leaked cross-project
+                // files. Pinning on Read disabled intentionally.
                 // Track draft_email so we forward the result as a special message
                 if (block.name === "mcp__crankhero-draft__draft_email") {
                   pendingDrafts.add(block.id);
@@ -3697,9 +4131,20 @@ wss.on("connection", (ws, req) => {
               if (!block.is_error) {
                 if (pending.tool_name === "Bash") {
                   const stdout = Array.isArray(block.content) ? (block.content[0]?.text || "") : String(block.content || "");
-                  autoDetectBashFiles(stdout, session.id, path.join(PROJECTS_DIR, session.project));
+                  const projCwd = path.join(PROJECTS_DIR, session.project);
+                  autoDetectBashFiles(stdout, session.id, projCwd);
+                  // ALSO scan the Bash command string itself for files this command created.
+                  // Catches `curl -s ... > path.mp3`, `curl -o path`, `cp x y`, `ffmpeg ... out.mp3`
+                  // patterns where the file path never appears in stdout (silent or piped writes).
+                  const cmd = pending.input?.command || "";
+                  if (cmd) autoDetectBashFiles(cmd, session.id, projCwd);
                 } else {
                   autoCreatePreview(pending, session.id);
+                  // Robust attribution: write to the sidecar log immediately. Independent of
+                  // autoCreatePreview's HTTP roundtrip to nh-backend (which can fail silently).
+                  if (pending.input?.file_path) {
+                    logFileAttribution(pending.input.file_path, session.id, pending.tool_name);
+                  }
                 }
               }
             }
@@ -3778,6 +4223,10 @@ wss.on("connection", (ws, req) => {
           // setTimeout(() => { try { spawnObserver(session.id, session.project); } catch (e) { console.error("[observer] hook failed:", e.message); } }, 500);
           setTimeout(() => { try { spawnDecisionExtractor(session.id, session.project); } catch (e) { console.error("[decision-extractor] hook failed:", e.message); } }, 800);
           setTimeout(() => { try { spawnContractCheck(session.id, session.project); } catch (e) { console.error("[contract-check] hook failed:", e.message); } }, 1100);
+          // File-attribution reconcile — runs FAST (synchronous filesystem walk),
+          // fires immediately so unattributed files from this run get linked before
+          // the user opens the drawer.
+          try { reconcileFileAttribution(session.id, session.project, runStartTs); } catch (e) { console.error("[file-reconcile] hook failed:", e.message); }
           if (!session.claudeSessionId && data.session_id) {
             session.claudeSessionId = data.session_id;
             updateSessionInStore(session);
@@ -4132,6 +4581,7 @@ wss.on("connection", (ws, req) => {
 
   ws.on("close", () => {
     clearInterval(pingInterval);
+    revokeNoncesForWs(ws);
     // Don't kill the process on disconnect - let it finish
     console.log("Client disconnected:", session.id);
   });
