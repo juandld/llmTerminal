@@ -183,11 +183,14 @@ registered in `projects.json`).
 
 - **llmTerminal = the cockpit** (the command surface), not the orchestrator. The
   `Terminal` tab of hero.camofiles.app; the rest of that app is orchestratorHero.
-- **Backend** `web/server.js` → being decomposed into `web/src/` modules:
-  `paths` (path SSOT), `store` (sqlite + sessions = persistence SSOT), `models`
-  (model catalog SSOT), `auth`, `providers/{context,openai,google,…}`,
-  `ws/broadcast`, `queue`, `permissions`, `priority`, `proc-state`, `gmail`,
-  `routes/*`, `mcp/*`.
+- **Backend** `web/server.js` (4167 -> ~1233 ln) = bootstrap + HTTP routes. The
+  rest is `web/src/`: `paths`/`store`/`models`/`permissions`/`proc-state` (SSOTs+state),
+  `providers/{context,claude,openai,google}` (the worker runners),
+  `supervisors` (the §4 per-agent watchers), `ws/{broadcast,connection}` (the core
+  message loop), `cheap-model`, `session-title`, `bwrap` (sandbox leaf), `tools`,
+  `attribution`, `voice-nonce`, `queue`, `uploads`, `gmail`, `priority`, `auth`,
+  `routes/*`, `mcp/*`. ~27 modules; the whole run-loop is modular + e2e-validated.
+  *Remaining: the 30 HTTP routes still inline in server.js — clean follow-up.*
 - **Frontend** `web/public/app.js` → decomposed into `app-*.js` classic scripts
   sharing global scope (cache-busted; **not** ES modules — internal imports would
   break the mobile cache-bust).

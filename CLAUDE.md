@@ -1,5 +1,9 @@
 # llmTerminal — Agent Instructions
 
+> **See `ARCHITECTURE.md` for the north star + the current module map.** As of
+> 2026-06-11 server.js (4167->~1233 ln) and app.js (4401->472 ln) are decomposed
+> into `web/src/` and `web/public/app-*.js` modules; line numbers below may be stale.
+
 You are working on the web chat infrastructure (`web/`) that runs your own UI at `https://hero.camofiles.app/terminal/`. Be careful: a sloppy restart drops every active chat tab, including the one you're talking to David in. Read this before touching code or services.
 
 ## Restart rules — **read this first if you change `web/`**
@@ -55,8 +59,10 @@ The `_assistantTextEmittedThisTurn` flag is flipped whenever ANY streamed text b
 
 ## Project layout (quick map)
 
-- `web/server.js` — Express + WebSocket backend, spawns claude/openai/gemini subprocesses
-- `web/public/app.js` — single-file frontend
+- `web/server.js` — bootstrap + HTTP routes only now; the run-loop, WS handler,
+  providers, supervisors, store, etc. live in `web/src/*` (see ARCHITECTURE.md §6)
+- `web/public/app.js` + `app-*.js` — frontend, decomposed into classic-script
+  modules (NOT ES modules — preserves the path cache-bust). See ARCHITECTURE.md §6
 - `web/public/app-email-draft.js` — email draft action card rendering (loaded after app.js)
 - `web/public/styles.css` — all CSS
 - `web/public/index.html` — single page
