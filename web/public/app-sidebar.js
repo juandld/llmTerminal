@@ -285,10 +285,3 @@ function renderDoneSection(items) {
   };
   sbList.appendChild(wrap);
 }
-
-
-// Detach ALL handlers from a WebSocket before closing so in-flight messages
-// can't race into the next session's view. Without this, a message arriving
-// on the old socket after we've already switched `session` global runs the
-// onmessage handler against the new session — and renders old content in
-// the new chat. ("Voice note from another chat populated my new chat" bug.)
