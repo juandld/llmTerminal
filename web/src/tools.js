@@ -1,5 +1,6 @@
 // Tool-result helpers: summarize a tool call for the UI, auto-create file
 // previews, detect files touched by bash. Extracted (refactor 2026-06-10).
+const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const { loadSessions } = require("./store");

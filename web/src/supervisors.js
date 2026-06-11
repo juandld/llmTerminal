@@ -2,6 +2,7 @@
 // ARCHITECTURE.md §4). spawnObserver mines what the run did; spawnDecisionExtractor
 // records decisions; spawnContractCheck verifies the run actually finished;
 // reconcileFileAttribution settles which files it touched. Extracted 2026-06-10.
+const http = require("http");
 const path = require("path");
 const fs = require("fs");
 const { PROJECTS_DIR } = require("./paths");
