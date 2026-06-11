@@ -66,6 +66,30 @@ So the shadow can run aggressively — worst case is a reversible mistake.
 
 ---
 
+## Continuity substrate: the jobs ledger  *(first brick — BUILT 2026-06-12)*
+
+The orchestrator cannot manage workers it cannot see. The foundation — built first,
+serving the operator immediately — is a **jobs ledger**: ONE substrate, two
+consumers (the operator's glass-box Jobs view AND the orchestrator's worker tracking).
+
+- **Where:** `~/.llm-terminal/jobs/<id>.json` (one file/job) + `events.jsonl`
+  (append-only state changes). Module `web/src/jobs.js`; universal CLI
+  `web/scripts/jobctl.js` — any bash/python/node task beats in (`jobctl beat <id> --done N`).
+- **Orchestrator-grade schema** (not display-only): `parent` (the §4 fan-of-workers
+  under a goal), `result_path` (merge), `last_beat`+`beat_interval_ms` (PROVABLE
+  liveness), `reversible` (the §7 gate → irreversible work becomes a pending decision).
+- **Anti-silent-hang:** a worker that stops beating flips to `stalled` (proven, not
+  guessed) and emits an event — instead of a manager hanging forever (the exact bug
+  that froze a chat 2026-06-12). The orchestrator subscribes to job events, not the
+  fragile "fire a task that re-invokes me" pattern that died mid-run at segment 225.
+- **Status:** ledger + `jobctl` + `/api/jobs` + the cockpit Jobs view (⚙ topbar,
+  live, color-coded liveness) are BUILT + deployed.
+
+Later phases ride on it: **Phase 2 (continuity engine)** = spawn each hero-advance as
+a ledger job + react to its events; **dormancy + morning results view** = queries
+over the ledger; **supervisors (§4)** = an agent-run IS a job, the observer/contract-
+check write its row → "supervisor → orchestrator" becomes "writes the row → reads it."
+
 ## Phased build (each phase ships value alone; later phases are opt-in)
 
 ### Phase 0 — Instrument the five moves *(1 sitting; read-only)*
