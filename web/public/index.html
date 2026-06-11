@@ -49,6 +49,7 @@
         <span class="win95-chev" aria-hidden="true">▼</span>
       </button>
       <button class="topbar-btn topbar-collapsible" id="tasksBtn" title="Task board" onclick="toggleTaskBoard()"><span class="btn-icon">▦</span><span class="btn-label">Tasks</span><span class="badge-count" id="tasksBadge" style="display:none">0</span></button>
+      <button class="topbar-btn topbar-collapsible" id="jobsBtn" title="Long-running jobs" onclick="toggleJobs()"><span class="btn-icon">⚙</span><span class="btn-label">Jobs</span></button>
       <button class="topbar-btn topbar-collapsible" id="decisionsBtn" title="Decision timeline / tree" onclick="toggleDecisionsDrawer()"><span class="btn-icon">⌥</span><span class="btn-label">Decisions</span><span class="badge-count" id="decisionsBadge" style="display:none">0</span></button>
       <button class="topbar-btn topbar-collapsible" id="searchBtn" title="Search (Cmd+F)" onclick="toggleChatSearch()"><span class="btn-icon">⌕</span><span class="btn-label">Search</span></button>
       <button class="topbar-btn topbar-collapsible" id="summaryBtn" title="Session summary" onclick="toggleSummary()"><span class="btn-icon">Σ</span><span class="btn-label">Summary</span></button>
@@ -90,6 +91,10 @@
         <div class="drawer-title-row"><h2>Summary</h2><button onclick="toggleSummary()">&times;</button></div>
       </div>
       <div class="summary-body" id="summaryBody"><div class="drawer-empty">Loading…</div></div>
+    </div>
+    <div class="drawer hidden" id="jobsDrawer">
+      <div class="drawer-head"><div class="drawer-title-row"><h2>Jobs</h2><button onclick="toggleJobs()">&times;</button></div></div>
+      <div id="jobsList"></div>
     </div>
     <div class="drawer hidden" id="taskBoard">
       <div class="drawer-head">
@@ -152,6 +157,7 @@
 <script src="app-render.js"></script>
 <script src="app-drawer.js"></script>
 <script src="app-tasks.js"></script>
+<script src="app-jobs.js"></script>
 <script src="app-voice.js"></script>
 <script src="app-permcards.js"></script>
 <script src="app-msg-helpers.js"></script>

@@ -1206,6 +1206,11 @@ const { spawnObserver, spawnDecisionExtractor, spawnContractCheck, reconcileFile
 const { runClaude, fireQueueHeadless, tryDrainQueue, killExistingClaudeFor } = require("./src/providers/claude");
 require("./src/ws/connection").registerWsHandlers();
 const PORT = process.env.PORT || 7683;
+// Jobs ledger — glass-box visibility + the orchestrator worker substrate (§4).
+const jobsLedger = require("./src/jobs");
+app.get("/api/jobs", (_req, res) => res.json(jobsLedger.listJobs()));
+setInterval(() => { try { jobsLedger.sweepStalled(); } catch {} }, 30000).unref();
+
 server.listen(PORT, "127.0.0.1", () => console.log("llmTerminal on port", PORT, "(127.0.0.1 only; reached via nginx/tunnel)"));
 
 // ---- Graceful shutdown ----
