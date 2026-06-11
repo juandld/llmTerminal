@@ -313,63 +313,9 @@ function spawnContractCheck(sessionId, projectName) {
       return;
     }
 
-    const lines = buildRecentTranscript(recent, { maxChars: 600 });
-    if (lines.length < 80) return;
-
-    const prompt = `You are deciding whether the agent has FINISHED its current discrete task in this chat. The user just got the assistant's most-recent reply. Output JSON ONLY:
-{"done": true|false, "reason": "short reason", "summary": "<one-line wrap-up of what was finished, ONLY if done=true, max 18 words>"}
-
-Mark done=true when ALL true:
-  - The assistant's last message is a concluding statement, not a question
-  - There is no pending action the agent could continue without user input
-  - The user's most recent ask has been substantively addressed
-  - The agent did not say it is "going to" / "about to" / "next will" do something
-
-Otherwise done=false.
-
-Conversation (NEWEST AT BOTTOM):
-${lines}`;
-
-    console.log("[contract-check] firing for", sessionId.slice(0,8), "(", recent.length, "msgs, wasDone=", wasDone, ")");
-    runCheapClaude(prompt, "contract-check", async (parsed) => {
-      const judged = !!(parsed && parsed.done === true);
-      const sessions2 = loadSessions();
-      const s2 = sessions2.find(x => x.id === sessionId);
-      if (!s2) return;
-      const msgs2 = loadMessages(sessionId);
-      const lastNow = msgs2[msgs2.length - 1];
-      // Abort if conversation moved on (a new message arrived during Haiku latency).
-      if (!lastNow || lastNow.ts !== last.ts) {
-        console.log("[contract-check]", sessionId.slice(0,8), "→ conversation moved on, aborting");
-        return;
-      }
-      if (judged) {
-        if (s2.manualDone) {
-          console.log("[contract-check]", sessionId.slice(0,8), "→ DONE (already marked, preserving)");
-          return;
-        }
-        const summary = String(parsed.summary || "").trim().slice(0, 240);
-        s2.manualDone = Date.now();
-        saveSessions(sessions2);
-        if (summary && !lastText.includes(summary.slice(0, 30))) {
-          try { saveMessage(sessionId, { role: "assistant", text: "✓ " + summary, ts: Date.now(), source: "contract_check" }); }
-          catch (e) { console.warn("[contract-check] append failed:", e.message); }
-        }
-        try { broadcastToSession(sessionId, { type: "history", messages: loadMessages(sessionId) }); } catch {}
-        console.log("[contract-check]", sessionId.slice(0,8), "→ DONE:", summary || "(no summary)");
-      } else {
-        if (s2.manualDone && s2.doneSource !== "mcp") {
-          delete s2.manualDone; delete s2.doneSource;
-          saveSessions(sessions2);
-          try { broadcastToSession(sessionId, { type: "history", messages: loadMessages(sessionId) }); } catch {}
-          console.log("[contract-check]", sessionId.slice(0,8), "→ CLEARED:", parsed?.reason || "(work resumed)");
-        } else if (s2.manualDone && s2.doneSource === "mcp") {
-          console.log("[contract-check]", sessionId.slice(0,8), "→ keeping MCP-set done (Haiku disagreed but llmt_complete takes precedence)");
-        } else {
-          console.log("[contract-check]", sessionId.slice(0,8), "→ not done:", parsed?.reason || "");
-        }
-      }
-    });
+    // [removed 2026-06-11] contract-check auto-done Haiku judge — depended on
+    // buildRecentTranscript() which was never defined in any version, so this
+    // path always threw and the feature was dead. Clarifying-question clear above is kept.
   } catch (e) {
     console.error("[contract-check] outer error:", e.message);
   }
