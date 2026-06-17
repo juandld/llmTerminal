@@ -4,8 +4,8 @@
 const path = require("path");
 const crypto = require("crypto");
 const { PROJECTS_DIR } = require("../paths");
-const { wsSend, getWss } = require("./broadcast");
-const { loadMessages, saveMessage, loadSessions, updateSessionInStore, _persistSessionIfNew } = require("../store");
+const { wsSend, getWss, broadcastToSession } = require("./broadcast");
+const { loadMessages, saveMessage, deleteMessagesByTs, loadSessions, updateSessionInStore, _persistSessionIfNew } = require("../store");
 const { getProvider } = require("../providers/context");
 const { runClaude, tryDrainQueue, killExistingClaudeFor } = require("../providers/claude");
 const { runOpenAI } = require("../providers/openai");
@@ -15,7 +15,7 @@ const { sessionPermissions, ensurePermissionsLoaded, savePermissions } = require
 const { spawnObserver, spawnDecisionExtractor, spawnContractCheck, reconcileFileAttribution } = require("../supervisors");
 const { generateSessionTitle } = require("../session-title");
 const { issueVoiceNonce, revokeNoncesForWs } = require("../voice-nonce");
-const { queueAppend, queueLoad, broadcastQueueState } = require("../queue");
+const { queueAppend, queueLoad, queueSaveAll, broadcastQueueState } = require("../queue");
 const { summarizeToolUse, autoCreatePreview, autoDetectBashFiles } = require("../tools");
 const { logFileAttribution } = require("../attribution");
 const { saveUploadedImage } = require("../uploads");
@@ -775,6 +775,64 @@ getWss().on("connection", (ws, req) => {
           saveMessage(session.id, { role: "interrupted", ts: Date.now() });
         }
         wsSend(ws, "interrupted");
+        break;
+      }
+      case "delete_message": {
+        // Delete a user message (and the assistant reply / tool blocks that
+        // belong to that turn). If the message is still queued, drop it from
+        // the queue. If it's the in-flight prompt, kill the active run first.
+        // After the delete, broadcast a fresh `history` to all clients on this
+        // session so every tab/device re-renders with the canonical state.
+        const cid = String((msg && msg.client_id) || "").trim();
+        if (!cid) { wsSend(ws, "error", { message: "delete_message requires client_id" }); break; }
+
+        // 1) Queued? Pop it and we're done.
+        const q = queueLoad(session.id);
+        const qIdx = q.findIndex(it => it && it.client_id === cid);
+        if (qIdx >= 0) {
+          q.splice(qIdx, 1);
+          queueSaveAll(session.id, q);
+          broadcastQueueState(session.id);
+          broadcastToSession(session.id, { type: "messages_deleted", client_ids: [cid] });
+          console.log("[delete] queued prompt removed", session.id, cid);
+          break;
+        }
+
+        // 2) Find the user message in saved history.
+        const all = loadMessages(session.id);
+        const idx = all.findIndex(m => m && m.role === "user" && m.client_id === cid);
+        if (idx < 0) {
+          // Already gone server-side — tell the client to drop its bubble anyway.
+          broadcastToSession(session.id, { type: "messages_deleted", client_ids: [cid] });
+          break;
+        }
+
+        // 3) The "turn" is this user msg + every non-user msg up to the next user msg.
+        let endExclusive = all.length;
+        for (let i = idx + 1; i < all.length; i++) {
+          if (all[i] && all[i].role === "user") { endExclusive = i; break; }
+        }
+        const turn = all.slice(idx, endExclusive);
+        const tsList = turn.map(m => m.ts).filter(t => Number.isFinite(t));
+
+        // 4) If this is the most recent user msg and the agent is running, kill it.
+        const isLastUser = idx === all.map(m => m.role).lastIndexOf("user");
+        const liveProc = activeProc || activeProcBySession.get(session.id);
+        if (isLastUser && liveProc) {
+          console.log("[delete] killing in-flight agent for", session.id, cid);
+          if (activeProc === liveProc) activeProc = null;
+          activeProcBySession.delete(session.id);
+          try { process.kill(-liveProc.pid, "SIGINT"); } catch { try { liveProc.kill("SIGINT"); } catch {} }
+          const _p = liveProc;
+          setTimeout(() => { try { process.kill(-_p.pid, "SIGKILL"); } catch { try { _p.kill("SIGKILL"); } catch {} } }, 2000);
+        }
+
+        // 5) Delete from store.
+        const removed = deleteMessagesByTs(session.id, tsList);
+        console.log("[delete] removed", removed, "of", tsList.length, "msgs for", session.id, cid);
+
+        // 6) Broadcast fresh history so all clients re-render the canonical state.
+        broadcastToSession(session.id, { type: "history", messages: loadMessages(session.id), offset: 0 });
         break;
       }
     }

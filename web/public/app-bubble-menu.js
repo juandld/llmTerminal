@@ -17,6 +17,14 @@ function showBubbleMenu(ev, el){
   const cBtn = mk("button","bm-btn"); cBtn.dataset.act="copy"; cBtn.textContent="\u{1F4CB} Copy text";
   const tBtn = mk("button","bm-btn"); tBtn.dataset.act="tts";  tBtn.textContent="\u{1F50A} Read aloud";
   menu.appendChild(cBtn); menu.appendChild(tBtn);
+  // Delete is offered ONLY on user bubbles that carry a client_id — that's the
+  // handle the server uses to find and remove the turn (and kill the in-flight
+  // agent if applicable). Two-tap confirm to prevent accidental long-press kills.
+  const isUserBubble = el.classList.contains("msg") && el.classList.contains("user") && el.dataset.clientId;
+  if (isUserBubble) {
+    const dBtn = mk("button","bm-btn bm-btn-danger"); dBtn.dataset.act="delete"; dBtn.textContent="\u{1F5D1} Delete message";
+    menu.appendChild(dBtn);
+  }
   document.body.appendChild(menu);
   const px = (ev.touches && ev.touches[0] ? ev.touches[0].clientX : (ev.clientX||window.innerWidth/2));
   const py = (ev.touches && ev.touches[0] ? ev.touches[0].clientY : (ev.clientY||window.innerHeight/2));
@@ -39,6 +47,20 @@ function showBubbleMenu(ev, el){
     } else if(btn.dataset.act === "tts"){
       // Call sync within the click to preserve iOS user-gesture for audio.
       playTts(text);
+      closeBubbleMenu();
+    } else if(btn.dataset.act === "delete"){
+      if(btn.dataset.confirm !== "1"){
+        btn.dataset.confirm = "1";
+        btn.textContent = "⚠ Tap again to delete";
+        btn.classList.add("bm-confirm");
+        return;
+      }
+      const cid = el.dataset.clientId;
+      try {
+        if(cid && typeof ws !== "undefined" && ws && ws.readyState === 1){
+          ws.send(JSON.stringify({type:"delete_message", client_id: cid}));
+        }
+      } catch {}
       closeBubbleMenu();
     }
   };

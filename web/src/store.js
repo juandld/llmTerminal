@@ -143,6 +143,33 @@ function deleteMessages(sessionId) {
   }
   try { fs.unlinkSync(path.join(MESSAGES_DIR, sessionId + ".json")); } catch {}
 }
+function deleteMessagesByTs(sessionId, tsList) {
+  if (!Array.isArray(tsList) || !tsList.length) return 0;
+  const tsSet = new Set(tsList.map(Number).filter(Number.isFinite));
+  if (!tsSet.size) return 0;
+  let removed = 0;
+  if (db) {
+    try {
+      const stmt = db.prepare("DELETE FROM messages WHERE session_id = ? AND ts = ?");
+      const tx = db.transaction((sid, list) => {
+        for (const t of list) {
+          const r = stmt.run(sid, t);
+          removed += r.changes || 0;
+        }
+      });
+      tx(sessionId, [...tsSet]);
+    } catch (e) { console.error("[deleteMessagesByTs] sqlite failed:", e.message); }
+  }
+  try {
+    const p = path.join(MESSAGES_DIR, sessionId + ".json");
+    const arr = JSON.parse(fs.readFileSync(p, "utf8"));
+    const filtered = arr.filter(m => !tsSet.has(Number(m.ts)));
+    if (filtered.length !== arr.length) fs.writeFileSync(p, JSON.stringify(filtered));
+  } catch (e) {
+    if (e.code !== "ENOENT") console.error("[deleteMessagesByTs] JSON mirror failed:", e.message);
+  }
+  return removed;
+}
 
 function ensureProjectTrusted(project) {
   try { fs.mkdirSync(path.join(CLAUDE_PROJECTS_DIR, "-home-claude-user-projects-" + project), { recursive: true }); } catch {}
@@ -176,6 +203,6 @@ function _persistSessionIfNew(session) {
 
 module.exports = {
   db,
-  loadMessages, saveMessage, deleteMessages, ensureProjectTrusted,
+  loadMessages, saveMessage, deleteMessages, deleteMessagesByTs, ensureProjectTrusted,
   loadSessions, saveSessions, updateSessionInStore, _persistSessionIfNew,
 };
