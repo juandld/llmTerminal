@@ -17,6 +17,23 @@ function _detachWs(wsRef){
 function _teardownAndConnect(project, sessionId){
   if(reconnectTimer){clearTimeout(reconnectTimer);reconnectTimer=null;}
   _detachWs(ws);
+  // Per-chat cleanup: when leaving a session (to another or to a brand-new
+  // blank one), stop in-flight audio playback and clear the file selection,
+  // open file modal, and expanded card. Must happen here BEFORE `session` is
+  // nulled — `connect()` can't observe the old id by the time it runs.
+  const oldId = session && session.id;
+  const switching = !!oldId && oldId !== sessionId;
+  if (switching) {
+    try { stopPlayback(); } catch {}
+    try { closeFileModal(); } catch {}
+    if (selectedPreviewIds.size) {
+      selectedPreviewIds.clear();
+      _lastSelectedId = null;
+      _saveSelection();
+      try { renderSelectedTray(); } catch {}
+    }
+    expandedPreviewId = null;
+  }
   chat.innerHTML=""; session=null; ws=null; busy=false; lastRenderedTs=0; removeThinking();
   try { localStorage.setItem("llmt_project", project); } catch {}
   setBusy(false);
@@ -79,20 +96,10 @@ async function delSession(id){
 }
 
 function connect(project,sessionId){
-  // Per-chat cleanup: when switching to a DIFFERENT session, stop any in-flight
-  // audio playback and clear the file selection (the "now playing" strip and
-  // the attached-files tray are both per-chat). Same-session reconnects don't
-  // trigger this; first-page-load (session === null) doesn't either.
-  const isSessionSwitch = session && session.id && sessionId && session.id !== sessionId;
-  if (isSessionSwitch) {
-    try { stopPlayback(); } catch {}
-    if (selectedPreviewIds.size) {
-      selectedPreviewIds.clear();
-      _lastSelectedId = null;
-      _saveSelection();
-      try { renderSelectedTray(); } catch {}
-    }
-  }
+  // Per-chat cleanup (stopPlayback / clear selection / close modal / reset
+  // expanded card) happens upstream in _teardownAndConnect, where the old
+  // session id is still readable. By the time this runs, `session` has
+  // already been nulled.
   // Cancel any pending reconnect and bump epoch so stale handlers become no-ops
   if(reconnectTimer){clearTimeout(reconnectTimer);reconnectTimer=null;}
   const epoch=++connectEpoch;
