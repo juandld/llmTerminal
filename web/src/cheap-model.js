@@ -2,6 +2,7 @@
 // title-gen, classify, and ROI scoring. Extracted (refactor 2026-06-10).
 const { spawn } = require("child_process");
 const path = require("path");
+const throttle = require("./throttle");
 
 async function callOpenAI(model, maxTokens, systemPrompt, userContent) {
   const key = process.env.OPENAI_API_KEY;
@@ -30,6 +31,19 @@ function runCheapClaude(prompt, tag, onParsed) {
 }
 
 function _runCheapClaudeCli(prompt, tag, onParsed) {
+  // Stand down while a transient throttle window is open: these background calls
+  // are exactly the concurrent load that trips the server-side limit, and they
+  // can wait. Fire-and-forget, so a delay is free (the user isn't blocked).
+  const wait = throttle.remaining();
+  if (wait > 0) {
+    console.log(`[${tag}] throttled — deferring ${Math.round(wait / 1000)}s`);
+    setTimeout(() => _spawnCheapClaudeCli(prompt, tag, onParsed), Math.min(wait, 60000));
+    return;
+  }
+  _spawnCheapClaudeCli(prompt, tag, onParsed);
+}
+
+function _spawnCheapClaudeCli(prompt, tag, onParsed) {
   const args = [
     "-p", prompt,
     "--model", "haiku",
@@ -48,6 +62,13 @@ function _runCheapClaudeCli(prompt, tag, onParsed) {
   const timer = setTimeout(() => { try { proc.kill("SIGTERM"); } catch {} }, 45000);
   proc.on("close", async () => {
     clearTimeout(timer);
+    // If this cheap call itself got throttled, extend the shared window so the
+    // user-facing runner (and other background calls) back off too.
+    if (throttle.isTransientRateLimit(out) || throttle.isTransientRateLimit(err)) {
+      throttle.bump(8000);
+      console.warn(`[${tag}] hit transient rate-limit — bumped shared throttle 8s`);
+      return; // skip parsing the error payload; this round is simply dropped
+    }
     try {
       const wrap = JSON.parse(out);
       const text = (wrap.result || wrap.text || out).toString();

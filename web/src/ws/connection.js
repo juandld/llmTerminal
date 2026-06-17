@@ -150,6 +150,11 @@ getWss().on("connection", (ws, req) => {
     // Closes the race where empty `data.result` could trigger the synthetic
     // closing marker even after the user already saw streamed text.
     let _assistantTextEmittedThisTurn = false;
+    // Set if the model returned a "currently unavailable" api_error and we
+    // should swap session.model and retry once in onDone. Deferred (not
+    // retried inline) so the previous claude proc fully closes first and we
+    // don't race two concurrent --resume runs against the same session.
+    let _fallbackModelTo = null;
     // Capture the run-start time so the post-run reconciliation pass can spot
     // any in-project files modified during this run that didn't get attribution
     // through the live tool_use stream (Python subprocess writes, async edits).
@@ -383,12 +388,28 @@ getWss().on("connection", (ws, req) => {
           if (isApiError) {
             const statusCode = apiErrorMatch ? apiErrorMatch[1] : "";
             const requestId = apiErrorMatch ? (apiErrorMatch[3] || "") : "";
-            // Don't save as assistant — prevents polluting context on retry
-            wsSend(ws, "api_error", {
-              status_code: statusCode,
-              request_id: requestId,
-              message: result.slice(0, 500),
-            });
+            // Model-unavailable detection: Anthropic returns a friendly
+            // "<Model> is currently unavailable" line for access-gated
+            // models (e.g. Fable 5 during Mythos staged rollout). When
+            // that hits, falling back to opus and re-firing the user's
+            // last prompt is strictly better than a silent dead chat —
+            // the prior api_error path didn't persist anything, so if
+            // the client's WS had already dropped the user just saw the
+            // agent ghost them. Now: switch model, log a notice, retry.
+            const _modelUnavailable = /is currently unavailable|mythos|access[- ]gated/i.test(result);
+            const _curAlias = (session.model || "").toLowerCase();
+            if (_modelUnavailable && _curAlias && _curAlias !== "opus" && !isRetry) {
+              _fallbackModelTo = "opus";
+              // Don't wsSend api_error — we're handling it via the
+              // fallback notice + retry in onDone.
+            } else {
+              // Don't save as assistant — prevents polluting context on retry
+              wsSend(ws, "api_error", {
+                status_code: statusCode,
+                request_id: requestId,
+                message: result.slice(0, 500),
+              });
+            }
           } else {
             // Strip any ```email-draft fences from the final assistant text —
             // the card already rendered live; persisting the fence in the
@@ -441,6 +462,33 @@ getWss().on("connection", (ws, req) => {
       (code, stderr) => {
         activeProc = null;
         activeProcBySession.delete(session.id); // run finished — session is idle again
+        // Model-unavailable fallback: api_error said the model is gated.
+        // Persist a visible notice (so the chat never goes silently dead
+        // again even if WS is gone), flip session.model to opus, and
+        // re-fire the user's last text exactly once. Guard with isRetry
+        // so opus failing doesn't cause an infinite loop.
+        if (_fallbackModelTo && !isRetry) {
+          const _fromAlias = session.model || "?";
+          const _toAlias = _fallbackModelTo;
+          _fallbackModelTo = null;
+          saveMessage(session.id, {
+            role: "assistant",
+            text: "_⚠️ Model `" + _fromAlias + "` is currently unavailable — falling back to `" + _toAlias + "` and retrying._",
+            ts: Date.now(),
+            synthetic: "model-fallback",
+          });
+          session.model = _toAlias;
+          updateSessionInStore(session);
+          wsSend(ws, "history", { messages: loadMessages(session.id) });
+          const msgs0 = loadMessages(session.id);
+          const lu = [...msgs0].reverse().find(m => m.role === "user");
+          if (lu) {
+            console.log("[model-fallback]", session.id, _fromAlias, "->", _toAlias);
+            wsSend(ws, "thinking");
+            sendToSession(lu.text, true);
+            return;
+          }
+        }
         // Detect a stale claudeSessionId — happens after we move a session
         // between projects (claude's per-project state dir doesn't move with
         // sessions.json). Clear and retry fresh, exactly once.

@@ -15,6 +15,21 @@ const { spawnObserver, spawnDecisionExtractor, spawnContractCheck, reconcileFile
 const { generateSessionTitle } = require("../session-title");
 const { _bwrapWrap } = require("../bwrap");
 const { queuePopNext, broadcastQueueState } = require("../queue");
+const throttle = require("../throttle");
+
+// ---- Transient rate-limit auto-throttle + retry ----
+// On a *transient* server-side throttle we back off and re-run the same turn via
+// --resume instead of stranding it half-done (the failure mode that left "go
+// area 1" needing manual attention). The throttle window is shared (../throttle)
+// so background fan-out calls also stand down, and concurrent sessions don't all
+// retry straight back into the same throttle.
+const RL_MAX_RETRIES = 4;
+const RL_BASE_MS = 4000;     // 4s, doubling each attempt
+const RL_CAP_MS = 60000;     // never wait more than 60s
+function _rlBackoff(attempt) {
+  const base = Math.min(RL_CAP_MS, RL_BASE_MS * Math.pow(2, attempt));
+  return Math.round(base * (0.8 + Math.random() * 0.4)); // ±20% jitter
+}
 
 function fireQueueHeadless(sessionId) {
   if (activeProcBySession.has(sessionId)) return;
@@ -224,10 +239,58 @@ function killExistingClaudeFor(claudeSessionId) {
 // handler), so a long voice-note session that drifts across topics keeps a sidebar
 // title reflecting what it's currently about. Fire-and-forget; ~5-15s. Tools
 // disabled so the model can't wander off researching before it answers.
-function runClaude({ project, prompt, claudeSessionId, cwd, extraAllowedTools, model, sessionId, effort }, onData, onDone) {
+function runClaude(opts, onData, onDone) {
+  const { project, prompt, claudeSessionId, cwd, extraAllowedTools, model, sessionId, effort } = opts;
+  const _attempt = opts._attempt || 0;
   ensureProjectTrusted(project);
 
-  const SYSTEM_PROMPT_ADD = "When producing an email draft for david@crankwheel.com, you MUST call the mcp__crankhero-draft__draft_email tool rather than typing the draft inline. The tool validates format rules and produces a UI action card for one-tap paste on mobile. Prose drafts are strictly inferior UX.\n\nWhen presenting tabular data, ALWAYS use standard markdown pipe tables with a header row and separator row. Example:\n| Column A | Column B |\n| --- | --- |\n| value 1 | value 2 |\nNever use ASCII art tables, plain-text alignment, or code blocks for tabular data. The UI renders markdown tables as styled, mobile-friendly scrollable HTML tables.\n\nWhen you generate or modify a file the user may want to inspect (PDF, HTML, image, generated doc, invoice, report), call mcp__llmterminal__llmt_show_file with its absolute path so it appears in the user's preview drawer. Don't tell them \"can't render inline\" — pin the file instead.\n\nWhen you finish a discrete task the user asked for and there is nothing more to do unless they reply, call mcp__llmterminal__llmt_complete (optionally with a one-paragraph summary). This explicitly marks the session done so it drops out of the user's NEEDS YOU sidebar. Don't call it mid-task or while waiting on the user.";
+  // --- transient rate-limit auto-retry (per attempt) ---
+  // Wrap the caller's onData/onDone so a throttled turn is retried with backoff
+  // instead of being forwarded as a failed/empty result. The rate-limit signal
+  // can arrive either as the final "result" (is_error/text) or as a streamed
+  // assistant text block followed by an unclean exit — we catch both.
+  let _resolvedCsid = claudeSessionId || null;
+  let _rlSeen = false;
+  let _retryScheduled = false;
+  let _forwardedResult = false;
+  const _scheduleRetry = (why) => {
+    if (_retryScheduled || _attempt >= RL_MAX_RETRIES) return false;
+    _retryScheduled = true;
+    const delay = Math.max(_rlBackoff(_attempt), throttle.remaining());
+    throttle.bump(delay);
+    console.log("[claude] transient rate-limit session=" + (sessionId || "?").slice(0, 8) +
+      " — retry " + (_attempt + 1) + "/" + RL_MAX_RETRIES + " in " + Math.round(delay / 1000) +
+      "s :: " + String(why || "").replace(/\s+/g, " ").slice(0, 80));
+    try {
+      broadcastToSession(sessionId, { type: "thinking", session_id: sessionId });
+      broadcastToSession(sessionId, { type: "notice", level: "throttle", session_id: sessionId,
+        message: "⏳ API rate-limited — retrying automatically in " + Math.round(delay / 1000) +
+                 "s (attempt " + (_attempt + 1) + "/" + RL_MAX_RETRIES + ")…" });
+    } catch {}
+    setTimeout(() => {
+      try { runClaude({ ...opts, _attempt: _attempt + 1, claudeSessionId: _resolvedCsid || claudeSessionId }, onData, onDone); }
+      catch (e) { console.error("[claude] retry spawn failed:", e.message); try { onDone(1, String(e)); } catch {} }
+    }, delay);
+    return true;
+  };
+  const wrappedOnData = (data) => {
+    if (data && data.type === "system" && data.subtype === "init" && data.session_id) _resolvedCsid = data.session_id;
+    if (data && data.type === "assistant" && Array.isArray(data.message?.content)) {
+      for (const b of data.message.content) if (b && b.type === "text" && throttle.isTransientRateLimit(b.text)) _rlSeen = true;
+    }
+    if (data && data.type === "result") {
+      if ((_rlSeen || throttle.isTransientRateLimit(data.result)) && _scheduleRetry(data.result || "rate-limit")) return; // suppress; retry owns it
+      _forwardedResult = true;
+    }
+    onData(data);
+  };
+  const wrappedOnDone = (code, stderr) => {
+    if (!_forwardedResult && !_retryScheduled && (_rlSeen || throttle.isTransientRateLimit(stderr)) && _scheduleRetry(stderr || "rate-limit")) return;
+    if (_retryScheduled) return; // a retry owns the continuation
+    onDone(code, stderr);
+  };
+
+  const SYSTEM_PROMPT_ADD = "When producing an email draft for david@crankwheel.com, you MUST call the mcp__crankhero-draft__draft_email tool rather than typing the draft inline. The tool validates format rules and produces a UI action card for one-tap paste on mobile. Prose drafts are strictly inferior UX.\n\nWhen presenting tabular data, ALWAYS use standard markdown pipe tables with a header row and separator row. Example:\n| Column A | Column B |\n| --- | --- |\n| value 1 | value 2 |\nNever use ASCII art tables, plain-text alignment, or code blocks for tabular data. The UI renders markdown tables as styled, mobile-friendly scrollable HTML tables.\n\nWhen you generate or modify a file the user may want to inspect (PDF, HTML, image, generated doc, invoice, report), call mcp__llmterminal__llmt_show_file with its absolute path so it appears in the user's preview drawer. Don't tell them \"can't render inline\" — pin the file instead.\n\nWhen you finish a discrete task the user asked for and there is nothing more to do unless they reply, call mcp__llmterminal__llmt_complete (optionally with a one-paragraph summary). This explicitly marks the session done so it drops out of the user's NEEDS YOU sidebar. Don't call it mid-task or while waiting on the user.\n\nWhen you need David to decide something, make it answerable — never dump open questions as a numbered prose list. Route by URGENCY, not by count. For choices that block you RIGHT NOW (you cannot continue until he picks), use AskUserQuestion — the tool's schema caps it at 4 questions per call, so for 5+ just call AskUserQuestion AGAIN with the rest. Do NOT fall back to llmt_decide solely because there are more than 4 questions, and NEVER create both a question card and decide cards for the same set. For decisions that can wait while you keep working, or any queue-fired/headless run (no live user attached), call mcp__llmterminal__llmt_decide once per decision with: summary = the question itself, chose = 'ask David (proposed: <your recommendation>)', alternatives = the candidate options, why = what hangs on the answer. Each becomes a tappable card in the Decisions drawer (no cap on count); David answers there whenever he wants, and his pick arrives back in this session as a user message prefixed 'Decision #<id>'. When that message arrives, act on it and close the loop with llmt_decide_resolve(id, 'verified', artifact: what you did with it).";
   // Phase C: deny the hosted claude.ai Google MCPs project-wide. They
   // bypass the canonical data.* layer + use a different identity, leading
   // the agent to flail when answers don't match what data.* would give.
@@ -294,7 +357,7 @@ function runClaude({ project, prompt, claudeSessionId, cwd, extraAllowedTools, m
       if (!line.trim()) continue;
       try {
         const msg = JSON.parse(line);
-        onData(msg);
+        wrappedOnData(msg);
       } catch {}
     }
   });
@@ -304,9 +367,9 @@ function runClaude({ project, prompt, claudeSessionId, cwd, extraAllowedTools, m
   proc.on("close", (code) => {
     // Process remaining stdout
     if (stdout.trim()) {
-      try { onData(JSON.parse(stdout)); } catch {}
+      try { wrappedOnData(JSON.parse(stdout)); } catch {}
     }
-    onDone(code, stderr);
+    wrappedOnDone(code, stderr);
   });
 
   return proc;
