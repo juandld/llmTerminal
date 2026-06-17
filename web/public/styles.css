@@ -99,6 +99,14 @@
   .main{flex:1;display:flex;flex-direction:column;min-width:0;overflow-x:hidden}
   .topbar{display:flex;align-items:center;border-bottom:1px solid var(--border);background:var(--surface);flex-shrink:0}
   .topbar-nav{flex:1;min-width:0;overflow:hidden;display:flex;align-items:center;gap:10px;padding:8px 8px 8px 14px}
+  /* Buttons keep natural width — app-topbar.js collapses whole buttons into ⋮
+     instead of letting flexbox squish them all. The bell (.topbar-att) is the
+     one intentional shrinker and re-enables itself further down. */
+  .topbar-nav>*{flex-shrink:0}
+  /* Collapsed by app-topbar.js: out of flow + invisible but still measurable,
+     so the fit calculation can use natural widths. display stays untouched. */
+  .topbar-nav .tb-collapsed{position:absolute!important;visibility:hidden!important;pointer-events:none!important;left:-9999px;top:0}
+  .topbar.tb-has-collapsed .topbar-overflow{display:inline-flex}
   .menu-btn{background:none;border:none;color:var(--dim);cursor:pointer;font-size:18px;display:none}
   @media (max-width:768px){.menu-btn{display:inline-flex;align-items:center;justify-content:center}}
   .btn-icon{font-size:15px;line-height:1;margin-right:0}
@@ -128,7 +136,9 @@
     .topbar{min-height:40px;align-items:center}
     .topbar-nav{padding:2px 2px 2px 6px;gap:6px}
     .menu-btn{width:36px;height:36px;min-width:36px;font-size:18px;display:grid;place-items:center;-webkit-tap-highlight-color:transparent;flex-shrink:0}
-    .badge{padding:0 6px;font-size:12px;height:36px;display:inline-flex;align-items:center;border-radius:0;background:none;color:var(--accent);font-weight:600;flex:1;min-width:0}
+    /* Natural width (no flex:1) — leftover space goes to priority+ buttons,
+       not an invisible spacer. Global .topbar-nav>.badge gives the shrink floor. */
+    .badge{padding:0 6px;font-size:12px;height:36px;display:inline-flex;align-items:center;border-radius:0;background:none;color:var(--accent);font-weight:600}
     /* Star + browser + model picker hidden on mobile — in overflow menu */
     .topbar-star{display:none!important}
     .browser-btn{display:none!important}
@@ -141,7 +151,9 @@
     .dot-status{display:flex!important;width:36px;height:36px;padding:0;border:1px solid var(--border);border-radius:10px;margin:0;gap:0;justify-content:center;align-items:center;flex-shrink:0}
     .dot-status #dsText{display:none}
     .dot-status .dot{width:8px;height:8px}
-    /* Bell and overflow at the end */
+    /* Panel buttons slot after Files (3), matching desktop's relative order;
+       bell and overflow stay at the end */
+    .topbar-collapsible{order:4}
     .topbar-att{order:5}
     .topbar-overflow{order:6}
   }
@@ -188,11 +200,28 @@
   .topbar-overflow-menu .om-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
   .topbar-overflow-menu .om-dot.live{background:var(--green);box-shadow:0 0 6px var(--green)}
   .topbar-overflow-menu .om-url{margin-left:auto;font-size:10px;color:var(--dim);max-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .topbar-overflow-menu .om-model-row{padding:6px 14px;align-items:center;gap:8px;min-height:44px}
+  /* ⋮ menu shows ONLY what's not in the bar. Each [data-om] item pairs with its
+     bar twin via sibling combinator (bar buttons precede .topbar-overflow under
+     .topbar-nav): twin collapsed → menu item appears. Mobile overrides below. */
+  .topbar-overflow-menu [data-om]{display:none}
+  #filesBtn.tb-collapsed~.topbar-overflow [data-om=files],
+  #tasksBtn.tb-collapsed~.topbar-overflow [data-om=tasks],
+  #jobsBtn.tb-collapsed~.topbar-overflow [data-om=jobs],
+  #decisionsBtn.tb-collapsed~.topbar-overflow [data-om=decisions],
+  #searchBtn.tb-collapsed~.topbar-overflow [data-om=search],
+  #summaryBtn.tb-collapsed~.topbar-overflow [data-om=summary],
+  #modelPickerBtn.tb-collapsed~.topbar-overflow [data-om=model],
+  #appBtn.tb-collapsed~.topbar-overflow [data-om=app]{display:flex}
   @media (max-width:768px){
+    /* ⋮ always present on mobile: Browser/Model/App live only in the menu here. */
     .topbar-overflow{display:inline-flex}
-    .topbar-collapsible{display:none!important}
     /* Hide browser dot on overflow btn — browser link is already hidden on mobile */
     .topbar-overflow-btn .overflow-dot{display:none!important}
+    /* Panels (Tasks/Jobs/…) pair via tb-collapsed like desktop — app-topbar.js
+       runs at all widths. Model + App are media-hidden in the bar (never
+       tb-collapsed), so force their menu twins on. */
+    .topbar-overflow-menu [data-om=model],.topbar-overflow-menu [data-om=app]{display:flex}
   }
 
   .chat{flex:1;overflow-y:auto;overflow-x:hidden;padding:16px;display:flex;flex-direction:column;gap:14px;-webkit-overflow-scrolling:touch;overscroll-behavior:contain}
@@ -243,13 +272,23 @@
   .topbar-btn{background:var(--surface2);color:var(--dim);border:1px solid var(--border);padding:4px 10px;border-radius:8px;font-size:13px;cursor:pointer;font-family:var(--mono);display:inline-flex;align-items:center;gap:0}
   @media (min-width:769px){.topbar-btn{padding:5px 12px}}
   .topbar-btn:hover{color:var(--accent);border-color:var(--accent)}
-  /* Medium desktop: hide collapsible buttons, show ⋮ so content stays accessible */
-  @media(min-width:769px) and (max-width:1199px){
-    .topbar-collapsible{display:none!important}
-    .topbar-overflow{display:inline-flex}
-    .topbar-overflow-btn .overflow-dot{display:none!important}
-    /* topbar is ~55px here (vs 40px mobile) — drop the fixed menu below it */
+  /* Weighted shrink order (all widths): browser URL gives space first, bell
+     second, the project badge (chat identity) only as a last resort — these
+     are the variable-text items; app-topbar.js budgets bell+browser at their
+     floors. Badge gets plain clip, no ellipsis: flex hands it subpixel shrink
+     (~0.04px) even with slack, and ellipsis's integer compare would eat a
+     whole character. */
+  .topbar-nav>.badge{flex-shrink:1;min-width:40px;overflow:hidden}
+  .topbar-nav>.browser-btn{flex-shrink:400;min-width:64px}
+  .topbar-nav>.topbar-att{flex-shrink:40}
+  /* Desktop overflow menu sits below the ~55px desktop topbar (vs ~40px mobile).
+     Desktop never needs the browser dot on ⋮ — the browser pill never collapses. */
+  @media(min-width:769px){
     .topbar-overflow-menu{top:59px}
+    .topbar-overflow-btn .overflow-dot{display:none!important}
+    /* Browser pill never collapses on desktop, so its ⋮ twin is always
+       redundant there (app-status.js only inline-hides it when no browser). */
+    #omBrowserBtn{display:none}
   }
   @media (max-width:768px){.topbar-btn{min-height:44px;min-width:44px;padding:6px 12px}}
   .chat-search{display:flex;align-items:center;gap:10px;padding:8px 14px;background:var(--surface);border-bottom:1px solid var(--border)}
@@ -679,7 +718,9 @@
   background:var(--surface2);border:1px solid var(--border);border-radius:8px;
   padding:5px 12px;cursor:pointer;font-family:var(--mono);font-size:13px;
   color:var(--dim);overflow:hidden;white-space:nowrap;
-  flex-shrink:1;min-width:0;
+  /* The one flexible topbar item: ellipsizes to absorb tight widths, but never
+     below icon+count (app-topbar.js budgets it at this min when fitting). */
+  flex-shrink:1;min-width:48px;
 }
 .topbar-att:hover,.topbar-att:active{border-color:var(--accent);color:var(--text)}
 .topbar-att-icon{font-size:13px;flex-shrink:0;white-space:nowrap}

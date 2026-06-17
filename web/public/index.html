@@ -40,7 +40,7 @@
       <button class="menu-btn" onclick="toggleSB()" title="Sessions">&#9776;</button>
       <span class="badge" id="badge">-</span>
       <button class="topbar-star" id="starBtn" onclick="toggleSessionStar()" title="Star — keeps this chat at high priority in the sidebar" aria-label="Star this chat">☆</button>
-      <a href="/" class="app-btn">App</a>
+      <a href="/" class="app-btn" id="appBtn">App</a>
       <button class="topbar-att hide-mobile" id="topbarAtt" onclick="nextAttentionSession()" title="Next chat needing attention"><span class="topbar-att-icon" id="topbarAttIcon"></span><span class="topbar-att-text" id="topbarAttText">All clear</span></button>
       <a class="browser-btn off" id="browserBtn" title="No browser active" target="_blank" rel="noopener noreferrer" onclick="return handleBrowserClick(event)"><span class="browser-dot"></span><span class="btn-icon">🌐</span><span class="browser-url" id="browserUrl"></span></a>
       <button class="files-btn topbar-collapsible" id="filesBtn" onclick="toggleDrawer()"><span class="btn-icon">◳</span><span class="btn-label">Files</span><span class="badge-count" id="filesBadge" style="display:none">0</span></button>
@@ -57,13 +57,14 @@
         <button class="topbar-overflow-btn" id="overflowBtn" onclick="toggleOverflowMenu()" title="More options"><span class="overflow-dot"></span>⋮</button>
         <div class="topbar-overflow-menu" id="overflowMenu">
           <a id="omBrowserBtn" target="_blank" rel="noopener" style="display:none" onclick="closeOverflowMenu()"><span class="om-dot" id="omBrowserDot"></span><span>🌐 Browser</span><span class="om-url" id="omBrowserUrl"></span></a>
-          <button onclick="toggleDrawer();closeOverflowMenu()">◳ Files<span class="badge-count" id="filesBadgeMobile" style="display:none;margin-left:auto;background:var(--accent);color:#000;font-size:9px;padding:1px 5px;border-radius:8px">0</span></button>
-          <button onclick="toggleTaskBoard();closeOverflowMenu()">▦ Tasks<span class="badge-count" id="tasksBadgeMobile" style="display:none;margin-left:auto;background:var(--accent);color:#000;font-size:9px;padding:1px 5px;border-radius:8px">0</span></button>
-          <button onclick="toggleDecisionsDrawer();closeOverflowMenu()">⌥ Decisions<span class="badge-count" id="decisionsBadgeMobile" style="display:none;margin-left:auto;background:var(--accent);color:#000;font-size:9px;padding:1px 5px;border-radius:8px">0</span></button>
-          <button onclick="toggleChatSearch();closeOverflowMenu()">⌕ Search</button>
-          <button onclick="toggleSummary();closeOverflowMenu()">Σ Summary</button>
-          <a href="/" onclick="closeOverflowMenu()" style="color:var(--dim)">↗ App</a>
-          <div style="padding:6px 14px;display:flex;align-items:center;gap:8px;min-height:44px"><span style="color:var(--dim);font-size:13px">Model</span><button id="omModelPickerBtn" class="win95-trigger" type="button" onclick="toggleModelMenu(event)" style="flex:1;justify-content:flex-start" aria-haspopup="true" aria-expanded="false"><span id="omModelPickLabel">Opus 4.8 · max</span><span class="win95-chev" style="margin-left:auto" aria-hidden="true">▼</span></button></div>
+          <button data-om="files" onclick="toggleDrawer();closeOverflowMenu()">◳ Files<span class="badge-count" id="filesBadgeMobile" style="display:none;margin-left:auto;background:var(--accent);color:#000;font-size:9px;padding:1px 5px;border-radius:8px">0</span></button>
+          <button data-om="tasks" onclick="toggleTaskBoard();closeOverflowMenu()">▦ Tasks<span class="badge-count" id="tasksBadgeMobile" style="display:none;margin-left:auto;background:var(--accent);color:#000;font-size:9px;padding:1px 5px;border-radius:8px">0</span></button>
+          <button data-om="jobs" onclick="toggleJobs();closeOverflowMenu()">⚙ Jobs</button>
+          <button data-om="decisions" onclick="toggleDecisionsDrawer();closeOverflowMenu()">⌥ Decisions<span class="badge-count" id="decisionsBadgeMobile" style="display:none;margin-left:auto;background:var(--accent);color:#000;font-size:9px;padding:1px 5px;border-radius:8px">0</span></button>
+          <button data-om="search" onclick="toggleChatSearch();closeOverflowMenu()">⌕ Search</button>
+          <button data-om="summary" onclick="toggleSummary();closeOverflowMenu()">Σ Summary</button>
+          <a data-om="app" href="/" onclick="closeOverflowMenu()" style="color:var(--dim)">↗ App</a>
+          <div data-om="model" class="om-model-row"><span style="color:var(--dim);font-size:13px">Model</span><button id="omModelPickerBtn" class="win95-trigger" type="button" onclick="toggleModelMenu(event)" style="flex:1;justify-content:flex-start" aria-haspopup="true" aria-expanded="false"><span id="omModelPickLabel">Opus 4.8 · max</span><span class="win95-chev" style="margin-left:auto" aria-hidden="true">▼</span></button></div>
         </div>
       </div>
     </div>
@@ -165,6 +166,7 @@
 <script src="app-session-state.js"></script>
 <script src="app-input.js"></script>
 <script src="app-ui-misc.js"></script>
+<script src="app-topbar.js"></script>
 <script src="app-bubble-menu.js"></script>
 <script src="app-tts.js"></script>
 <script src="app-decisions.js"></script>
