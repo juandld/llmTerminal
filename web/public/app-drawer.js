@@ -337,23 +337,121 @@ async function refreshPreviews(showNewInline){
 
     const oldIds = new Set(sessionPreviews.map(p => p.id));
     sessionPreviews = merged;
+    // Tag _batchId on audio previews — derived UI grouping per AUDIO-DRAWER-PLAN
+    // §3 (NOT persisted, recomputed each refresh). batchMembersOf() reads this.
+    _tagBatches(sessionPreviews);
     renderDrawer();
     // Badge
     const badge=document.getElementById("filesBadge");
     if(sessionPreviews.length>0){badge.textContent=sessionPreviews.length;badge.style.display="";}
     else{badge.style.display="none";}
     syncMobileFilesBadge();
-    // Show new previews inline in chat
+    // Show new previews inline in chat. Cluster co-arriving audio (≥2 in same
+    // batch) into ONE playlist card; everything else (singletons + non-audio)
+    // renders per-file as before.
     if(showNewInline){
-      for(const p of sessionPreviews){
-        if(!oldIds.has(p.id)&&!knownPreviewIds.has(p.id)){
-          knownPreviewIds.add(p.id);
-          addInlinePreview(p);
+      const newPreviews = sessionPreviews.filter(p => !oldIds.has(p.id) && !knownPreviewIds.has(p.id));
+      newPreviews.forEach(p => knownPreviewIds.add(p.id));
+      const byBatch = new Map();
+      const singles = [];
+      for(const p of newPreviews){
+        if(p._batchId){
+          if(!byBatch.has(p._batchId)) byBatch.set(p._batchId, []);
+          byBatch.get(p._batchId).push(p);
+        } else {
+          singles.push(p);
         }
       }
+      for(const items of byBatch.values()){
+        if(items.length >= 2) addInlineAudioBatch(items);
+        else singles.push(...items);   // lone NEW arrival in an old batch — render per-file
+      }
+      // Sort singles back into arrival order so the chat thread isn't reordered.
+      singles.sort((a,b) => new Date(a.created_at) - new Date(b.created_at));
+      for(const p of singles) addInlinePreview(p);
     }
     sessionPreviews.forEach(p=>knownPreviewIds.add(p.id));
   }catch{}
+}
+
+// Tag _batchId on audio previews: same-session audio files arriving within
+// a 5-second sliding window are one batch. Singleton arrivals (no sibling
+// within the window) get _batchId = null.
+const _BATCH_WINDOW_MS = 5000;
+function _tagBatches(previews){
+  const audioByTs = previews
+    .filter(p => fileKindMeta(p).kind === "audio")
+    .map(p => ({p, ts: p.created_at ? new Date(p.created_at).getTime() : 0}))
+    .sort((a,b) => a.ts - b.ts);
+  let currentId = null, prevTs = 0;
+  for(const {p, ts} of audioByTs){
+    if(currentId === null || (ts - prevTs) > _BATCH_WINDOW_MS) currentId = "b:" + ts;
+    p._batchId = currentId;
+    prevTs = ts;
+  }
+  // Demote singleton batches back to null so single-file arrivals render normally.
+  const counts = {};
+  for(const {p} of audioByTs) if(p._batchId) counts[p._batchId] = (counts[p._batchId]||0) + 1;
+  for(const {p} of audioByTs) if(p._batchId && counts[p._batchId] < 2) p._batchId = null;
+}
+
+// Return the ordered list of preview ids in the same batch as `previewId`.
+// Singletons (or unknown ids) return [previewId] so the caller can queue a
+// one-track playback uniformly. Used by §4's row-▶ handler.
+function batchMembersOf(previewId){
+  const p = sessionPreviews.find(x => x.id === previewId);
+  if(!p || !p._batchId) return [previewId];
+  return sessionPreviews
+    .filter(x => x._batchId === p._batchId)
+    .sort((a,b) => new Date(a.created_at) - new Date(b.created_at))
+    .map(x => x.id);
+}
+
+// Seed the playback queue with a batch starting at startIdx, then play.
+// Reuses _playbackQueue / _playCurrent so the now-playing strip + skip-next +
+// pause-toggle all work uniformly.
+function playFromBatch(batchId, startIdx){
+  const members = sessionPreviews
+    .filter(p => p._batchId === batchId)
+    .sort((a,b) => new Date(a.created_at) - new Date(b.created_at));
+  const items = members.map(p => {
+    const bt = (p.content?.body_text) || "";
+    if(!bt.startsWith("FILE_PATH:")) return null;
+    const fp = bt.slice("FILE_PATH:".length);
+    return { id: p.id, url: apiUrl("/api/file?path=" + encodeURIComponent(fp)), title: p.title || fp.split("/").pop() };
+  }).filter(Boolean);
+  if(!items.length) return;
+  _playbackQueue = items;
+  _playbackIndex = Math.min(Math.max(0, startIdx|0), items.length - 1);
+  _playCurrent();
+}
+
+// Inline playlist card for a co-arriving audio batch. Per AUDIO-DRAWER-PLAN
+// §3: no auto-play — render with ▶, wait for tap. ▶ on a track plays FROM
+// that track through end of batch.
+function addInlineAudioBatch(items){
+  if(!items || items.length < 2) return;
+  const batchId = items[0]._batchId;
+  const d = mk("div", "audio-batch");
+  let html = '<div class="ab-header">'
+           + '<span class="ab-icon">🎵</span>'
+           + '<span class="ab-title">' + items.length + ' audio tracks</span>'
+           + '<button class="ab-play-all" onclick="playFromBatch(\'' + esc(batchId) + '\', 0)">▶ Play all</button>'
+           + '</div>'
+           + '<div class="ab-tracks">';
+  items.forEach((p, i) => {
+    const bt = (p.content?.body_text) || "";
+    const fp = bt.startsWith("FILE_PATH:") ? bt.slice("FILE_PATH:".length) : "";
+    const name = (fp ? fp.split("/").pop() : (p.title || "Untitled"));
+    html += '<button class="ab-track" data-pid="' + esc(p.id) + '" onclick="playFromBatch(\'' + esc(batchId) + '\',' + i + ')">'
+         +    '<span class="ab-track-play">▶</span>'
+         +    '<span class="ab-track-name">' + esc(name) + '</span>'
+         +  '</button>';
+  });
+  html += '</div>';
+  d.innerHTML = html;
+  chat.appendChild(d);
+  if(typeof scrollToBottomIfSticky === "function") scrollToBottomIfSticky();
 }
 
 function addInlinePreview(p){
