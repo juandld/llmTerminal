@@ -211,17 +211,48 @@ function copyCodeFromBtn(btn){
 
 // Intercept clicks on file:// links in chat messages — those are produced by
 // skills (e.g. /generate-takes) that render comparison tables with each cell
-// linking to a generated file. Open the preview modal instead of letting the
-// browser try to navigate to file:// (which doesn't work across the
-// sandbox / nginx anyway). Delegated handler — survives DOM re-renders.
+// linking to a generated file. Audio tables: seed the existing playback queue
+// with EVERY audio link in the same message (so tracks auto-advance and the
+// now-playing strip / prev / next / pause buttons all work uniformly), start
+// at the clicked one. Everything else (pdf, image, text): open the file-preview
+// modal. Delegated — survives DOM re-renders.
+const _AUDIO_EXT = new Set(["mp3","wav","m4a","ogg","webm","aac","flac","opus"]);
+function _decodeFileHref(href){
+  let p = decodeURIComponent(href || "");
+  p = p.replace(/^file:\/\/\/?/, "/").replace(/^\/+/, "/");
+  return p.startsWith("/") ? p : null;
+}
 chat.addEventListener("click", (e) => {
   const a = e.target && e.target.closest && e.target.closest('a[href^="file:"]');
   if (!a) return;
   e.preventDefault();
-  let fp = decodeURIComponent(a.getAttribute("href") || "");
-  fp = fp.replace(/^file:\/\/\/?/, "/").replace(/^\/+/, "/");
-  if (!fp.startsWith("/")) return;
+  const fp = _decodeFileHref(a.getAttribute("href"));
+  if (!fp) return;
+  const ext = (fp.split(".").pop() || "").toLowerCase();
   const title = a.textContent.trim() || fp.split("/").pop();
+  if (_AUDIO_EXT.has(ext)) {
+    // Build the queue from every audio file:// link in the SAME assistant
+    // message (the table), preserving render order. Then play from idx.
+    const msg = a.closest(".msg") || chat;
+    const items = [];
+    let clickedIdx = -1;
+    for (const link of msg.querySelectorAll('a[href^="file:"]')) {
+      const lp = _decodeFileHref(link.getAttribute("href"));
+      if (!lp) continue;
+      const lext = (lp.split(".").pop() || "").toLowerCase();
+      if (!_AUDIO_EXT.has(lext)) continue;
+      const id = "tbl:" + lp;
+      if (link === a) clickedIdx = items.length;
+      items.push({ id, url: apiUrl("/api/file?path=" + encodeURIComponent(lp)), title: link.textContent.trim() || lp.split("/").pop() });
+    }
+    if (items.length && typeof _playCurrent === "function") {
+      _playbackQueue = items;
+      _playbackIndex = Math.max(0, clickedIdx);
+      _playCurrent();
+      return;
+    }
+    // Fall-through if playback infra isn't loaded yet — open modal as backup.
+  }
   if (typeof openFileModal === "function") openFileModal(title, fp);
 });
 
