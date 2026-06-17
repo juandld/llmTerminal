@@ -71,7 +71,7 @@ ${lines}`;
           console.error("[observer] task POST failed:", e.message);
         }
       }
-    });
+    }, projectName);
   } catch (e) {
     console.error("[observer] outer error:", e.message);
   }
@@ -209,7 +209,7 @@ ${lines}`;
         req.write(post); req.end();
       }
       _decisionHighWaterTs[sessionId] = recent[recent.length - 1].ts || now;
-    });
+    }, projectName);
   } catch (e) {
     console.error("[decision-extractor] outer error:", e.message);
   }

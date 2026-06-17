@@ -427,7 +427,7 @@ ${lines}`;
           scored++;
         }
         resolve();
-      });
+      }, s.project);
       // 8s timeout per session — runCheapClaude has its own 45s but we want to bound the request.
       setTimeout(resolve, 8000);
     });

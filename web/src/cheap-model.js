@@ -1,8 +1,47 @@
 // Cheap/background model calls (Haiku CLI + OpenAI) used by supervisors,
 // title-gen, classify, and ROI scoring. Extracted (refactor 2026-06-10).
+const fs = require("fs");
 const { spawn } = require("child_process");
 const path = require("path");
 const throttle = require("./throttle");
+
+// Per-hero context chunks parsed from ~/.claude/CLAUDE.md. Each row in the
+// "project table" is one hero's blurb. Cheap-claude spawns auto-load the full
+// CLAUDE.md by default — that's how Mandarin/langHero leaked onto a
+// crankHero voiceover chat (title-gen bug, 2026-06-17). Passing
+// --system-prompt with JUST this hero's row keeps the cheap agent scoped to
+// the relevant context without dragging the rest of the ecosystem along.
+let _heroChunkCache = null;
+function _loadHeroChunks() {
+  if (_heroChunkCache) return _heroChunkCache;
+  const map = new Map();
+  try {
+    const txt = fs.readFileSync("/home/claude-user/.claude/CLAUDE.md", "utf8");
+    for (const line of txt.split("\n")) {
+      // Project table rows: | `<name>` | <Role> | <Key paths> |
+      const m = line.match(/^\|\s*`([a-zA-Z0-9_-]+)`\s*\|/);
+      if (m) {
+        const name = m[1];
+        // First occurrence wins (later sections like "Browser stack" repeat names)
+        if (!map.has(name)) map.set(name, line.trim());
+      }
+    }
+  } catch (e) {
+    console.warn("[cheap-model] could not parse hero chunks:", e.message);
+  }
+  _heroChunkCache = map;
+  return _heroChunkCache;
+}
+function _systemPromptFor(project) {
+  // Tight system prompt that REPLACES the default (which would auto-load
+  // ~/.claude/CLAUDE.md). Includes ONLY this hero's table row, so other
+  // heroes' descriptions never appear in this cheap call's context.
+  const base = "You are a background helper for an agent chat. Output exactly what the user prompt asks (typically a small JSON object). Do not invent topics, facts, or topic words not present in the input. Do not use tools.";
+  if (!project) return base;
+  const chunk = _loadHeroChunks().get(project);
+  if (!chunk) return base;
+  return base + "\n\nHero context (this chat's project):\n" + chunk;
+}
 
 async function callOpenAI(model, maxTokens, systemPrompt, userContent) {
   const key = process.env.OPENAI_API_KEY;
@@ -22,32 +61,33 @@ async function callOpenAI(model, maxTokens, systemPrompt, userContent) {
 
 // Classify voice note transcript and auto-create orchestrator task if it's a new idea/direction
 
-function runCheapClaude(prompt, tag, onParsed) {
+function runCheapClaude(prompt, tag, onParsed, project) {
   const want = (process.env.LLMT_BACKGROUND_PROVIDER || "claude").toLowerCase();
   if (want === "openai" && process.env.OPENAI_API_KEY) {
-    return _runCheapOpenAI(prompt, tag, onParsed);
+    return _runCheapOpenAI(prompt, tag, onParsed, project);
   }
-  return _runCheapClaudeCli(prompt, tag, onParsed);
+  return _runCheapClaudeCli(prompt, tag, onParsed, project);
 }
 
-function _runCheapClaudeCli(prompt, tag, onParsed) {
+function _runCheapClaudeCli(prompt, tag, onParsed, project) {
   // Stand down while a transient throttle window is open: these background calls
   // are exactly the concurrent load that trips the server-side limit, and they
   // can wait. Fire-and-forget, so a delay is free (the user isn't blocked).
   const wait = throttle.remaining();
   if (wait > 0) {
     console.log(`[${tag}] throttled — deferring ${Math.round(wait / 1000)}s`);
-    setTimeout(() => _spawnCheapClaudeCli(prompt, tag, onParsed), Math.min(wait, 60000));
+    setTimeout(() => _spawnCheapClaudeCli(prompt, tag, onParsed, project), Math.min(wait, 60000));
     return;
   }
-  _spawnCheapClaudeCli(prompt, tag, onParsed);
+  _spawnCheapClaudeCli(prompt, tag, onParsed, project);
 }
 
-function _spawnCheapClaudeCli(prompt, tag, onParsed) {
+function _spawnCheapClaudeCli(prompt, tag, onParsed, project) {
   const args = [
     "-p", prompt,
     "--model", "haiku",
     "--output-format", "json",
+    "--system-prompt", _systemPromptFor(project),
     "--dangerously-skip-permissions",
     "--disallowedTools", "Bash", "Read", "Write", "Edit", "Glob", "Grep", "Agent", "NotebookEdit", "MultiEdit", "WebFetch", "WebSearch",
   ];
@@ -85,8 +125,8 @@ function _spawnCheapClaudeCli(prompt, tag, onParsed) {
 // OpenAI-backed equivalent of _runCheapClaudeCli. Reuses callOpenAI() and
 // produces an object parsed from JSON content. Kept side-effect-symmetric
 // with the claude path: silent warn on failure, no throw to the caller.
-async function _runCheapOpenAI(prompt, tag, onParsed) {
-  const SYSTEM = "You return JSON only. No prose, no markdown fences, no commentary. The user prompt fully describes the required JSON shape.";
+async function _runCheapOpenAI(prompt, tag, onParsed, project) {
+  const SYSTEM = _systemPromptFor(project) + "\n\nYou return JSON only. No prose, no markdown fences, no commentary. The user prompt fully describes the required JSON shape.";
   try {
     const content = await callOpenAI("gpt-4o-mini", 800, SYSTEM, prompt);
     if (!content) {
