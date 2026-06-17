@@ -533,6 +533,83 @@ function fileSnippet(bodyText) {
   return bodyText.slice(0, 80).replace(/\n/g, ' ');
 }
 
+// Calendar bucket for a file ≥7d old: "Jun 14" within ~30 days, "May" within
+// current year, "2025" for older. Replaces the old single "Older" catch-all.
+const _MONTH_ABBREV = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+function _calendarBucket(t, now){
+  if(!t) return "Unknown";
+  const d=new Date(t), n=new Date(now);
+  if(d.getFullYear() !== n.getFullYear()) return String(d.getFullYear());
+  if((now - t) < 30*86400000) return _MONTH_ABBREV[d.getMonth()] + " " + d.getDate();
+  return _MONTH_ABBREV[d.getMonth()];
+}
+function _dateBucket(t, now){
+  if(!t) return "Unknown";
+  const age=now - t;
+  if(age < 3600000)   return "Last hour";
+  if(age < 86400000)  return "Today";
+  if(age < 172800000) return "Yesterday";
+  if(age < 604800000) return "This week";
+  return _calendarBucket(t, now);
+}
+// Produce a flat render plan from `filtered` (already sorted by sortMode).
+// Each entry is {label, level: "flat"|"major"|"minor", files}:
+//   - "flat":  one bucket header + its files (newest/oldest/name sort)
+//   - "major": a type header with no files (type sort outer)
+//   - "minor": a date sub-header with files (type sort inner)
+function _buildRenderGroups(filtered, sortMode, _ts){
+  const now=Date.now();
+  const out=[];
+  if(sortMode === "newest" || sortMode === "oldest"){
+    // Bucket discovery order follows `filtered`'s sort, so buckets emerge
+    // newest-first (or oldest-first via reverse below).
+    const buckets=new Map();
+    for(const p of filtered){
+      const b=_dateBucket(_ts(p), now);
+      if(!buckets.has(b)) buckets.set(b, []);
+      buckets.get(b).push(p);
+    }
+    const order=[...buckets.keys()];
+    if(sortMode === "oldest") order.reverse();
+    for(const label of order) out.push({label, level: "flat", files: buckets.get(label)});
+  } else if(sortMode === "type"){
+    // Outer = type label (Audio / Image / …), inner = date buckets. Decided
+    // 2026-06-17 — David hunts by type then wants the time dimension inside.
+    const byType=new Map();
+    for(const p of filtered){
+      const tl=fileKindMeta(p).label;
+      const db=_dateBucket(_ts(p), now);
+      if(!byType.has(tl)) byType.set(tl, new Map());
+      const inner=byType.get(tl);
+      if(!inner.has(db)) inner.set(db, []);
+      inner.get(db).push(p);
+    }
+    const typeOrder=[...byType.keys()].sort();
+    for(const tl of typeOrder){
+      out.push({label: tl, level: "major", files: []});
+      // Inner date order = newest sub-bucket first (regardless of outer sort).
+      const inner=byType.get(tl);
+      const innerOrder=[...inner.keys()].sort((a,b) => {
+        const ma=Math.max(...inner.get(a).map(p => _ts(p)));
+        const mb=Math.max(...inner.get(b).map(p => _ts(p)));
+        return mb - ma;
+      });
+      for(const db of innerOrder) out.push({label: db, level: "minor", files: inner.get(db)});
+    }
+  } else { // name
+    const buckets=new Map();
+    for(const p of filtered){
+      const ch=(p.title||"?").charAt(0).toUpperCase();
+      const b=/[A-Z]/.test(ch) ? ch : "#";
+      if(!buckets.has(b)) buckets.set(b, []);
+      buckets.get(b).push(p);
+    }
+    const order=[...buckets.keys()].sort();
+    for(const label of order) out.push({label, level: "flat", files: buckets.get(label)});
+  }
+  return out;
+}
+
 function renderDrawer(){
   const list=document.getElementById("drawerList");
   const countEl=document.getElementById("drawerCount");
@@ -561,47 +638,32 @@ function renderDrawer(){
   else if (sortMode === "name")   filtered = filtered.slice().sort(cmpName);
   else if (sortMode === "type")   filtered = filtered.slice().sort(cmpType);
 
-  // Grouping aligns with the sort: time buckets for newest/oldest, alpha for name, type label for type.
-  const groups = {};
-  const order = [];
-  function pushGroup(name, p) {
-    if (!groups[name]) { groups[name] = []; order.push(name); }
-    groups[name].push(p);
-  }
-  if (sortMode === "newest" || sortMode === "oldest") {
-    const now = Date.now();
-    const buckets = ["Last hour","Today","Yesterday","This week","Older"];
-    buckets.forEach(b => { groups[b]=[]; order.push(b); });
-    filtered.forEach(p => {
-      const t = _ts(p);
-      const age = now - t;
-      let bucket = "Older";
-      if (age < 3600000) bucket = "Last hour";
-      else if (age < 86400000) bucket = "Today";
-      else if (age < 172800000) bucket = "Yesterday";
-      else if (age < 604800000) bucket = "This week";
-      groups[bucket].push(p);
-    });
-    if (sortMode === "oldest") order.reverse();
-  } else if (sortMode === "type") {
-    filtered.forEach(p => pushGroup(fileKindMeta(p).label, p));
-  } else { // name
-    filtered.forEach(p => {
-      const ch = (p.title||"?").charAt(0).toUpperCase();
-      pushGroup(/[A-Z]/.test(ch) ? ch : "#", p);
-    });
-  }
+  // Grouping aligns with the sort: time buckets for newest/oldest, alpha for
+  // name, type-then-date for type. Pipeline returns a flat render plan of
+  // {label, level: "flat"|"major"|"minor", files} so the render loop is
+  // uniform — type-mode shows a major header per type and minor date
+  // sub-headers inside; everything else uses flat headers.
+  const renderGroups = _buildRenderGroups(filtered, sortMode, _ts);
 
   // Capture the flat rendered order so shift-click range select and playback
   // sequence both follow the visible sort.
-  _currentDrawerOrder = order.flatMap(b => (groups[b]||[]).map(p => p.id));
+  _currentDrawerOrder = renderGroups.flatMap(g => g.files.map(p => p.id));
 
-  order.forEach(bucket=>{
-    if(!groups[bucket]||!groups[bucket].length)return;
-    const grp=mk("div","drawer-group");
-    const h=mk("div","drawer-group-h");h.textContent=bucket+" ("+groups[bucket].length+")";
+  renderGroups.forEach(g=>{
+    if(g.level === "major"){
+      // Type-mode major header: just the type label, no count (sum of inner
+      // dates). Stands alone outside any drawer-group div so sticky works.
+      const h=mk("div","drawer-group-h drawer-group-h-major");
+      h.textContent=g.label;
+      list.appendChild(h);
+      return;
+    }
+    if(!g.files.length)return;
+    const grp=mk("div","drawer-group"+(g.level === "minor" ? " drawer-group-minor" : ""));
+    const h=mk("div","drawer-group-h"+(g.level === "minor" ? " drawer-group-h-minor" : ""));
+    h.textContent=g.label+" ("+g.files.length+")";
     grp.appendChild(h);
-    groups[bucket].forEach(p=>{
+    g.files.forEach(p=>{
     const isSel = selectedPreviewIds.has(p.id);
     const meta = fileKindMeta(p);
     const card=mk("div","fp-card fp-kind-"+meta.kind+(expandedPreviewId===p.id?" active":"")+(isSel?" fp-selected":""));

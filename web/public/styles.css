@@ -308,8 +308,22 @@
   .summary-list{list-style:none;padding:0;margin:4px 0}
   .summary-list li{padding:3px 0;color:var(--text);font-size:11px;font-family:var(--mono);word-break:break-all;border-bottom:1px solid var(--border)}
   .summary-list li:last-child{border-bottom:none}
-  .drawer-group{margin-bottom:12px}
-  .drawer-group-h{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;padding:6px 4px;border-bottom:1px solid var(--border);margin-bottom:6px}
+  /* display:contents lets the inner header escape into .drawer-list so its
+     sticky anchors to that scroll container (not this short bucket div).
+     Margin re-applies via the last card's :last-child rule. */
+  .drawer-group{display:contents}
+  .drawer-group .fp-card:last-child{margin-bottom:12px}
+  /* Sticky: pin the date/type header to the top of .drawer-list while its
+     bucket scrolls under it, so the current bucket is always labelled.
+     surface bg + z-index keep file rows from bleeding through. */
+  .drawer-group-h{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;padding:6px 4px;border-bottom:1px solid var(--border);margin-bottom:6px;position:sticky;top:0;background:var(--surface);z-index:1}
+  /* Type-mode outer header — bigger, bolder, no border (the minor header below
+     it owns the divider). Stickies ABOVE the minor header in z-order. */
+  .drawer-group-h-major{font-size:13px;color:var(--text);font-weight:700;padding:10px 4px 4px;border-bottom:none;margin-bottom:0;z-index:3}
+  /* Type-mode inner date sub-header — slightly indented, plain weight. Stickies
+     BELOW the major header (top:30px is the major's measured height). */
+  .drawer-group-h-minor{padding-left:14px;text-transform:none;font-weight:500;color:var(--text);letter-spacing:0;top:30px;z-index:2}
+  .drawer-group-minor .fp-card{margin-left:14px}
   @media (max-width:768px){.summary-panel{position:fixed;right:0;top:env(safe-area-inset-top, 0px);z-index:12;height:calc(100% - env(safe-area-inset-top, 0px));width:85vw;max-width:360px}}
   .btn-mic{background:var(--surface2);color:var(--dim);border:1px solid var(--border);padding:10px 14px;border-radius:10px;font-size:16px;cursor:pointer;font-family:var(--mono);min-height:44px;min-width:44px;transition:all .15s}
   .btn-mic:hover{color:var(--accent);border-color:var(--accent)}
