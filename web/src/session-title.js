@@ -15,13 +15,32 @@ function generateSessionTitle(sessionId) {
   const convoMsgs = loadMessages(sessionId).filter(m =>
     (m.role === "user" || m.role === "assistant") && m.text && !m.synthetic && !m.stalled);
   if (!convoMsgs.length) return;
-  const _convo = convoMsgs.slice(-8)
+  // Always include the FIRST user message (it sets the topic) plus the last N
+  // — slicing only the tail can drop the original framing on long threads,
+  // pushing the titler to guess from late tool-chatter and bleed in unrelated
+  // context. With the first turn anchored, the title hugs the actual topic.
+  const _firstUser = convoMsgs.find(m => m.role === "user");
+  const _tail = convoMsgs.slice(-7);
+  const _seen = new Set();
+  const _ordered = [];
+  for (const m of [_firstUser, ..._tail].filter(Boolean)) {
+    const key = m.ts || (m.role + ":" + (m.text || "").slice(0, 40));
+    if (_seen.has(key)) continue;
+    _seen.add(key);
+    _ordered.push(m);
+  }
+  const _convo = _ordered
     .map(m => (m.role === "user" ? "User: " : "Assistant: ") + String(m.text).slice(0, 500))
     .join("\n\n");
-  const prompt = "You are titling a chat conversation. Output ONLY the title — 4 to 6 words, no quotes, no markdown, no period, no preface. DO NOT use any tools. DO NOT ask for clarification. If the conversation is unclear, make your best guess from the available context.\n\n"
-    + _convo.slice(0, 2500);
+  // Override the default system prompt (which auto-loads ~/.claude/CLAUDE.md
+  // — David's global ecosystem map mentions Mandarin/langHero, and the
+  // titler used to graft those topics onto unrelated voiceover work). Custom
+  // system prompt keeps the titler scoped to the conversation text only.
+  const _systemPrompt = "You are a session titler. You will receive a chat transcript. Output ONLY a 4-to-6-word title for THAT conversation. Use only words/concepts present in the transcript. Never invent topics not mentioned. No quotes, no markdown, no period, no preface.";
+  const prompt = "Transcript:\n\n" + _convo.slice(0, 2500);
   const _titleArgs = [
     "-p", prompt,
+    "--system-prompt", _systemPrompt,
     "--dangerously-skip-permissions",
     "--disallowedTools", "Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch", "WebSearch", "Agent", "NotebookEdit",
   ];
