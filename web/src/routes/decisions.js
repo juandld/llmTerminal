@@ -62,6 +62,10 @@ module.exports = function mountDecisions(app) {
         .run(id, parentId, ts, summary, chose, alts, why, cons, cost, mined);
       const newId = Number(result.lastInsertRowid);
       const row = db.prepare("SELECT * FROM decisions WHERE id = ?").get(newId);
+      try {
+        const { broadcastToSession } = require("../ws/broadcast");
+        broadcastToSession(id, { type: "decisions_updated" });
+      } catch {}
       res.json({ ok: true, decision: _normalizeDecisionRow(row) });
     } catch (e) {
       console.error("[decisions] insert failed:", e.message);
@@ -104,6 +108,50 @@ module.exports = function mountDecisions(app) {
     } catch (e) {
       console.error("[decisions] update failed:", e.message);
       res.status(500).json({ ok: false, error: "update failed" });
+    }
+  });
+
+  // David answers a pending decision from the drawer. Records the answer on the
+  // decision row (status -> 'answered', artifacts.answer), then feeds it back
+  // into the owning session as a queued user message so the agent — or an
+  // orchestrator worker watching via GET — resumes with the answer in hand.
+  app.post("/api/decisions/:did/answer", express.json(), (req, res) => {
+    if (!db) return res.status(503).json({ ok: false, error: "db unavailable" });
+    const did = Number(req.params.did);
+    const answer = String(req.body?.answer || "").trim();
+    const note = String(req.body?.note || "").trim();
+    if (!answer) return res.status(400).json({ ok: false, error: "answer is required" });
+    try {
+      const row = db.prepare("SELECT * FROM decisions WHERE id = ?").get(did);
+      if (!row) return res.status(404).json({ ok: false, error: "decision not found" });
+      if (row.mined) return res.status(409).json({ ok: false, error: "mined records are read-only" });
+      if (row.status !== "pending") return res.status(409).json({ ok: false, error: "already " + row.status });
+      let arts; try { arts = row.artifacts ? JSON.parse(row.artifacts) : {}; } catch { arts = {}; }
+      arts.answer = answer;
+      if (note) arts.answerNote = note;
+      arts.answeredAt = Date.now();
+      db.prepare("UPDATE decisions SET status = 'answered', artifacts = ? WHERE id = ?")
+        .run(JSON.stringify(arts), did);
+      // Feed the answer back as a normal queued prompt. Lazy requires:
+      // providers/claude requires sibling modules at load; a top-level require
+      // here would create a cycle through server.js.
+      try {
+        const { queueAppend, broadcastQueueState } = require("../queue");
+        const text = `Decision #${did} ("${row.summary}") — David answered: ${answer}` + (note ? `\nNote: ${note}` : "");
+        queueAppend(row.session_id, { text, source: "decision-answer" });
+        broadcastQueueState(row.session_id);
+        const { tryDrainQueue } = require("../providers/claude");
+        setTimeout(() => { try { tryDrainQueue(row.session_id); } catch (e) { console.error("[decisions] answer drain failed:", e.message); } }, 30);
+      } catch (e) { console.error("[decisions] answer feed-back failed:", e.message); }
+      try {
+        const { broadcastToSession } = require("../ws/broadcast");
+        broadcastToSession(row.session_id, { type: "decisions_updated" });
+      } catch {}
+      const updated = db.prepare("SELECT * FROM decisions WHERE id = ?").get(did);
+      res.json({ ok: true, decision: _normalizeDecisionRow(updated) });
+    } catch (e) {
+      console.error("[decisions] answer failed:", e.message);
+      res.status(500).json({ ok: false, error: "answer failed" });
     }
   });
 

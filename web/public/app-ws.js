@@ -167,6 +167,7 @@ function connect(project,sessionId){
         startBrowserPoll();
         if (modelSel) { modelSel.value = session.model || ""; applyModelDirty(); }
         updateStarBtn();
+        try { refreshDecisionsBadge(); } catch {}
         break;
       case "history":
         // Diff-based rendering: only append messages newer than what's already on screen
@@ -358,6 +359,13 @@ function connect(project,sessionId){
         break;
             case "permission_granted":
         if(msg.permission) grantedPerms.add(msg.permission);
+        break;
+      case "decisions_updated":
+        try { refreshDecisionsBadge(); } catch {}
+        try {
+          const _dw = document.getElementById("decisionsDrawer");
+          if (_dw && !_dw.classList.contains("hidden")) loadDecisions();
+        } catch {}
         break;
       case "title_updated":
         // Refresh the sidebar so the new title shows up.

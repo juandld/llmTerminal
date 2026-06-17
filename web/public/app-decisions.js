@@ -96,11 +96,39 @@ function renderDecisions(){
   // Wire expand toggles
   list.querySelectorAll(".dec-row").forEach(row => {
     row.addEventListener("click", (e) => {
-      if (e.target.closest("a") || e.target.closest("button")) return;
+      if (e.target.closest("a") || e.target.closest("button") || e.target.closest("input")) return;
       const id = row.dataset.did;
       if (_decisionsExpanded.has(id)) _decisionsExpanded.delete(id);
       else _decisionsExpanded.add(id);
       renderDecisions();
+    });
+  });
+  // Wire answer buttons (innerHTML re-render drops listeners, so re-wire each pass)
+  list.querySelectorAll("[data-answer-did]").forEach(btn => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const d = _decisions.find(x => String(x.id) === btn.dataset.answerDid);
+      if (!d) return;
+      const opts = _decAnswerOptions(d);
+      _answerDecision(btn.dataset.answerDid, opts[Number(btn.dataset.answerIdx)] || "", btn);
+    });
+  });
+  list.querySelectorAll("[data-answer-send]").forEach(btn => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const id = btn.dataset.answerSend;
+      const inp = list.querySelector(`[data-answer-input="${CSS.escape(id)}"]`);
+      _answerDecision(id, (inp && inp.value) || "", btn);
+    });
+  });
+  list.querySelectorAll("[data-answer-input]").forEach(inp => {
+    inp.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        const id = inp.dataset.answerInput;
+        const btn = list.querySelector(`[data-answer-send="${CSS.escape(id)}"]`);
+        _answerDecision(id, inp.value, btn);
+      }
     });
   });
 }
@@ -109,8 +137,66 @@ function _decStatusClass(s){ return "dec-status-" + (s || "pending"); }
 function _decStatusIcon(s){
   return s === "verified" ? "✓"
        : s === "reversed" ? "↺"
+       : s === "answered" ? "✦"
        : s === "mined"    ? "~"
        : "•";
+}
+
+// A pending, explicitly-recorded decision (not auto-mined) is answerable by
+// David from the drawer. The "ask David" convention: agents set
+// chose = "ask David (proposed: <recommendation>)" with the options in
+// alternatives — but any open fork can be answered/redirected.
+const _DEC_ASK_RE = /^ask\s+(david|user|me)\b/i;
+function _decIsAnswerable(d){ return !!d && !d.mined && d.status === "pending"; }
+function _decAnswerOptions(d){
+  const opts = [];
+  if (d.chose) {
+    const m = d.chose.match(/\(proposed:?\s*([^)]+)\)/i);
+    if (m && m[1].trim()) opts.push(m[1].trim());
+    else if (!_DEC_ASK_RE.test(d.chose)) opts.push(d.chose);
+  }
+  if (Array.isArray(d.alternatives)) {
+    for (const a of d.alternatives) { if (a && !opts.includes(a)) opts.push(a); }
+  }
+  return opts;
+}
+
+async function _answerDecision(id, answer, btn){
+  answer = (answer || "").trim();
+  if (!answer) return;
+  const err = document.querySelector(`[data-answer-err="${id}"]`);
+  if (err) err.textContent = "";
+  if (btn) { btn.disabled = true; btn.dataset.prevText = btn.textContent; btn.textContent = "Sending…"; }
+  try {
+    const r = await fetch(apiUrl("/api/decisions/" + encodeURIComponent(id) + "/answer"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ answer })
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || !data.ok) throw new Error((data && data.error) || ("HTTP " + r.status));
+    _decisionsExpanded.delete(String(id));
+    await loadDecisions();
+    refreshDecisionsBadge();
+  } catch (e) {
+    if (btn) { btn.disabled = false; btn.textContent = btn.dataset.prevText || "Retry"; }
+    if (err) err.textContent = "⚠ " + (e.message || "failed");
+  }
+}
+
+// Pending-answerable count on the topbar Decisions button (desktop + mobile
+// overflow). Fetched per-project: same scope the drawer defaults to.
+async function refreshDecisionsBadge(){
+  try {
+    if (!session || !session.project) return;
+    const r = await fetch(apiUrl("/api/projects/" + encodeURIComponent(session.project) + "/decisions"));
+    const data = await r.json();
+    const n = (data.decisions || []).filter(_decIsAnswerable).length;
+    for (const elId of ["decisionsBadge", "decisionsBadgeMobile"]) {
+      const el = document.getElementById(elId);
+      if (el) { el.textContent = String(n); el.style.display = n ? "" : "none"; }
+    }
+  } catch {}
 }
 
 function _renderDecisionRow(d, depth){
@@ -119,6 +205,7 @@ function _renderDecisionRow(d, depth){
   const indent = depth ? `style="margin-left:${depth * 18}px"` : "";
   const stClass = _decStatusClass(d.status);
   const ic = _decStatusIcon(d.status);
+  const answerable = _decIsAnswerable(d);
   let body = "";
   if (expanded) {
     const alts = Array.isArray(d.alternatives) && d.alternatives.length
@@ -140,19 +227,38 @@ function _renderDecisionRow(d, depth){
       } catch {}
     }
     const mined = d.mined ? ` <span class="dec-mined" title="Auto-extracted, lower confidence">mined</span>` : "";
+    let answerBlock = "";
+    if (answerable) {
+      const opts = _decAnswerOptions(d);
+      const optBtns = opts.map((o, i) =>
+        `<button class="dec-answer-btn" data-answer-did="${id}" data-answer-idx="${i}">${esc(o)}</button>`).join("");
+      answerBlock = `
+        <div class="dec-answer">
+          <div class="dec-label">Your answer</div>
+          <div class="dec-answer-opts">${optBtns}</div>
+          <div class="dec-answer-free">
+            <input type="text" class="dec-answer-input" data-answer-input="${id}" placeholder="Or type your own…">
+            <button class="dec-answer-send" data-answer-send="${id}">Send</button>
+          </div>
+          <div class="dec-answer-err" data-answer-err="${id}"></div>
+        </div>`;
+    }
     body = `
       <div class="dec-detail">
         <div class="dec-section"><div class="dec-label">Chose</div><div>${esc(d.chose)}</div></div>
         <div class="dec-section"><div class="dec-label">Alternatives</div><ul>${alts}</ul></div>
         <div class="dec-section"><div class="dec-label">Why</div><div>${esc(d.why || "")}</div></div>
         ${cons}${cost}${arts}
+        ${answerBlock}
         <div class="dec-meta">#${id} · ${esc(d.status)}${mined}</div>
       </div>`;
   }
+  const chip = answerable ? `<span class="dec-answer-chip">answer</span>` : "";
   return `<div class="dec-row" data-did="${id}" ${indent}>
     <div class="dec-headline">
       <span class="dec-dot ${stClass}" title="${esc(d.status)}">${ic}</span>
       <div class="dec-title">${esc(d.summary)}</div>
+      ${chip}
       <div class="dec-when">${relativeTime(d.ts)}</div>
     </div>
     ${body}
