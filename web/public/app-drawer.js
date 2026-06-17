@@ -577,7 +577,9 @@ function renderAttachmentsHtml(previewId,attachments){
 function openFileModal(title, filePath) {
   const ext = filePath.split('.').pop().toLowerCase();
   const url = apiUrl('/api/file?path=' + encodeURIComponent(filePath));
-  const icon = ext === 'pdf' ? '📕' : ['png','jpg','jpeg','gif','svg'].includes(ext) ? '🖼' : '📄';
+  const isAudio = ['mp3','wav','m4a','ogg','webm','aac','flac','opus'].includes(ext);
+  const isVideo = ['mp4','mov'].includes(ext);
+  const icon = ext === 'pdf' ? '📕' : ['png','jpg','jpeg','gif','svg'].includes(ext) ? '🖼' : isAudio ? '🎵' : isVideo ? '🎬' : '📄';
   document.getElementById('fm-icon').textContent = icon;
   document.getElementById('fm-title').textContent = title;
   const link = document.getElementById('fm-open-tab');
@@ -594,6 +596,19 @@ function openFileModal(title, filePath) {
     el = document.createElement('img');
     el.src = url;
     el.alt = title;
+  } else if (isAudio) {
+    el = document.createElement('audio');
+    el.controls = true;
+    el.autoplay = true;
+    el.preload = 'metadata';
+    el.src = url;
+    el.style.width = '100%';
+  } else if (isVideo) {
+    el = document.createElement('video');
+    el.controls = true;
+    el.preload = 'metadata';
+    el.src = url;
+    el.style.maxWidth = '100%';
   } else {
     el = document.createElement('pre');
     fetch(url).then(r=>r.text()).then(t=>{ el.textContent = t; }).catch(()=>{ el.textContent = 'Could not load file.'; });

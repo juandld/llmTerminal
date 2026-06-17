@@ -209,6 +209,22 @@ function copyCodeFromBtn(btn){
   }catch(e){btn.textContent="Failed"}
 }
 
+// Intercept clicks on file:// links in chat messages — those are produced by
+// skills (e.g. /generate-takes) that render comparison tables with each cell
+// linking to a generated file. Open the preview modal instead of letting the
+// browser try to navigate to file:// (which doesn't work across the
+// sandbox / nginx anyway). Delegated handler — survives DOM re-renders.
+chat.addEventListener("click", (e) => {
+  const a = e.target && e.target.closest && e.target.closest('a[href^="file:"]');
+  if (!a) return;
+  e.preventDefault();
+  let fp = decodeURIComponent(a.getAttribute("href") || "");
+  fp = fp.replace(/^file:\/\/\/?/, "/").replace(/^\/+/, "/");
+  if (!fp.startsWith("/")) return;
+  const title = a.textContent.trim() || fp.split("/").pop();
+  if (typeof openFileModal === "function") openFileModal(title, fp);
+});
+
 // Long-press / right-click copy on messages
 (function setupMessageCopy(){
   let pressTimer=null;
