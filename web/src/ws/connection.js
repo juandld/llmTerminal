@@ -96,6 +96,7 @@ getWss().on("connection", (ws, req) => {
     messages: initialSlice,
     total: allMessages.length,
     offset: Math.max(0, allMessages.length - recentSlice.length),
+    busy: activeProcBySession.has(session.id),
   }));
 
   // Send current permission state so frontend knows what's already allowed
@@ -577,23 +578,9 @@ getWss().on("connection", (ws, req) => {
             return;
           }
         }
-        if (activeProc || activeProcBySession.has(session.id)) {
-          // Already running (on this WS, or on another WS for the same session
-          // after a mobile reconnect) — write the new prompt to the persistent
-          // queue. It will auto-fire when the current run completes (see onDone).
-          queueAppend(session.id, { text: msg.text || "", source: "prompt", client_id: msg.client_id });
-          wsSend(ws, "queued", { client_id: msg.client_id, queueDepth: queueLoad(session.id).length });
-          // Broadcast new queue contents to every connected client on this session so
-          // other tabs/devices see the pending bubble too.
-          broadcastQueueState(session.id);
-          return;
-        }
-
-        const text = msg.text.trim();
-        if (!text) return;
-
-        // Handle attached images
-        let prompt = text;
+        // Process images UP FRONT so the queue (if we queue) carries the augmented
+        // prompt — otherwise queued prompts would silently drop their images on drain.
+        const text = (msg.text || "").trim();
         const images = Array.isArray(msg.images) ? msg.images : [];
         const imagePaths = [];
         for (const img of images) {
@@ -602,10 +589,36 @@ getWss().on("connection", (ws, req) => {
             imagePaths.push(p);
           }
         }
+        let prompt = text;
         if (imagePaths.length > 0) {
           const imageRefs = imagePaths.map((p, i) => `[Image ${i + 1}: ${p}]`).join(" ");
           prompt = `${text}\n\nThe user attached ${imagePaths.length} image(s). Read them with the Read tool to see them: ${imageRefs}`;
         }
+        const _source = msg.source || "prompt";
+        const _audioUrl = msg.audioUrl || null;
+
+        if (activeProc || activeProcBySession.has(session.id)) {
+          // Already running (on this WS, or on another WS for the same session
+          // after a mobile reconnect) — write the new prompt to the persistent
+          // queue. It will auto-fire when the current run completes (see onDone).
+          // Carry promptText (image-augmented) so drain fires the right text to
+          // Claude; text (the user's actual words) is what we persist + display.
+          queueAppend(session.id, {
+            text: text || "",
+            promptText: prompt,
+            source: _source,
+            audioUrl: _audioUrl,
+            hasImages: imagePaths.length > 0,
+            client_id: msg.client_id
+          });
+          wsSend(ws, "queued", { client_id: msg.client_id, queueDepth: queueLoad(session.id).length });
+          // Broadcast new queue contents to every connected client on this session so
+          // other tabs/devices see the pending bubble too.
+          broadcastQueueState(session.id);
+          return;
+        }
+
+        if (!text) return;
 
         session.messageCount++;
         if (session.messageCount === 1) session.title = text.slice(0, 80);
@@ -625,7 +638,7 @@ getWss().on("connection", (ws, req) => {
         updateSessionInStore(session);
 
         // Save user message
-        saveMessage(session.id, { role: "user", text, ts: Date.now(), client_id: msg.client_id, hasImages: imagePaths.length > 0 });
+        saveMessage(session.id, { role: "user", text, ts: Date.now(), client_id: msg.client_id, hasImages: imagePaths.length > 0, source: _source, audioUrl: _audioUrl });
 
         ws.send(JSON.stringify({ type: "thinking" }));
 

@@ -38,19 +38,30 @@ function renderPendingItems(items){
         continue;
       }
     } else {
-      // No client_id — dedupe by text against any already-queued bubble
-      const candidates=chat.querySelectorAll('.msg.user.queued');
+      // No client_id — dedupe by text against any already-queued bubble, or a
+      // rich local voice bubble (the recording device already shows one)
+      const candidates=chat.querySelectorAll('.msg.user.queued, .msg.user.voice-note-msg');
       let dup=false;
       for(const c of candidates){
         if(c.textContent && c.textContent.includes(item.text.slice(0,40))){dup=true;break;}
       }
       if(dup) continue;
     }
-    const d=mk("div","msg user queued");
-    if(item.client_id) d.dataset.clientId=item.client_id;
-    d.appendChild(document.createTextNode(item.text));
-    const badge=mk("span","queued-badge");
     const isVoice=item.source==="voice-note";
+    let d;
+    if(isVoice){
+      // Render as a proper voice-note bubble (collapsed transcript + audio player).
+      // The "queued" class adds the pending-state styling; unmarkOldestQueuedUserMessage
+      // strips it + the badge when the voice note fires, leaving a clean voice-note-msg.
+      d=buildVoiceNoteHistoryEl({text:item.text, audioUrl:item.audioUrl});
+      d.classList.add("queued");
+      if(item.client_id) d.dataset.clientId=item.client_id;
+    } else {
+      d=mk("div","msg user queued");
+      if(item.client_id) d.dataset.clientId=item.client_id;
+      d.appendChild(document.createTextNode(item.text));
+    }
+    const badge=mk("span","queued-badge");
     badge.textContent=isVoice ? "queued voice note — will fire when Claude is idle"
                               : "queued — will fire when Claude is idle";
     badge.title="Stored on the server. It will be sent automatically when the current turn finishes.";
@@ -124,6 +135,66 @@ function addVoiceNoteUser(blob,duration,imagePreviews){
   vn.appendChild(transcript);
   d.appendChild(vn);
   chat.appendChild(d);scrollToBottomForce();
+  return d;
+}
+// Voice-note bubble built from the persisted message ({text, audioUrl?}) rather
+// than a local recording blob — used for history re-render after reconnect and
+// for cross-device display. The transcript is collapsed by default (long notes
+// would otherwise dominate the chat scrollback); tap "Show transcript" to expand.
+function buildVoiceNoteHistoryEl(m){
+  const d=mk("div","msg user voice-note-msg");
+  const vn=mk("div","vn-bubble");
+  const title=mk("div","vn-title");title.textContent="🎙 Voice note";
+  vn.appendChild(title);
+  if(m.audioUrl){
+    const audio=document.createElement("audio");
+    audio.src=m.audioUrl;
+    audio.preload="metadata";
+    const playBtn=mk("button","vn-play");playBtn.textContent="▶";
+    playBtn.onclick=()=>{
+      if(audio.paused){audio.play();playBtn.textContent="⏸";}
+      else{audio.pause();playBtn.textContent="▶";}
+    };
+    audio.onended=()=>{playBtn.textContent="▶";};
+    audio.onpause=()=>{playBtn.textContent="▶";};
+    audio.onplay=()=>{playBtn.textContent="⏸";};
+    const wave=mk("div","vn-wave");
+    for(let i=0;i<20;i++){const bar=mk("div","vn-bar");bar.style.height=Math.max(4,Math.random()*16)+"px";wave.appendChild(bar);}
+    const dur=mk("span","vn-duration");
+    audio.onloadedmetadata=()=>{
+      if(!isFinite(audio.duration))return;
+      const s=Math.round(audio.duration);
+      dur.textContent=Math.floor(s/60)+":"+(s%60<10?"0":"")+(s%60);
+    };
+    audio.ontimeupdate=()=>{
+      if(!audio.duration)return;
+      const pct=audio.currentTime/audio.duration*100;
+      wave.style.background=`linear-gradient(90deg,var(--accent) ${pct}%,var(--surface2) ${pct}%)`;
+    };
+    const row=mk("div","vn-row");
+    row.appendChild(playBtn);row.appendChild(wave);row.appendChild(dur);
+    vn.appendChild(row);
+  }
+  const text=m.text||"";
+  if(text){
+    const toggle=mk("button","vn-toggle vn-ready");
+    toggle.textContent="Show transcript";
+    const transcript=mk("div","vn-transcript vn-history");
+    transcript.textContent=text;
+    toggle.onclick=()=>{
+      const open=transcript.classList.toggle("vn-open");
+      toggle.textContent=open?"Hide transcript":"Show transcript";
+    };
+    vn.appendChild(toggle);
+    vn.appendChild(transcript);
+  }
+  d.appendChild(vn);
+  return d;
+}
+function addVoiceNoteFromHistory(m){
+  const d=buildVoiceNoteHistoryEl(m);
+  chat.appendChild(d);
+  scrollToBottomIfSticky();
   return d;
 }
 // Renders the supervisor's contract-check wrap-up as a visually distinct

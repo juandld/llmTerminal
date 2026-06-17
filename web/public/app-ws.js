@@ -192,7 +192,8 @@ function connect(project,sessionId){
         let newestTs=lastRenderedTs;
         (msg.messages||[]).forEach(m=>{
           const ts=m.ts||0;
-          if(m.role==="user"&&m.source!=="voice-note") addUser(m.text);
+          if(m.role==="user"&&m.source==="voice-note") addVoiceNoteFromHistory(m);
+          else if(m.role==="user") addUser(m.text, null, m.client_id || null);
           else if(m.role==="question") addQuestion(m.text);
           else if(m.role==="permission_denied") addPermissionCardFromHistory({tool_name:m.tool_name,tool_input:m.tool_input,message:m.message});
           else if(m.role==="assistant") addAssistant(m.text, { source: m.source });
@@ -206,7 +207,8 @@ function connect(project,sessionId){
           }
         });
         lastRenderedTs=newestTs;
-        setBusy(false);
+        // Server-authoritative: if a run is in flight for this session, show Stop button
+        setBusy(!!msg.busy);
         setTimeout(restoreChatScroll,0);
         break;
       case "history_prepend":
@@ -230,6 +232,10 @@ function connect(project,sessionId){
             const line=mk("div","msg tool-activity-line");
             line.textContent="\u25B8 "+(m.tool_name||"?")+(m.summary?": "+m.summary:"");
             frag.appendChild(line);
+            return;
+          }
+          if(m.role==="user"&&m.source==="voice-note"){
+            frag.appendChild(buildVoiceNoteHistoryEl(m));
             return;
           }
           const d=mk("div","msg "+(m.role==="user"?"user":m.role==="question"?"question":"assistant"));
@@ -307,7 +313,29 @@ function connect(project,sessionId){
               fired.dataset.ts = msg.ts;
               if (msg.ts > lastRenderedTs) lastRenderedTs = msg.ts;
             }
-          } else if (msg.source !== "voice-note") {
+          } else if (msg.source === "voice-note") {
+            // The recording device already shows a rich local bubble — claim the
+            // matching untagged one instead of double-rendering. Render fresh only
+            // when none exists (other device, or page reloaded since recording).
+            const locals = chat.querySelectorAll('.msg.user.voice-note-msg:not([data-ts])');
+            let claimed = null;
+            for (const el of locals) {
+              if (msg.text && el.textContent && el.textContent.includes(msg.text.slice(0, 40))) { claimed = el; break; }
+            }
+            if (!claimed && locals.length) claimed = locals[0];
+            if (claimed) {
+              if (msg.ts) {
+                claimed.dataset.ts = msg.ts;
+                if (msg.ts > lastRenderedTs) lastRenderedTs = msg.ts;
+              }
+            } else {
+              const d = addVoiceNoteFromHistory(msg);
+              if (msg.ts) {
+                d.dataset.ts = msg.ts;
+                if (msg.ts > lastRenderedTs) lastRenderedTs = msg.ts;
+              }
+            }
+          } else {
             const d = addUser(msg.text || "", null, msg.client_id || null);
             if (msg.ts) {
               d.dataset.ts = msg.ts;

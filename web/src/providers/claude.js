@@ -44,8 +44,8 @@ function fireQueueHeadless(sessionId) {
   _persistSessionIfNew(session);
   updateSessionInStore(session);
   const firingTs = next.ts || Date.now();
-  saveMessage(sessionId, { role: "user", text: next.text, ts: firingTs, source: next.source, client_id: next.client_id });
-  broadcastToSession(sessionId, { type: "queued_prompt_firing", text: next.text, source: next.source, client_id: next.client_id, ts: firingTs });
+  saveMessage(sessionId, { role: "user", text: next.text, ts: firingTs, source: next.source, client_id: next.client_id, audioUrl: next.audioUrl, hasImages: !!next.hasImages });
+  broadcastToSession(sessionId, { type: "queued_prompt_firing", text: next.text, source: next.source, client_id: next.client_id, ts: firingTs, audioUrl: next.audioUrl });
   broadcastToSession(sessionId, { type: "thinking", session_id: sessionId });
   broadcastQueueState(sessionId);
   const cwd = path.join(PROJECTS_DIR, session.project);
@@ -55,9 +55,11 @@ function fireQueueHeadless(sessionId) {
   const extraAllowedTools = perms ? [...perms] : [];
   const _provider = getProvider(session.model);
   const _runFn = _provider === "openai" ? runOpenAI : _provider === "google" ? runGoogle : runClaude;
+  // Fire the image-augmented prompt (with [Image N: path] refs) if present; else plain text.
+  const _firePrompt = next.promptText || next.text;
   const _runArgs = _provider === "claude"
-    ? { project: session.project, prompt: next.text, claudeSessionId: session.claudeSessionId, cwd, extraAllowedTools, model: session.model, sessionId, effort: _effort }
-    : { prompt: next.text, sessionId, model: session.model, project: session.project, effort: _effort };
+    ? { project: session.project, prompt: _firePrompt, claudeSessionId: session.claudeSessionId, cwd, extraAllowedTools, model: session.model, sessionId, effort: _effort }
+    : { prompt: _firePrompt, sessionId, model: session.model, project: session.project, effort: _effort };
   if (_provider === "claude") killExistingClaudeFor(session.claudeSessionId);
   let _assistantTextEmittedThisTurn = false;
   let lastToolUse = null;
@@ -204,13 +206,15 @@ function tryDrainQueue(sessionId) {
   _persistSessionIfNew(session);
   updateSessionInStore(session);
   const firingTs = next.ts || Date.now();
-  saveMessage(sessionId, { role: "user", text: next.text, ts: firingTs, source: next.source, client_id: next.client_id });
-  try { target.send(JSON.stringify({ type: "queued_prompt_firing", text: next.text, source: next.source, client_id: next.client_id, ts: firingTs })); } catch {}
+  saveMessage(sessionId, { role: "user", text: next.text, ts: firingTs, source: next.source, client_id: next.client_id, audioUrl: next.audioUrl, hasImages: !!next.hasImages });
+  try { target.send(JSON.stringify({ type: "queued_prompt_firing", text: next.text, source: next.source, client_id: next.client_id, ts: firingTs, audioUrl: next.audioUrl })); } catch {}
   try { target.send(JSON.stringify({ type: "thinking" })); } catch {}
   // Tell every client on this session that one item just left the queue, so the
   // pending-bubble list re-renders without the popped item.
   broadcastQueueState(sessionId);
-  target._sendToSession(next.text, false);
+  // Fire the IMAGE-AUGMENTED prompt text (with [Image N: path] refs) if the queue
+  // item was an image-bearing prompt. Otherwise fall back to the plain transcript/text.
+  target._sendToSession(next.promptText || next.text, false);
 }
 
 // ---- killExistingClaudeFor ----

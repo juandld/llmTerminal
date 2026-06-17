@@ -773,7 +773,11 @@ app.post("/voice-note", express.raw({ type: ["audio/*", "application/octet-strea
     // This guarantees the prompt is recorded server-side even if the client crashes / refreshes
     // before sending it.
     // Routing target was resolved up front (_routedSid: WS-bound nonce, or legacy ?session=).
-    if (_routedSid && result.text) {
+    // noQueue=1: client will fire its own WS prompt with this transcript + attached
+    // images, so we must NOT queue here (else two separate Claude turns fire — one for
+    // the transcript-alone, one for the text+images). Still attribute the audio file.
+    const _noQueue = !!(req.query && req.query.noQueue);
+    if (_routedSid && result.text && !_noQueue) {
       console.log(`[voice-note] routing to session=${_routedSid.slice(0,8)}… (mode=${_routingMode})`);
       queueAppend(_routedSid, { text: result.text, source: "voice-note", audioUrl: "/voice-notes/" + name });
       // Show the pending voice-note bubble to every client on this session.
@@ -782,6 +786,8 @@ app.post("/voice-note", express.raw({ type: ["audio/*", "application/octet-strea
       try { broadcastQueueState(_routedSid); } catch {}
       // Try to drain immediately if the session isn't currently running anything
       try { tryDrainQueue(_routedSid); } catch (e) { console.error("[queue] drain attempt failed:", e.message); }
+    }
+    if (_routedSid && result.text) {
       // Robust attribution: link the saved audio file to the session in the sidecar log
       logFileAttribution(filePath, _routedSid, "voice-note");
     }

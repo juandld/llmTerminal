@@ -165,9 +165,13 @@ async function sendVoiceNote(blob){
     // Prefer the WS-bound nonce — it proves this upload is from the currently-open
     // socket. Falls back to bare session= only if nonce hasn't arrived yet (server
     // logs that path as deprecated).
-    const qs = currentVoiceNonce
+    // noQueue=1 when images are attached: we want ONE message (the WS prompt below,
+    // which carries both transcript + images), not two (server-queued transcript +
+    // client-WS image prompt) firing as separate Claude turns.
+    let qs = currentVoiceNonce
       ? "?nonce="+encodeURIComponent(currentVoiceNonce)
       : (sid?"?session="+encodeURIComponent(sid):"");
+    if(vnImages.length){ qs += (qs?"&":"?") + "noQueue=1"; }
     // Track upload progress via XMLHttpRequest for real upload %
     const data=await new Promise((resolve,reject)=>{
       const xhr=new XMLHttpRequest();
@@ -206,12 +210,15 @@ async function sendVoiceNote(blob){
     // Update audio src to server URL
     const audioEl=msgEl.querySelector("audio");
     if(audioEl&&data.audioUrl) audioEl.src=data.audioUrl;
-    // Server already queued the transcript — only send from client if images attached
+    // Server already queued the transcript — only send from client if images attached.
+    // When images attached we passed noQueue=1 above, so server did NOT queue. Send
+    // text + images as ONE WS prompt, tagged with voice-note metadata so it persists
+    // as a proper voice-note bubble on reload.
     if(data.transcript&&vnImages.length){
       const clientId=genMsgId();
       outbox.push({id:clientId,text:data.transcript,images:vnImages,ts:Date.now()});saveOutbox();
       if(ws&&ws.readyState===1){
-        ws.send(JSON.stringify({type:"prompt",client_id:clientId,text:data.transcript,images:vnImages}));
+        ws.send(JSON.stringify({type:"prompt",client_id:clientId,text:data.transcript,images:vnImages,source:"voice-note",audioUrl:data.audioUrl}));
         setBusy(true);
       }
     }

@@ -56,6 +56,7 @@ function broadcastQueueState(sessionId) {
     source: it.source || "prompt",
     client_id: it.client_id || null,
     ts: it.ts || null,
+    audioUrl: it.audioUrl || null,
   }));
   broadcastToSession(sessionId, { type: "queue_state", queueDepth: items.length, items });
 }

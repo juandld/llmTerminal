@@ -910,6 +910,9 @@
 }
 .vn-transcript.vn-open{max-height:500px;margin-top:6px}
 .vn-transcript.vn-error{color:#e74c3c;font-style:normal;max-height:500px;margin-top:6px}
+/* History/cross-device voice bubble: collapsed by default, full text on tap (no 500px cap) */
+.vn-transcript.vn-history{color:var(--text);font-style:normal}
+.vn-transcript.vn-history.vn-open{max-height:none;margin-top:6px}
 
 /* ── Task board styles ── */
 .tk-group{margin-bottom:6px}
