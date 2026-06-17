@@ -451,7 +451,13 @@ getWss().on("connection", (ws, req) => {
                 synthetic: "empty-result-after-tools",
               });
             }
-            wsSend(ws, "done", {
+            // Broadcast (not wsSend) so reconnected / sibling tabs of the same
+            // session also see "done" — otherwise a tab that reconnected after
+            // the originating socket dropped will never refresh its drawer
+            // for files generated this turn. Bug surfaced 2026-06-17 on a
+            // mobile-Safari tab that kept reconnecting under the agent.
+            broadcastToSession(session.id, {
+              type: "done",
               result,
               cost: data.total_cost_usd,
               duration: data.duration_ms,

@@ -17,7 +17,14 @@ document.addEventListener("visibilitychange",()=>{
     console.log("[visibility] page visible, reconnecting (wsAlive="+wsAlive+", stale="+stale+", session="+sid+")");
     chat.innerHTML=""; lastRenderedTs=0;
     connect(proj,sid); // connect() already cleans up old ws
+    return; // connect() will refreshPreviews on `ready`
   }
+  // WS is technically open + recent, but mobile Safari may have queued/throttled
+  // events while the tab was hidden — most-felt symptom: the file drawer goes
+  // stale because the "done" event from a completed mid-background run never
+  // ran its handler. Fetch drawer fresh on every visibility-visible so files
+  // generated while away still appear.
+  try { refreshPreviews(false); } catch {}
 });
 
 function send(){
