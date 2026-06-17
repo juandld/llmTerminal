@@ -685,16 +685,50 @@ function _dateBucket(t, now){
   return _calendarBucket(t, now);
 }
 // Produce a flat render plan from `filtered` (already sorted by sortMode).
-// Each entry is {label, level: "flat"|"major"|"minor", files}:
-//   - "flat":  one bucket header + its files (newest/oldest/name sort)
-//   - "major": a type header with no files (type sort outer)
-//   - "minor": a date sub-header with files (type sort inner)
+// Each entry is {label, level, files, batchKey?}:
+//   - "flat":  one bucket header + its files (empty label = loose, no header)
+//   - "major": top-level header with no files of its own (date or type outer)
+//   - "minor": sub-header + its files (batch sub-group, indented + sticky)
+function _parentDirOf(p){
+  const bt=p && p.content && p.content.body_text || "";
+  if(!bt.startsWith("FILE_PATH:")) return null;
+  const fp=bt.slice("FILE_PATH:".length);
+  const i=fp.lastIndexOf("/");
+  return i > 0 ? fp.slice(0, i) : null;
+}
+function _parentDirLabel(fullDir){
+  if(!fullDir) return "";
+  const parts=fullDir.split("/");
+  return parts[parts.length - 1] || "";
+}
+// Subdivide a flat list of files by parent dir. Dirs with ≥2 files become
+// "minor" sub-buckets; singletons (and orphans with no parent dir) emit as
+// loose "flat" groups with no label so they render without a header.
+function _splitByBatchDir(files, out){
+  const byDir=new Map();
+  const dirOrder=[];
+  for(const p of files){
+    const dir=_parentDirOf(p);
+    const key=dir || "__none__";
+    if(!byDir.has(key)){ byDir.set(key, []); dirOrder.push(key); }
+    byDir.get(key).push(p);
+  }
+  for(const key of dirOrder){
+    const items=byDir.get(key);
+    if(key !== "__none__" && items.length >= 2){
+      out.push({label: _parentDirLabel(key), level: "minor", files: items, batchKey: key});
+    } else {
+      for(const p of items) out.push({label: "", level: "flat", files: [p]});
+    }
+  }
+}
 function _buildRenderGroups(filtered, sortMode, _ts){
   const now=Date.now();
   const out=[];
   if(sortMode === "newest" || sortMode === "oldest"){
-    // Bucket discovery order follows `filtered`'s sort, so buckets emerge
-    // newest-first (or oldest-first via reverse below).
+    // Bucket by date, then within each date sub-bucket by parent directory
+    // (the natural on-disk batch boundary — files generated together land in
+    // the same folder). Singletons render flush under the date header.
     const buckets=new Map();
     for(const p of filtered){
       const b=_dateBucket(_ts(p), now);
@@ -703,30 +737,38 @@ function _buildRenderGroups(filtered, sortMode, _ts){
     }
     const order=[...buckets.keys()];
     if(sortMode === "oldest") order.reverse();
-    for(const label of order) out.push({label, level: "flat", files: buckets.get(label)});
+    for(const label of order){
+      const filesInBucket=buckets.get(label);
+      // Look-ahead: do we have any batch (≥2 same-dir siblings) inside? If
+      // yes, render date as MAJOR + batches as MINOR. If not, render date as
+      // FLAT (current behaviour for thin buckets).
+      const dirCounts=new Map();
+      for(const p of filesInBucket){
+        const d=_parentDirOf(p);
+        if(d) dirCounts.set(d, (dirCounts.get(d) || 0) + 1);
+      }
+      const hasBatch=[...dirCounts.values()].some(n => n >= 2);
+      if(hasBatch){
+        out.push({label, level: "major", files: []});
+        _splitByBatchDir(filesInBucket, out);
+      } else {
+        out.push({label, level: "flat", files: filesInBucket});
+      }
+    }
   } else if(sortMode === "type"){
-    // Outer = type label (Audio / Image / …), inner = date buckets. Decided
-    // 2026-06-17 — David hunts by type then wants the time dimension inside.
+    // Outer = type label (Audio / Image / …), inner = batch dirs (decided
+    // 2026-06-17, then revised the same day to use batch dirs instead of
+    // dates — David hunts by type then by generation batch).
     const byType=new Map();
     for(const p of filtered){
       const tl=fileKindMeta(p).label;
-      const db=_dateBucket(_ts(p), now);
-      if(!byType.has(tl)) byType.set(tl, new Map());
-      const inner=byType.get(tl);
-      if(!inner.has(db)) inner.set(db, []);
-      inner.get(db).push(p);
+      if(!byType.has(tl)) byType.set(tl, []);
+      byType.get(tl).push(p);
     }
     const typeOrder=[...byType.keys()].sort();
     for(const tl of typeOrder){
       out.push({label: tl, level: "major", files: []});
-      // Inner date order = newest sub-bucket first (regardless of outer sort).
-      const inner=byType.get(tl);
-      const innerOrder=[...inner.keys()].sort((a,b) => {
-        const ma=Math.max(...inner.get(a).map(p => _ts(p)));
-        const mb=Math.max(...inner.get(b).map(p => _ts(p)));
-        return mb - ma;
-      });
-      for(const db of innerOrder) out.push({label: db, level: "minor", files: inner.get(db)});
+      _splitByBatchDir(byType.get(tl), out);
     }
   } else { // name
     const buckets=new Map();
@@ -740,6 +782,27 @@ function _buildRenderGroups(filtered, sortMode, _ts){
     for(const label of order) out.push({label, level: "flat", files: buckets.get(label)});
   }
   return out;
+}
+
+// Play every audio file in a batch (= files whose parent directory matches).
+// Sort by created_at so playback follows generation order. Used by the ▶ on
+// drawer batch sub-headers.
+function playBatchByDir(parentPath){
+  const items=sessionPreviews
+    .filter(p => _parentDirOf(p) === parentPath)
+    .filter(p => { const k=fileKindMeta(p).kind; return k === "audio" || k === "voice"; })
+    .sort((a,b) => new Date(a.created_at) - new Date(b.created_at))
+    .map(p => {
+      const bt=(p.content && p.content.body_text) || "";
+      if(!bt.startsWith("FILE_PATH:")) return null;
+      const fp=bt.slice("FILE_PATH:".length);
+      return { id: p.id, url: apiUrl("/api/file?path=" + encodeURIComponent(fp)), title: p.title || fp.split("/").pop() };
+    })
+    .filter(Boolean);
+  if(!items.length) return;
+  _playbackQueue=items;
+  _playbackIndex=0;
+  _playCurrent();
 }
 
 function renderDrawer(){
@@ -792,9 +855,28 @@ function renderDrawer(){
     }
     if(!g.files.length)return;
     const grp=mk("div","drawer-group"+(g.level === "minor" ? " drawer-group-minor" : ""));
-    const h=mk("div","drawer-group-h"+(g.level === "minor" ? " drawer-group-h-minor" : ""));
-    h.textContent=g.label+" ("+g.files.length+")";
-    grp.appendChild(h);
+    // Loose group: no label means singleton(s) that didn't fit into a batch
+    // sub-bucket. Render cards directly with no header (they sit under the
+    // outer date / type major).
+    if(g.label){
+      const h=mk("div","drawer-group-h"+(g.level === "minor" ? " drawer-group-h-minor" : ""));
+      const labelEl=mk("span","drawer-group-h-label");
+      labelEl.textContent=g.label+" ("+g.files.length+")";
+      h.appendChild(labelEl);
+      // Batch sub-headers get a play-all ▶ when the batch contains audio.
+      if(g.level === "minor" && g.batchKey){
+        const hasAudio=g.files.some(p => { const k=fileKindMeta(p).kind; return k === "audio" || k === "voice"; });
+        if(hasAudio){
+          const btn=mk("button","drawer-group-h-play");
+          btn.textContent="▶";
+          btn.title="Play this batch";
+          btn.setAttribute("aria-label","Play batch");
+          btn.onclick=(ev) => { ev.stopPropagation(); playBatchByDir(g.batchKey); };
+          h.appendChild(btn);
+        }
+      }
+      grp.appendChild(h);
+    }
     g.files.forEach(p=>{
     const isSel = selectedPreviewIds.has(p.id);
     const meta = fileKindMeta(p);

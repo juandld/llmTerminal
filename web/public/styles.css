@@ -322,7 +322,11 @@
   .drawer-group-h-major{font-size:13px;color:var(--text);font-weight:700;padding:10px 4px 4px;border-bottom:none;margin-bottom:0;z-index:3}
   /* Type-mode inner date sub-header — slightly indented, plain weight. Stickies
      BELOW the major header (top:30px is the major's measured height). */
-  .drawer-group-h-minor{padding-left:14px;text-transform:none;font-weight:500;color:var(--text);letter-spacing:0;top:30px;z-index:2}
+  .drawer-group-h-minor{padding-left:14px;text-transform:none;font-weight:500;color:var(--text);letter-spacing:0;top:30px;z-index:2;display:flex;align-items:center;gap:6px}
+  .drawer-group-h-label{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  /* Play-all ▶ on batch sub-headers — only renders for audio-bearing batches. */
+  .drawer-group-h-play{background:none;border:none;color:var(--accent);font-size:12px;line-height:1;padding:2px 8px;min-height:24px;min-width:28px;border-radius:6px;cursor:pointer;font-family:var(--mono);flex-shrink:0}
+  .drawer-group-h-play:hover,.drawer-group-h-play:active{background:rgba(0,170,255,.12)}
   .drawer-group-minor .fp-card{margin-left:14px}
   @media (max-width:768px){.summary-panel{position:fixed;right:0;top:env(safe-area-inset-top, 0px);z-index:12;height:calc(100% - env(safe-area-inset-top, 0px));width:85vw;max-width:360px}}
   .btn-mic{background:var(--surface2);color:var(--dim);border:1px solid var(--border);padding:10px 14px;border-radius:10px;font-size:16px;cursor:pointer;font-family:var(--mono);min-height:44px;min-width:44px;transition:all .15s}
