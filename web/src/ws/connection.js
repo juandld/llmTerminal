@@ -372,7 +372,7 @@ getWss().on("connection", (ws, req) => {
           // File-attribution reconcile — runs FAST (synchronous filesystem walk),
           // fires immediately so unattributed files from this run get linked before
           // the user opens the drawer.
-          try { reconcileFileAttribution(session.id, session.project, runStartTs); } catch (e) { console.error("[file-reconcile] hook failed:", e.message); }
+          try { reconcileFileAttribution(session, runStartTs); } catch (e) { console.error("[file-reconcile] hook failed:", e.message); }
           if (!session.claudeSessionId && data.session_id) {
             session.claudeSessionId = data.session_id;
             updateSessionInStore(session);

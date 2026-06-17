@@ -222,14 +222,34 @@ ${lines}`;
 // (Python scripts, etc.) whose paths never appeared in tool_use stdout/cmd.
 // This is the "supervisor catches what fell through the cracks" pattern —
 // programmatic enforcement of the file-attribution contract.
-function reconcileFileAttribution(sessionId, projectName, runStartTs) {
+// Signature accepts a session object (or legacy sessionId/projectName for
+// backwards compat) so it can read session.extra_project_dirs and walk those
+// too — needed when an agent legitimately writes outside its primary project
+// dir (e.g. narrativeHero-content session generating mp3s under crankHero/).
+function reconcileFileAttribution(sessionOrId, projectNameOrStartTs, runStartTs) {
   try {
+    let sessionId, projectName, extraDirs = [];
+    if (typeof sessionOrId === "object" && sessionOrId) {
+      sessionId = sessionOrId.id;
+      projectName = sessionOrId.project;
+      if (Array.isArray(sessionOrId.extra_project_dirs)) {
+        for (const d of sessionOrId.extra_project_dirs) {
+          if (typeof d === "string" && d.startsWith("/")) extraDirs.push(d);
+        }
+      }
+      runStartTs = projectNameOrStartTs;
+    } else {
+      sessionId = sessionOrId;
+      projectName = projectNameOrStartTs;
+    }
     if (!sessionId || !projectName) return;
-    const projDir = path.join(PROJECTS_DIR, projectName);
-    if (!fs.existsSync(projDir)) return;
+    const roots = [path.join(PROJECTS_DIR, projectName), ...extraDirs].filter(d => {
+      try { return fs.existsSync(d); } catch { return false; }
+    });
+    if (!roots.length) return;
     const existing = buildAttributionMap();
     let added = 0;
-    const stack = [projDir];
+    const stack = [...roots];
     while (stack.length && added < 500) {
       const dir = stack.pop();
       let entries;
@@ -252,7 +272,7 @@ function reconcileFileAttribution(sessionId, projectName, runStartTs) {
         added++;
       }
     }
-    if (added > 0) console.log("[file-reconcile]", sessionId, "→ attributed", added, "unreported file(s)");
+    if (added > 0) console.log("[file-reconcile]", sessionId, "→ attributed", added, "unreported file(s) across", roots.length, "root(s)");
   } catch (e) {
     console.error("[file-reconcile] error:", e.message);
   }

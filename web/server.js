@@ -243,6 +243,19 @@ app.get("/api/drawer-files", (req, res) => {
 
   const targetIds = new Set(targets.map(s => s.id));
   const projectsToWalk = new Set(targets.map(s => s.project).filter(Boolean));
+  // Per-session linked dirs: agent can write outside its primary project
+  // (e.g. a narrativeHero-content session producing assets under crankHero/),
+  // session.extra_project_dirs opts those dirs in for chat-scope queries.
+  // Project-scope intentionally ignores these — `?project=X` means "files
+  // under X", not "files this project's sessions touched anywhere".
+  const extraDirsToWalk = new Set();
+  for (const s of targets) {
+    if (Array.isArray(s.extra_project_dirs)) {
+      for (const d of s.extra_project_dirs) {
+        if (typeof d === "string" && d.startsWith("/")) extraDirsToWalk.add(d);
+      }
+    }
+  }
   const allSessionsById = new Map(all.map(s => [s.id, s]));
 
   // Attribution sources (1) tool_activity rows (2) sidecar JSONL log
@@ -287,6 +300,29 @@ app.get("/api/drawer-files", (req, res) => {
           ext: f.ext,
           mtime_ms: f.mtime_ms,
           size: f.size,
+          title: path.basename(f.path),
+          source_session_id: owner,
+          source_session_title: sess?.title || "",
+          attributed_by: attr.source,
+        });
+      }
+    }
+  }
+
+  // Extra linked dirs (chat scope only — see note where extraDirsToWalk is
+  // built). Same attribution rule: positive match against this session.
+  if (!isProjectScope) {
+    for (const extraDir of extraDirsToWalk) {
+      if (!fs.existsSync(extraDir)) continue;
+      const allFsFiles = _drawerWalkProjectFull(extraDir);
+      for (const f of allFsFiles) {
+        if (fileMap.has(f.path)) continue;
+        const attr = attribution.get(f.path);
+        const owner = attr ? attr.sessionId : null;
+        if (!owner || !targetIds.has(owner)) continue;
+        const sess = allSessionsById.get(owner);
+        fileMap.set(f.path, {
+          path: f.path, ext: f.ext, mtime_ms: f.mtime_ms, size: f.size,
           title: path.basename(f.path),
           source_session_id: owner,
           source_session_title: sess?.title || "",
@@ -497,6 +533,35 @@ app.post("/api/sessions/:id/state", express.json(), (req, res) => {
   }
   saveSessions(sessions);
   res.json({ ok: true, manualDone: s.manualDone || null, starred: !!s.starred });
+});
+
+// Link an additional project dir to this session — opt-in cross-project view.
+// Used when an agent legitimately writes outside its primary project dir
+// (e.g. narrativeHero-content session producing assets under crankHero/).
+// /api/drawer-files + reconcileFileAttribution honor extras for chat-scope
+// queries. Validation: absolute path under /home/claude-user/projects/, not
+// .credentials/, must exist on disk. Pass { path, unlink?:true } to unlink.
+app.post("/api/sessions/:id/link-dir", express.json(), (req, res) => {
+  const found = findSessionOr404(req.params.id, res); if (!found) return;
+  const { sessions, session: s } = found;
+  const body = req.body || {};
+  const p = typeof body.path === "string" ? body.path.trim() : "";
+  if (!p) return res.status(400).json({ error: "path is required" });
+  if (!p.startsWith("/home/claude-user/projects/")) {
+    return res.status(400).json({ error: "path must be under /home/claude-user/projects/" });
+  }
+  if (p.includes("/.credentials") || p.includes("/.env") || p.includes("/.git/")) {
+    return res.status(400).json({ error: "path crosses a sensitive subtree" });
+  }
+  if (!fs.existsSync(p)) return res.status(400).json({ error: "path does not exist on disk" });
+  if (!Array.isArray(s.extra_project_dirs)) s.extra_project_dirs = [];
+  if (body.unlink) {
+    s.extra_project_dirs = s.extra_project_dirs.filter(d => d !== p);
+  } else if (!s.extra_project_dirs.includes(p)) {
+    s.extra_project_dirs.push(p);
+  }
+  saveSessions(sessions);
+  res.json({ ok: true, extra_project_dirs: s.extra_project_dirs });
 });
 
 // Sets lastViewed=now on a session. Frontend calls this when you open the
