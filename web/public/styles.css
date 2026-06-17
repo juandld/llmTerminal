@@ -437,6 +437,12 @@
   /* Per-row unpin button — one click to remove a stale or unwanted file pin without expanding the card */
   .fp-row-x{background:none;border:none;color:var(--dim);cursor:pointer;font-size:16px;line-height:1;padding:0 6px;min-width:24px;border-radius:6px;margin-left:4px}
   .fp-row-x:hover{color:#c2453d;background:rgba(194,69,61,.08)}
+  /* Row-level ▶ for audio/voice rows (AUDIO-DRAWER-PLAN §4) — plays the
+     file's batch, or just the file for singletons. Accent color to read as a
+     primary action. */
+  .fp-row-play{background:none;border:none;color:var(--accent);cursor:pointer;font-size:13px;line-height:1;padding:0 6px;min-width:28px;min-height:28px;border-radius:6px;margin-left:4px;font-family:var(--mono)}
+  .fp-row-play:hover,.fp-row-play:active{background:rgba(0,170,255,.12)}
+  .fp-card.fp-playing .fp-row-play{color:#000;background:var(--accent)}
   .fp-audio-wrap{padding:6px 0}
   .fp-audio-wrap audio{display:block;background:var(--surface2);border-radius:6px}
   /* Selected files tray — appears above the input bar when user has checkmarks in the drawer */

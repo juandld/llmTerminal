@@ -407,6 +407,25 @@ function batchMembersOf(previewId){
     .map(x => x.id);
 }
 
+// Row-level ▶: play the file's batch starting at this file. Singletons
+// queue length=1. Used by the drawer row button — AUDIO-DRAWER-PLAN §4.
+function playFromRow(previewId){
+  const ids = batchMembersOf(previewId);
+  const startIdx = Math.max(0, ids.indexOf(previewId));
+  const items = ids.map(id => {
+    const p = sessionPreviews.find(x => x.id === id);
+    if(!p) return null;
+    const bt = (p.content?.body_text) || "";
+    if(!bt.startsWith("FILE_PATH:")) return null;
+    const fp = bt.slice("FILE_PATH:".length);
+    return { id, url: apiUrl("/api/file?path=" + encodeURIComponent(fp)), title: p.title || fp.split("/").pop() };
+  }).filter(Boolean);
+  if(!items.length) return;
+  _playbackQueue = items;
+  _playbackIndex = Math.min(startIdx, items.length - 1);
+  _playCurrent();
+}
+
 // Seed the playback queue with a batch starting at startIdx, then play.
 // Reuses _playbackQueue / _playCurrent so the now-playing strip + skip-next +
 // pause-toggle all work uniformly.
@@ -772,6 +791,12 @@ function renderDrawer(){
     let html='<div class="fp-head">'
       +'<label class="fp-check" onclick="event.stopPropagation()"><input type="checkbox" '+(isSel?"checked":"")+' onclick="event.stopPropagation();toggleFileSelection(\''+p.id+'\',event)" aria-label="Attach to next message; shift+click to range select"></label>'
       +'<span class="fp-icon">'+icon+'</span><span class="fp-title">'+highlightText(p.title||"Untitled",query)+'</span><span class="fp-time">'+ago+'</span><span class="fp-type">'+esc(meta.label)+'</span>';
+    // Audio/voice rows get a row-level ▶ that plays the file's BATCH (or just
+    // itself for singletons) — AUDIO-DRAWER-PLAN §4. No selection required;
+    // batchMembersOf() resolves siblings from the _batchId tag.
+    if (meta.kind === "audio" || meta.kind === "voice") {
+      html += '<button class="fp-row-play" onclick="event.stopPropagation();playFromRow(\''+p.id+'\')" title="Play batch" aria-label="Play">▶</button>';
+    }
     // Filesystem-derived rows: no × (the row is a view of the filesystem; can't be removed
     // from the drawer without deleting the file itself, which we don't do from the UI).
     // DB-backed rows (emails, agent-labeled previews): × deletes the DB record.
