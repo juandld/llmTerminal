@@ -71,30 +71,33 @@ function showBubbleMenu(ev, el){
   }, 50);
 }
 
-// Manual long-press detection (iOS Safari often suppresses contextmenu on selectable text)
+// Tap = our menu. Long-press = iOS native text-select (we don't fight it).
+// touchend within MAX_TAP_MS and no scroll-like movement => synthetic tap → menu.
+// Anything longer falls through, so iOS selection callout shows on its own.
 (function(){
-  let timer=null, sx=0, sy=0, targetEl=null;
-  const DUR=500, MOVE=10;
+  let sx=0, sy=0, t0=0, targetEl=null;
+  const MAX_TAP_MS=350, MAX_MOVE=10;
   chat.addEventListener("touchstart",(e)=>{
-    if(e.touches.length!==1) return;
+    if(e.touches.length!==1){ targetEl=null; return; }
     const t=e.target.closest(".msg.user, .msg.assistant .bubble, .msg.assistant");
-    if(!t) return;
-    sx=e.touches[0].clientX; sy=e.touches[0].clientY; targetEl=t;
-    if(timer) clearTimeout(timer);
-    timer=setTimeout(()=>{
-      timer=null;
-      const fakeEv={preventDefault:()=>{},touches:[{clientX:sx,clientY:sy}],clientX:sx,clientY:sy};
-      showBubbleMenu(fakeEv, targetEl);
-    }, DUR);
+    if(!t){ targetEl=null; return; }
+    // Don't hijack interactive children (TTS speaker, voice-note play, links, buttons)
+    if(e.target.closest("button, a, input, textarea, audio, video, .msg-tts-btn, .vn-play, .vn-toggle")){ targetEl=null; return; }
+    sx=e.touches[0].clientX; sy=e.touches[0].clientY; t0=performance.now(); targetEl=t;
   },{passive:true});
   chat.addEventListener("touchmove",(e)=>{
-    if(!timer) return;
+    if(!targetEl) return;
     const dx=e.touches[0].clientX-sx, dy=e.touches[0].clientY-sy;
-    if(Math.hypot(dx,dy)>MOVE){ clearTimeout(timer); timer=null; }
+    if(Math.hypot(dx,dy)>MAX_MOVE) targetEl=null; // scroll, not a tap
   },{passive:true});
-  const cancel=()=>{ if(timer){clearTimeout(timer); timer=null;} };
-  chat.addEventListener("touchend",cancel,{passive:true});
-  chat.addEventListener("touchcancel",cancel,{passive:true});
+  chat.addEventListener("touchend",()=>{
+    if(!targetEl) return;
+    const tgt=targetEl; targetEl=null;
+    if(performance.now()-t0 > MAX_TAP_MS) return; // long-press: hand off to iOS
+    const fakeEv={preventDefault:()=>{},touches:[{clientX:sx,clientY:sy}],clientX:sx,clientY:sy};
+    showBubbleMenu(fakeEv, tgt);
+  },{passive:true});
+  chat.addEventListener("touchcancel",()=>{ targetEl=null; },{passive:true});
 })();
 
 chat.addEventListener("contextmenu",(e)=>{
