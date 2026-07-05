@@ -308,9 +308,66 @@ function spawnContractCheck(sessionId, projectName) {
     if (!session) return;
     const wasDone = !!session.manualDone;
 
+    // ── Pending-question enforcement ───────────────────────────────────────
+    // If the agent called llmt_ask and the decision is still pending, the
+    // session is BLOCKED on David's answer. Force lastMessageRole back to
+    // "question" so the sidebar shows blocked (RED ❗) even if the agent
+    // emitted closing assistant text after llmt_ask returned. Also clear
+    // any manualDone — a pending question is not "done".
+    if (db) {
+      try {
+        const ask = /^ask\s+(david|user|me)\b/i;
+        const rows = db
+          .prepare("SELECT id, chose, mined, status FROM decisions WHERE session_id = ? AND status = 'pending' ORDER BY ts DESC")
+          .all(sessionId);
+        const open = rows.find(r => !r.mined && ask.test(r.chose || ""));
+        if (open) {
+          let changed = false;
+          if (session.lastMessageRole !== "question") {
+            session.lastMessageRole = "question";
+            session.lastSnippet = "Question waiting";
+            changed = true;
+          }
+          if (session.manualDone) { delete session.manualDone; changed = true; }
+          if (changed) {
+            saveSessions(sessions);
+            console.log("[contract-check]", sessionId.slice(0,8), "→ BLOCKED (open llmt_ask decision #" + open.id + ")");
+          }
+          return;
+        }
+      } catch (e) { console.error("[contract-check] pending-question check failed:", e.message); }
+    }
+
     const all = loadMessages(sessionId);
     if (all.length < CONTRACT_CHECK_MIN_MESSAGES) return;
     const recent = all.slice(-20);
+
+    // ── Browser tab etiquette (mechanical, warn-only) ─────────────────────
+    // The shared per-project chromium is the operator's live browser. A run
+    // that calls browser_navigate without ever creating its own tab via
+    // browser_tabs is (very likely) driving the operator's tab — the
+    // 2026-07-05 "browser keeps reloading by itself" incident. Tool results
+    // aren't persisted (only tool names), so end-state URL comparison isn't
+    // possible here; browser_run_code_unsafe may open pages internally and is
+    // deliberately not judged. Warn, don't block.
+    try {
+      const lastUserIdx = all.map(m => m.role).lastIndexOf("user");
+      const run = lastUserIdx >= 0 ? all.slice(lastUserIdx + 1) : all;
+      const toolNames = run.filter(m => m.role === "tool_activity").map(m => String(m.tool_name || ""));
+      const navigated = toolNames.includes("mcp__playwright__browser_navigate");
+      const madeOwnTab = toolNames.includes("mcp__playwright__browser_tabs");
+      const alreadyWarned = run.some(m => m.source === "contract_check_tab_etiquette");
+      if (navigated && !madeOwnTab && !alreadyWarned) {
+        saveMessage(sessionId, {
+          role: "assistant",
+          text: "⚠ Browser etiquette: this run navigated the shared chromium without opening its own tab (browser_navigate, no browser_tabs). The per-project browser is the operator's — verify in a NEW tab and restore the active tab when done (orchestratorHero CLAUDE.md → Browser verification etiquette).",
+          ts: Date.now(),
+          source: "contract_check_tab_etiquette",
+        });
+        try { broadcastToSession(sessionId, { type: "history", messages: loadMessages(sessionId) }); } catch {}
+        console.log("[contract-check]", sessionId.slice(0, 8), "→ tab-etiquette warning (navigate without own tab)");
+      }
+    } catch (e) { console.error("[contract-check] tab-etiquette check failed:", e.message); }
 
     // Quick prefilter: skip if the last message isn't from the assistant, or if
     // the assistant is clearly mid-conversation (ends with a question mark, ends

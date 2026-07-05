@@ -61,7 +61,7 @@ app.use(express.static(path.join(__dirname, "public"), { etag: false, lastModifi
 
 const { PROJECTS_DIR, DATA_DIR } = require("./src/paths");
 const {
-  db, loadMessages, saveMessage, deleteMessages, ensureProjectTrusted,
+  db, loadMessages, saveMessage, updateMessageByTs, deleteMessages, ensureProjectTrusted,
   loadSessions, saveSessions, updateSessionInStore, _persistSessionIfNew,
 } = require("./src/store");
 
@@ -70,33 +70,57 @@ const {
 const { activeProcs, activeProcBySession } = require("./src/proc-state");
 const { runOpenAI } = require("./src/providers/openai");
 const { runGoogle } = require("./src/providers/google");
+const { getProvider } = require("./src/providers/context");
 const { saveUploadedImage } = require("./src/uploads");
 // ---- Startup recovery: fix any sessions stuck from before restart ----
+// Unions the shutdown snapshot (sessions whose run was SIGKILLed by the last
+// restart — loop-hardening WS1b) with the unanswered scan. The scan logic
+// (last-user-message answered-ness guard + freshness skip) lives in
+// shutdown-snapshot.js:recoveryCandidate so the shutdown/boot pair is testable.
+const shutdownSnap = require("./src/shutdown-snapshot");
 setTimeout(() => {
+  const killedMidRun = shutdownSnap.consumeSnapshot(); // Set — read-once, deleted on consume
   const sessions = loadSessions();
   for (const session of sessions) {
+    // delete() = union with the scan: each snapshot id is handled exactly once,
+    // leftovers (session record gone) are reported after the loop.
+    const wasKilledMidRun = killedMidRun.delete(session.id);
     const msgs = loadMessages(session.id);
     if (!msgs.length) continue;
-    // Find the most-recent user message. A session needs recovery if that user
-    // message has no real (non-stalled) assistant response after it — covers
-    // both "last msg is user" and "last msg is a stalled marker over a user".
-    let lastUserIdx = -1;
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      if (msgs[i].role === "user") { lastUserIdx = i; break; }
+    const cand = shutdownSnap.recoveryCandidate(msgs, { wasKilledMidRun });
+    if (!cand.recover) {
+      if (wasKilledMidRun) console.log("[startup-recovery] snapshot session skipped (" + cand.why + "):", session.id);
+      continue;
     }
-    if (lastUserIdx === -1) continue;
-    const after = msgs.slice(lastUserIdx + 1);
-    if (after.some(m => m.role === "assistant" && !m.stalled)) continue; // answered
-    const lastUserMsg = msgs[lastUserIdx];
-    if (Date.now() - lastUserMsg.ts < 30000) continue; // too fresh, might still be running
+    const lastUserMsg = msgs[cand.lastUserIdx];
+    // A session with a scheduled wake (due or future) belongs to the wake
+    // sweeper — its wakePrompt is the precise continuation. Re-firing the
+    // original user prompt here would double-run the turn. Snapshot sessions
+    // included: a killed run whose wake survived (pending-wakeups.json) resumes
+    // via the wake, not via a duplicate re-fire of the old prompt.
+    const _regEntry = require("./src/run-registry").getEntry(session.id);
+    if (_regEntry && _regEntry.wakeAt) { console.log("[startup-recovery] skipping (pending wake):", session.id); continue; }
 
-    console.log("[startup-recovery] retrying stuck session:", session.id);
+    // Governor gate (WS3a): startup-recovery re-fires are machine-initiated.
+    // Parked sessions stay recoverable — David re-prompting is never gated.
+    const _gv = require("./src/governor").check("llmterminal-auto");
+    if (!_gv.ok) { console.log("[governor] parked startup-recovery re-fire:", session.id, "—", _gv.reason); continue; }
+
+    console.log("[startup-recovery] retrying stuck session:", session.id, "(" + cand.why + ")");
     const cwd = path.join(PROJECTS_DIR, session.project);
     ensurePermissionsLoaded(session.id);
     const perms = sessionPermissions[session.id];
-    killExistingClaudeFor(session.claudeSessionId);
-    runClaude(
-      { project: session.project, prompt: lastUserMsg.text, claudeSessionId: session.claudeSessionId, cwd, extraAllowedTools: perms ? [...perms] : [], model: session.model, sessionId: session.id },
+    // Route by provider — a gpt-5.x/o-series/gemini session must NOT be resumed
+    // through the Claude CLI (which rejects non-Claude models with "you may not
+    // have access to it"). Mirrors the routing in ws/connection.js.
+    const _provider = getProvider(session.model);
+    const _runFn = _provider === "openai" ? runOpenAI : _provider === "google" ? runGoogle : runClaude;
+    if (_provider === "claude") killExistingClaudeFor(session.claudeSessionId);
+    const _runArgs = _provider === "claude"
+      ? { project: session.project, prompt: lastUserMsg.text, claudeSessionId: session.claudeSessionId, cwd, extraAllowedTools: perms ? [...perms] : [], model: session.model, sessionId: session.id, effort: session.effort, governorComponent: "llmterminal-auto", spawnTrigger: "recovery" }
+      : { prompt: lastUserMsg.text, sessionId: session.id, model: session.model, project: session.project, effort: session.effort };
+    _runFn(
+      _runArgs,
       (data) => {
         if (data.type === "system" && data.subtype === "init" && data.session_id && !session.claudeSessionId) {
           session.claudeSessionId = data.session_id;
@@ -116,43 +140,66 @@ setTimeout(() => {
       (code) => { if (code !== 0) console.log("[startup-recovery] failed:", session.id, "code:", code); }
     );
   }
+  // Snapshot ids with no session record left — nothing to re-fire, but say so:
+  // silent drops are how the 16:59 non-recovery went undiagnosed for a day.
+  for (const id of killedMidRun) console.log("[startup-recovery] snapshot session not in store, dropped:", id);
 }, 5000);
 
-// ---- Periodic stalled-session janitor ----
-// Catches sessions stranded by hard-kill (SIGKILL of the parent server, OOM, etc.)
-// where the per-process onClose handler never fired. The startup recovery only
-// retries sessions whose last message is "user"; this one closes the gap for
-// sessions whose last message is mid-tool (tool_activity / tool_result /
-// permission_granted) with no live subprocess and no recent activity.
+// ---- Periodic stalled-session janitor (signal-based, 2026-07-04) ----
+// Still the ONE canonical stuck-checker (isolation invariant #4), but verdicts
+// now come from run-registry signals — pid liveness, stream bytes, open-tool
+// budgets, cpu+io deltas, pending wakes — instead of message age. Only two
+// states ever get the ⚠️ marker, both provable:
+//   wedged       — pid alive but no stream, no open tool within budget, and
+//                  cpu+io flat across two consecutive sweeps (~10 min apart)
+//   dead_mid_run — proc gone mid-tool, no result saved, no pending wake
+// Thinking silences, long subagents, paused loops, and sleeping phones are all
+// "working"/"paused" and left alone. The old STALLED_AGE_THRESHOLD_MS and the
+// wss.clients liveness set (which went empty whenever the phone backgrounded,
+// defaming healthy runs) are gone; see LIVENESS-AND-FRUITION-PLAN-2026-07-04.md.
+const runReg = require("./src/run-registry");
+const runLedger = require("./src/run-ledger");
+runReg.loadRegistry(); // adopt/bury persisted entries before any timer fires
 const STALLED_SWEEP_INTERVAL_MS = 5 * 60 * 1000;   // every 5 min
-const STALLED_AGE_THRESHOLD_MS  = 5 * 60 * 1000;   // last activity > 5 min ago
 const _STALLED_STUCK_ROLES = new Set(["tool_activity", "tool_result", "permission_granted"]);
 
 function sweepStalledSessions() {
   try {
     const sessions = loadSessions();
     if (!sessions || !sessions.length) return;
-    // Build the "sessions with an active subprocess" set by walking live WS clients.
-    const liveSessionIds = new Set();
-    for (const c of wss.clients) {
-      if (c.readyState === 1 && c._activeProcRef && c._activeProcRef.proc) {
-        if (c._llmSessionId) liveSessionIds.add(c._llmSessionId);
-      }
-    }
     const now = Date.now();
     let marked = 0;
     for (const s of sessions) {
-      if (liveSessionIds.has(s.id)) continue;
       const msgs = loadMessages(s.id);
       if (!msgs.length) continue;
       const last = msgs[msgs.length - 1];
       if (!last || !_STALLED_STUCK_ROLES.has(last.role)) continue;
-      if (!last.ts || now - last.ts < STALLED_AGE_THRESHOLD_MS) continue;
-      const note = "⚠️ The agent stopped mid-run and was reaped by the stalled-session sweeper. Re-prompt to continue.";
-      saveMessage(s.id, { role: "assistant", text: note, ts: now, recovered: true, stalled: true });
-      try { broadcastToSession(s.id, { type: "history", messages: loadMessages(s.id) }); } catch {}
-      console.log("[stalled-sweep] marked stalled:", s.id, "(last role:", last.role + ", age:", Math.round((now - last.ts) / 1000) + "s)");
-      marked++;
+      runReg.sampleForWedge(s.id); // advance cpu/io evidence for live-but-silent procs
+      const v = runReg.sessionRunState(s.id, { lastMessageRole: last.role, lastActiveTs: last.ts || s.lastActive });
+      if (v.state === "wedged") {
+        const e = runReg.getEntry(s.id);
+        try { if (e && e.pid) process.kill(e.pid, "SIGTERM"); } catch {}
+        // Run-ledger L4 evidence (additive): last ledger event + age + pid
+        // liveness in the SAME line as the verdict, so a contradiction
+        // ("heartbeat 12s ago, pid ALIVE") is visible where the decision logs.
+        console.log("[stalled-sweep] wedged (cpu+io flat 2 sweeps), SIGTERM:", s.id, "pid:", e && e.pid, "—", runLedger.evidence(s.id));
+        if (e && e.adopted) {
+          // Adopted orphans have no close handler — write the marker ourselves.
+          // For this-server procs the SIGTERM triggers onClose, which writes
+          // the canonical "exited before final response" marker; no double.
+          const note = "⚠️ The agent process wedged (no CPU/io activity across two sweeps) and was terminated. Re-prompt to continue.";
+          saveMessage(s.id, { role: "assistant", text: note, ts: now, recovered: true, stalled: true });
+          try { broadcastToSession(s.id, { type: "history", messages: loadMessages(s.id) }); } catch {}
+          marked++;
+        }
+      } else if (v.state === "dead_mid_run") {
+        const note = "⚠️ The agent process died mid-run without a final response. Re-prompt to continue.";
+        saveMessage(s.id, { role: "assistant", text: note, ts: now, recovered: true, stalled: true });
+        try { broadcastToSession(s.id, { type: "history", messages: loadMessages(s.id) }); } catch {}
+        console.log("[stalled-sweep] dead mid-run, marked:", s.id, v.legacy ? "(legacy-age fallback)" : "(pid " + v.pid + ", exit " + v.exitCode + ")", "—", runLedger.evidence(s.id));
+        marked++;
+      }
+      // working / waiting_tool / paused_until / awaiting_user / idle → leave alone
     }
     if (marked > 0) console.log("[stalled-sweep] marked", marked, "stalled session(s)");
   } catch (e) {
@@ -163,17 +210,78 @@ function sweepStalledSessions() {
 setTimeout(sweepStalledSessions, 60 * 1000); // first sweep 60s after boot (after startup-recovery has run)
 setInterval(sweepStalledSessions, STALLED_SWEEP_INTERVAL_MS).unref();
 
+// ---- Scheduled-wake re-firing (LIVENESS plan Phase 2) ----
+// ScheduleWakeup ends the turn and the CLI process exits with it — without this
+// loop, every /loop iteration parked >5 min simply never continued (bc590843's
+// overnight failure). The registry persists {wakeAt, wakePrompt} parsed from the
+// tool_use; when a wake is due and the session has no live run, we push the
+// wake prompt through the NORMAL queue machinery (queueAppend + tryDrainQueue →
+// fireQueueHeadless), which gives the full pipeline: user message with
+// source:"wake", tool activity rows, previews, supervisors, queue serialization.
+const WAKE_SWEEP_INTERVAL_MS = 30 * 1000;
+function sweepDueWakes() {
+  try {
+    const due = runReg.dueWakes(Date.now());
+    if (!due.length) return;
+    const throttle = require("./src/throttle");
+    for (const e of due) {
+      if (activeProcBySession.has(e.sessionId)) continue; // run still live; re-check next sweep
+      const session = loadSessions().find(s => s.id === e.sessionId);
+      if (!session) { runReg.clearWake(e.sessionId, "lost (session record gone)"); continue; }
+      if (getProvider(session.model) !== "claude") { runReg.clearWake(e.sessionId, "lost (non-claude provider)"); continue; } // harness tool: claude-only
+      if (throttle.remaining() > 0) {
+        console.log("[wake-sweep] throttled, deferring wake for", e.sessionId.slice(0, 8), "(" + Math.round(throttle.remaining() / 1000) + "s left)");
+        continue; // retry next sweep — wakeAt stays set
+      }
+      // Governor gate (WS3a): wake re-fires are machine-initiated — the exact
+      // path that leaked overnight 2026-07-03. Defer (wake stays armed), never
+      // drop: the wake fires as soon as the cap window rolls or cooldown ends.
+      const _gv = require("./src/governor").check("llmterminal-auto");
+      if (!_gv.ok) {
+        console.log("[governor] parked wake re-fire for", e.sessionId.slice(0, 8), "—", _gv.reason);
+        continue; // retry next sweep — wakeAt stays set
+      }
+      const overdueMs = Date.now() - e.wakeAt;
+      const overdueMin = Math.round(overdueMs / 60000);
+      // Late = re-armed past-due at boot (server was down when it should have
+      // fired) or overdue past the sweep's own cadence — the model should know
+      // the gap exists rather than assume its requested delay was honored.
+      const late = !!e.wakeLate || overdueMs > 2 * 60 * 1000;
+      let prompt = e.wakePrompt ||
+        ("Scheduled wake-up fired (reason: " + (e.wakeReason || "unspecified") + "). Continue the task you scheduled this wake for; if it is complete, say so and do not schedule another wake.");
+      if (late) {
+        prompt = "[Late wake-up: this was scheduled to fire at " + new Date(e.wakeAt).toISOString() +
+          " and is firing ~" + Math.max(1, overdueMin) + " min late (server restart or timer delay). Account for the gap before continuing.]\n\n" + prompt;
+      }
+      runReg.clearWake(e.sessionId, late ? "late-fired" : "fired"); // the queue item owns the continuation now
+      console.log("[wake-sweep] firing wake for", e.sessionId.slice(0, 8), overdueMin > 1 ? "(" + overdueMin + "min overdue)" : "", "reason:", (e.wakeReason || "").slice(0, 60));
+      queueAppend(e.sessionId, { text: prompt, source: "wake", ts: Date.now() });
+      try { tryDrainQueue(e.sessionId); } catch (err) { console.error("[wake-sweep] drain failed:", err.message); }
+    }
+  } catch (e) {
+    console.error("[wake-sweep] error:", e.message);
+  }
+}
+setTimeout(sweepDueWakes, 30 * 1000); // first pass after startup-recovery (5s) has settled
+setInterval(sweepDueWakes, WAKE_SWEEP_INTERVAL_MS).unref();
+
 // Gmail Pub/Sub webhook + watch renewal (see src/gmail.js).
 require("./src/gmail")(app);
 
 // ---- API ----
 app.get("/health", (_, res) => {
   const sessions = loadSessions();
-  const stuck = sessions.filter(s => {
-    const msgs = loadMessages(s.id);
-    return msgs.length > 0 && msgs[msgs.length - 1].role === "user" && (Date.now() - msgs[msgs.length - 1].ts > 60000);
+  const run_states = {};
+  for (const s of sessions) {
+    const st = runReg.sessionRunState(s.id, { lastMessageRole: s.lastMessageRole, lastActiveTs: s.lastActive }).state;
+    run_states[st] = (run_states[st] || 0) + 1;
+  }
+  res.json({
+    status: "ok", sessions: sessions.length,
+    stuck: (run_states.dead_mid_run || 0) + (run_states.wedged || 0),
+    run_states,
+    pending_wakes: runReg.dueWakes(Number.MAX_SAFE_INTEGER).length,
   });
-  res.json({ status: "ok", sessions: sessions.length, stuck: stuck.length });
 });
 app.get("/api/projects", (_, res) => {
   // Skip symlinks so legacy compat symlinks (e.g. narrativeHero -> orchestratorHero)
@@ -461,11 +569,17 @@ app.get("/api/sessions", (req, res) => {
   const prioritySettings = loadPrioritySettings();
   s = s.map(x => {
     const p = computePrioritySession(x, prioritySettings);
+    // Signal-based run state (LIVENESS plan): working / waiting_tool /
+    // paused_until / awaiting_user / user_waiting / idle / wedged / dead_mid_run.
+    const rs = runReg.sessionRunState(x.id, { lastMessageRole: x.lastMessageRole, lastActiveTs: x.lastActive });
     return {
       ...x,
       archived: (x.lastActive || x.created || 0) < cutoff,
       priority_score: p.score,
       priority_breakdown: p.breakdown,
+      run_state: rs.state,
+      wake_at: rs.wakeAt || null,
+      current_tool: rs.tool || null,
     };
   });
   // Sort newest first within the result. (Frontend can re-sort by priority_score
@@ -1090,18 +1204,25 @@ server.on('upgrade', (req, socket, head) => {
 // In-browser Claude OAuth re-auth routes (see src/auth.js).
 require("./src/auth")(app);
 
+// Map session.project -> default sending account (matches connection.js helper).
+// All sends still shell out to camoHero/scripts/send_gmail_email.py with all
+// safety checks; project just picks the From: identity.
+function _defaultFromAccountForProject(project) {
+  const p = String(project || "").toLowerCase();
+  if (p === "camohero") return "camofiles";
+  return "crankwheel";
+}
+
 app.post("/api/email-draft/send", express.json(), (req, res) => {
-  const { sessionId, to, cc, subject, body, fromAccount, threadId, attachments, force } = req.body || {};
+  const { sessionId, to, cc, subject, body, fromAccount, threadId, attachments, force, draftTs } = req.body || {};
   if (!sessionId || !to || !subject || !body) {
     return res.status(400).json({ ok: false, error: "missing fields (sessionId, to, subject, body required)" });
   }
   const sessions = loadSessions();
   const session = sessions.find(s => s.id === sessionId);
   if (!session) return res.status(404).json({ ok: false, error: "session not found" });
-  if (session.project !== "camoHero") {
-    return res.status(403).json({ ok: false, error: "send button is only enabled for camoHero sessions" });
-  }
-  const account = (fromAccount && /^[a-z0-9_-]+$/.test(fromAccount)) ? fromAccount : "camofiles";
+  const projectDefault = _defaultFromAccountForProject(session.project);
+  const account = (fromAccount && /^[a-z0-9_-]+$/.test(fromAccount)) ? fromAccount : projectDefault;
   const args = [
     "/home/claude-user/projects/camoHero/scripts/send_gmail_email.py",
     "--from", account,
@@ -1111,16 +1232,21 @@ app.post("/api/email-draft/send", express.json(), (req, res) => {
   ];
   if (cc) { args.push("--cc", cc); }
   if (threadId && /^[A-Za-z0-9_-]+$/.test(threadId)) { args.push("--thread-id", threadId); }
-  // Attachments: validate each path is absolute, exists, and lives under camoHero project dir
+  // Attachments: each path must be absolute, exist, and live under either
+  // camoHero (canonical) or the session's own project dir. Cross-project
+  // pinning is intentionally disallowed.
   if (Array.isArray(attachments) && attachments.length) {
-    const ALLOWED_PREFIX = "/home/claude-user/projects/camoHero/";
+    const allowedPrefixes = [
+      "/home/claude-user/projects/camoHero/",
+      "/home/claude-user/projects/" + session.project + "/",
+    ];
     for (const ap of attachments) {
       if (typeof ap !== "string") {
         return res.status(400).json({ ok: false, error: "attachment must be a string path" });
       }
       const abs = path.resolve(ap);
-      if (!abs.startsWith(ALLOWED_PREFIX)) {
-        return res.status(400).json({ ok: false, error: `attachment outside allowed dir: ${ap}` });
+      if (!allowedPrefixes.some(p => abs.startsWith(p))) {
+        return res.status(400).json({ ok: false, error: `attachment outside allowed dirs (camoHero/ or ${session.project}/): ${ap}` });
       }
       if (!fs.existsSync(abs)) {
         return res.status(400).json({ ok: false, error: `attachment not found: ${ap}` });
@@ -1143,7 +1269,24 @@ app.post("/api/email-draft/send", express.json(), (req, res) => {
     if (code === 0) {
       const m = stdout.match(/Message ID: (\S+)/);
       const tm = stdout.match(/Thread ID:\s*([A-Za-z0-9_-]+)/);
-      saveMessage(sessionId, { role: "email_sent", to, cc: cc || "", subject, account, message_id: m ? m[1] : null, ts: Date.now() });
+      const sentAt = Date.now();
+      saveMessage(sessionId, { role: "email_sent", to, cc: cc || "", subject, account, message_id: m ? m[1] : null, ts: sentAt });
+      // Patch the original draft row with the values that were actually sent
+      // (the user may have edited the agent's draft in place) plus a `sent`
+      // flag. Without this, a tab-switch + reconnect re-renders the card from
+      // the original draft text and the user can't tell what actually went out.
+      if (draftTs) {
+        try {
+          updateMessageByTs(sessionId, draftTs, "email_draft", {
+            to, cc: cc || "", subject, body,
+            sent: true,
+            sent_ts: sentAt,
+            message_id: m ? m[1] : null,
+            account,
+            forced: force === true ? true : undefined,
+          });
+        } catch (e) { console.error("[email-draft/send] draft row patch failed:", e.message); }
+      }
       // Track the Gmail thread on the session so the reply poller can match replies.
       try {
         const sessions = loadSessions();
@@ -1170,6 +1313,52 @@ app.post("/api/email-draft/send", express.json(), (req, res) => {
   proc.on("error", (e) => {
     res.status(500).json({ ok: false, error: "spawn failed: " + e.message });
   });
+});
+
+// ---- /api/email-draft/test-send ----
+// Session-less sibling of /api/email-draft/send for the campaigns dashboard's
+// "Send test to my inbox" button. The safety boundary is NOT a session but a
+// hardcoded recipient allowlist: it can ONLY deliver to David's own addresses,
+// so nh-backend can render a campaign email exactly (merge sentinel, signature
+// and all) and see it in a real inbox. --force skips content checks because the
+// recipient is provably the operator himself. Still the ONLY sender is camoHero's
+// token-gated script; nh-backend never touches Gmail or the token.
+const TEST_SEND_RECIPIENTS = new Set(["david@crankwheel.com", "david@camofiles.app"]);
+app.post("/api/email-draft/test-send", express.json(), (req, res) => {
+  const { to, subject, body, fromAccount, html } = req.body || {};
+  if (!to || !subject || !body) {
+    return res.status(400).json({ ok: false, error: "missing fields (to, subject, body required)" });
+  }
+  if (!TEST_SEND_RECIPIENTS.has(String(to).toLowerCase().trim())) {
+    return res.status(403).json({ ok: false, error: "test-send only delivers to the operator's own addresses" });
+  }
+  const account = (fromAccount && /^[a-z0-9_-]+$/.test(fromAccount)) ? fromAccount : "crankwheel";
+  const args = [
+    "/home/claude-user/projects/camoHero/scripts/send_gmail_email.py",
+    "--from", account, "--to", to, "--subject", subject, "--body", body,
+    "--force",
+  ];
+  if (html === true) { args.push("--html"); }
+  const proc = spawn("/usr/bin/python3", args, {
+    cwd: "/home/claude-user/projects/camoHero",
+    uid: 1000, gid: 1000,
+    env: { HOME: "/home/claude-user", PATH: process.env.PATH, LANG: "en_US.UTF-8", LLMT_SEND_TOKEN },
+    stdio: ["ignore", "pipe", "pipe"],
+    detached: true,
+  });
+  let stdout = "", stderr = "";
+  proc.stdout.on("data", c => { stdout += c.toString(); });
+  proc.stderr.on("data", c => { stderr += c.toString(); });
+  proc.on("close", (code) => {
+    if (code === 0) {
+      const m = stdout.match(/Message ID: (\S+)/);
+      res.json({ ok: true, message_id: m ? m[1] : null, account, to });
+    } else {
+      const blocked = stdout.match(/BLOCKED[^\n]+|WARNING[^\n]+/);
+      res.status(400).json({ ok: false, code, error: blocked ? blocked[0] : (stderr.split("\n").pop() || "send failed"), stdout: stdout.slice(-1500) });
+    }
+  });
+  proc.on("error", (e) => { res.status(500).json({ ok: false, error: "spawn failed: " + e.message }); });
 });
 
 
@@ -1202,6 +1391,15 @@ app.get('/api/file', (req, res) => {
   const mime = FILE_SERVE_MIME[ext] || 'application/octet-stream';
   res.setHeader('Content-Type', mime);
   res.setHeader('X-Content-Type-Options', 'nosniff');
+  // No headers meant heuristic browser caching — edited pinned files rendered
+  // stale (2026-07-05 "the plan document did not update"). Text/docs must
+  // revalidate every open; audio/video renders are immutable, keep them
+  // cacheable for mobile replay.
+  if (mime.startsWith('audio/') || mime.startsWith('video/')) {
+    res.setHeader('Cache-Control', 'private, max-age=86400');
+  } else {
+    res.setHeader('Cache-Control', 'no-store');
+  }
   fs.createReadStream(abs).pipe(res);
 });
 
@@ -1290,6 +1488,9 @@ async function gracefulShutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`[shutdown] ${signal} received, waiting for active work (max 60s)`);
+  // Snapshot the sessions with live runs NOW (crash-safe even if we never reach
+  // the post-drain rewrite); startup recovery consumes this file (WS1b).
+  shutdownSnap.writeSnapshot(activeProcBySession.keys(), signal);
   try { wss.close(); } catch {}
   try { server.close(); } catch {}
   const start = Date.now();
@@ -1301,6 +1502,10 @@ async function gracefulShutdown(signal) {
   if (activeProcs.size > 0) {
     console.log(`[shutdown] forcing exit with ${activeProcs.size} stuck subprocess(es)`);
   }
+  // Rewrite with the survivors: runs that drained during the grace window
+  // answered their prompt and drop out; what's left is exactly what systemd
+  // is about to SIGKILL.
+  shutdownSnap.writeSnapshot(activeProcBySession.keys(), signal + " post-drain");
   try { if (db) db.close(); } catch {}
   console.log("[shutdown] exiting");
   process.exit(0);
