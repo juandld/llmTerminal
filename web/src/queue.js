@@ -15,6 +15,15 @@ function queueAppend(sessionId, item) {
   // item = { text, ts, source }  (source = 'voice-note' | 'prompt' | etc.)
   if (!item.ts) item.ts = Date.now();
   try {
+    // Dedupe by client_id: the WS path and the outbox-capture fallback can both
+    // carry the same message (2026-07-07 no-loss hardening) — exactly-once wins.
+    if (item.client_id) {
+      const existing = queueLoad(sessionId);
+      if (existing.some(it => it.client_id && it.client_id === item.client_id)) {
+        console.log("[queue] dup client_id skipped:", sessionId, item.client_id);
+        return true;
+      }
+    }
     fs.appendFileSync(queueFile(sessionId), JSON.stringify(item) + "\n");
     console.log("[queue] +1 for", sessionId, "(" + item.source + ")", item.text.slice(0, 60));
     return true;
