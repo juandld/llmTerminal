@@ -136,6 +136,38 @@ function saveMessage(sessionId, msg) {
     }
   } catch {}
 }
+// In-place patch of one row identified by (sessionId, ts, role). Used by the
+// email-draft send path so that after a successful send, the stored draft row
+// reflects the values that were actually sent (not the agent's pre-edit text)
+// plus a `sent: true` flag. Without this, a mobile-tab reconnect replays the
+// original draft and the user can't tell what actually went out.
+function updateMessageByTs(sessionId, ts, role, patch) {
+  if (db) {
+    try {
+      const row = db.prepare("SELECT id, data FROM messages WHERE session_id = ? AND ts = ? AND role = ?").get(sessionId, Number(ts), role);
+      if (row) {
+        let obj; try { obj = JSON.parse(row.data); } catch { obj = {}; }
+        const merged = { ...obj, ...patch };
+        db.prepare("UPDATE messages SET data = ? WHERE id = ?").run(JSON.stringify(merged), row.id);
+      }
+    } catch (e) { console.error("[updateMessageByTs] sqlite failed:", e.message); }
+  }
+  try {
+    const p = path.join(MESSAGES_DIR, sessionId + ".json");
+    const arr = JSON.parse(fs.readFileSync(p, "utf8"));
+    let changed = false;
+    for (let i = 0; i < arr.length; i++) {
+      if (Number(arr[i].ts) === Number(ts) && arr[i].role === role) {
+        arr[i] = { ...arr[i], ...patch };
+        changed = true;
+      }
+    }
+    if (changed) fs.writeFileSync(p, JSON.stringify(arr));
+  } catch (e) {
+    if (e.code !== "ENOENT") console.error("[updateMessageByTs] JSON mirror failed:", e.message);
+  }
+}
+
 function deleteMessages(sessionId) {
   if (db) {
     try { db.prepare("DELETE FROM messages WHERE session_id = ?").run(sessionId); }
@@ -203,6 +235,6 @@ function _persistSessionIfNew(session) {
 
 module.exports = {
   db,
-  loadMessages, saveMessage, deleteMessages, deleteMessagesByTs, ensureProjectTrusted,
+  loadMessages, saveMessage, updateMessageByTs, deleteMessages, deleteMessagesByTs, ensureProjectTrusted,
   loadSessions, saveSessions, updateSessionInStore, _persistSessionIfNew,
 };
