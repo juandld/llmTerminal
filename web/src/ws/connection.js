@@ -19,6 +19,31 @@ const { queueAppend, queueLoad, queueSaveAll, broadcastQueueState } = require(".
 const { summarizeToolUse, autoCreatePreview, autoDetectBashFiles } = require("../tools");
 const { logFileAttribution } = require("../attribution");
 const { saveUploadedImage } = require("../uploads");
+const governor = require("../governor");
+
+// Answered-ness guard, shared by every automated re-fire in onDone below: the
+// most-recent user message already has a real assistant response (stalled
+// markers don't count) or was deliberately interrupted → re-firing it would be
+// the ghost re-run bug (2026-07-03). Same rule as providers/claude.js
+// _scheduleRetry and shutdown-snapshot.js recoveryCandidate.
+function _lastPromptAnswered(msgs) {
+  let lui = -1;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i].role === "user") { lui = i; break; }
+  }
+  if (lui < 0) return true; // nothing to re-fire
+  return msgs.slice(lui + 1).some(m => (m.role === "assistant" && !m.stalled) || m.role === "interrupted");
+}
+
+// Map session.project -> default camoHero sending account.
+// Every send still goes through camoHero/scripts/send_gmail_email.py — this
+// just picks the right identity ("From:") for the session context.
+function defaultFromAccountForProject(project) {
+  const p = String(project || "").toLowerCase();
+  if (p === "camohero") return "camofiles";
+  // crankHero, narrativeHero, orchestratorHero, langHero, etc. → David's primary identity
+  return "crankwheel";
+}
 
 function registerWsHandlers() {
 getWss().on("connection", (ws, req) => {
@@ -168,9 +193,23 @@ getWss().on("connection", (ws, req) => {
                  : runClaude;
     const _effort = session.effort || "max";
     const _runArgs = _provider === "claude"
-      ? { project: session.project, prompt: fullPrompt, claudeSessionId: session.claudeSessionId, cwd, extraAllowedTools, model: session.model, sessionId: session.id, effort: _effort }
+      ? { project: session.project, prompt: fullPrompt, claudeSessionId: session.claudeSessionId, cwd, extraAllowedTools, model: session.model, sessionId: session.id, effort: _effort,
+          // Ledger attribution (WS3a): fresh user turns are interactive
+          // ("llmterminal-chat", record-only, never gated); isRetry spawns are
+          // machine re-fires ("llmterminal-auto") — their governor check
+          // happened at the call site that decided to retry.
+          governorComponent: isRetry ? "llmterminal-auto" : "llmterminal-chat",
+          // Run-ledger L4 trigger: isRetry covers the no-result auto-retry,
+          // model-fallback, stale-resume, and permission-grant re-fires.
+          spawnTrigger: isRetry ? "noresult-retry" : "user" }
       : { prompt: fullPrompt, sessionId: session.id, model: session.model, project: session.project, effort: _effort };
-    activeProc = _runFn(
+    // Capture this run's proc handle so onDone can identity-check before
+    // nullifying shared state — a queued drain may spawn a NEXT run before
+    // THIS run's OS proc actually closes (MCP shutdown can lag minutes after
+    // the model's `result` event). Without the guard, the old proc's onClose
+    // would nullify the newer run's activeProc + delete its bySession entry.
+    let _runProc = null;
+    activeProc = _runProc = _runFn(
       _runArgs,
       (data) => {
         if (data.type === "system" && data.subtype === "init") {
@@ -202,16 +241,22 @@ getWss().on("connection", (ws, req) => {
                           to: payload.to || "", cc: payload.cc || "",
                           subject: payload.subject || "", body: payload.body || "",
                           thread_id: payload.thread_id || "",
+                          reply_mode: payload.reply_mode || "",
+                          thread_participants: Array.isArray(payload.thread_participants) ? payload.thread_participants : [],
                           attachments: Array.isArray(payload.attachments) ? payload.attachments : [],
                           project: session.project,
+                          default_from_account: defaultFromAccountForProject(session.project),
                           ts: Date.now() };
                         wsSend(ws, draftMsg);
                         saveMessage(session.id, { role: "email_draft",
                           to: draftMsg.to, cc: draftMsg.cc,
                           subject: draftMsg.subject, body: draftMsg.body,
                           thread_id: draftMsg.thread_id,
+                          reply_mode: draftMsg.reply_mode,
+                          thread_participants: draftMsg.thread_participants,
                           attachments: draftMsg.attachments,
                           project: draftMsg.project,
+                          default_from_account: draftMsg.default_from_account,
                           ts: draftMsg.ts });
                       }
                     } catch (e) {
@@ -240,6 +285,15 @@ getWss().on("connection", (ws, req) => {
                 // Track draft_email so we forward the result as a special message
                 if (block.name === "mcp__crankhero-draft__draft_email") {
                   pendingDrafts.add(block.id);
+                }
+                // Pin attribution for llmt_show_file so the file appears in the
+                // chat-scoped drawer. The MCP tool POSTs to orchestratorHero's
+                // /api/previews, but /api/drawer-files is the source of truth for
+                // file rows and it requires an attribution record.
+                if (block.name === "mcp__llmterminal__llmt_show_file"
+                    && typeof block.input?.path === "string"
+                    && block.input.path.startsWith("/home/claude-user/projects/")) {
+                  logFileAttribution(block.input.path, session.id, "show_file");
                 }
                 // Persist a lightweight activity log (skip AskUserQuestion — handled separately below)
                 if (block.name !== "AskUserQuestion") {
@@ -320,16 +374,22 @@ getWss().on("connection", (ws, req) => {
                       to: payload.to || "", cc: payload.cc || "",
                       subject: payload.subject || "", body: payload.body || "",
                       thread_id: payload.thread_id || "",
+                      reply_mode: payload.reply_mode || "",
+                      thread_participants: Array.isArray(payload.thread_participants) ? payload.thread_participants : [],
                       attachments: Array.isArray(payload.attachments) ? payload.attachments : [],
                       project: session.project,
+                      default_from_account: defaultFromAccountForProject(session.project),
                       ts: Date.now() };
                     wsSend(ws, draftMsg);
                     saveMessage(session.id, { role: "email_draft",
                       to: draftMsg.to, cc: draftMsg.cc,
                       subject: draftMsg.subject, body: draftMsg.body,
                       thread_id: draftMsg.thread_id,
+                      reply_mode: draftMsg.reply_mode,
+                      thread_participants: draftMsg.thread_participants,
                       attachments: draftMsg.attachments,
                       project: draftMsg.project,
+                      default_from_account: draftMsg.default_from_account,
                       ts: draftMsg.ts });
                   }
                 } catch (e) {
@@ -360,7 +420,15 @@ getWss().on("connection", (ws, req) => {
           wsSend(ws, "tool_result", { name: data.tool_name || "", content: data.content || "" });
         }
         if (data.type === "result") {
-          // After clearing activeProc below, try to drain the next queued prompt
+          // Release the per-session busy lock NOW (model turn done) instead of
+          // waiting for `proc.on("close")`. The claude CLI's MCP-server shutdown
+          // (Playwright in particular) can hang minutes after the result event,
+          // and tryDrainQueue no-ops while activeProcBySession.has() is true —
+          // so without this clear, queued prompts wait on OS-proc-close instead
+          // of model-idle. killExistingClaudeFor in the next run handles overlap.
+          if (activeProcBySession.get(session.id) === _runProc) activeProcBySession.delete(session.id);
+          if (activeProc === _runProc) activeProc = null;
+          // Now drain — busy lock is released, drain pops the next queued item
           setTimeout(() => { try { tryDrainQueue(session.id); } catch (e) { console.error("[queue] drain after result failed:", e.message); } }, 50);
           // Fire-and-forget observer: read recent messages, identify unaddressed asks, register as tasks
           // [observer] disabled 2026-05-28: was enqueueing duplicate Opus tasks
@@ -467,8 +535,11 @@ getWss().on("connection", (ws, req) => {
         }
       },
       (code, stderr) => {
-        activeProc = null;
-        activeProcBySession.delete(session.id); // run finished — session is idle again
+        // Identity-guarded: a queued drain may already have spawned the next
+        // run and stored its handles in activeProc/activeProcBySession after
+        // we released the lock on `result` above. Don't clobber that.
+        if (activeProc === _runProc) activeProc = null;
+        if (activeProcBySession.get(session.id) === _runProc) activeProcBySession.delete(session.id); // run finished — session is idle again
         // Model-unavailable fallback: api_error said the model is gated.
         // Persist a visible notice (so the chat never goes silently dead
         // again even if WS is gone), flip session.model to opus, and
@@ -489,7 +560,13 @@ getWss().on("connection", (ws, req) => {
           wsSend(ws, "history", { messages: loadMessages(session.id) });
           const msgs0 = loadMessages(session.id);
           const lu = [...msgs0].reverse().find(m => m.role === "user");
-          if (lu) {
+          // Answered-guard + governor gate: this re-fire is machine-initiated.
+          const _gvFb = governor.check("llmterminal-auto");
+          if (lu && _lastPromptAnswered(msgs0)) {
+            console.log("[model-fallback] suppressed — prompt already answered:", session.id);
+          } else if (lu && !_gvFb.ok) {
+            console.log("[governor] parked model-fallback re-fire", session.id, "—", _gvFb.reason);
+          } else if (lu) {
             console.log("[model-fallback]", session.id, _fromAlias, "->", _toAlias);
             wsSend(ws, "thinking");
             sendToSession(lu.text, true);
@@ -506,7 +583,13 @@ getWss().on("connection", (ws, req) => {
           if (!isRetry) {
             const msgs0 = loadMessages(session.id);
             const lu = [...msgs0].reverse().find(m => m.role === "user");
-            if (lu) {
+            // Answered-guard + governor gate: machine-initiated re-fire.
+            const _gvSr = governor.check("llmterminal-auto");
+            if (lu && _lastPromptAnswered(msgs0)) {
+              console.log("[stale-resume] suppressed — prompt already answered:", session.id);
+            } else if (lu && !_gvSr.ok) {
+              console.log("[governor] parked stale-resume re-fire", session.id, "—", _gvSr.reason);
+            } else if (lu) {
               wsSend(ws, "thinking");
               sendToSession(lu.text, true);
               return;
@@ -524,12 +607,23 @@ getWss().on("connection", (ws, req) => {
           }
           if (lui >= 0) {
             const after = msgs.slice(lui + 1);
-            const answered = after.some(m => m.role === "assistant" && !m.stalled);
+            // `interrupted` counts as answered: the user deliberately killed the
+            // run — re-firing the prompt they just stopped is the one thing this
+            // retry must never do (Stop→ghost-rerun bug, gap report 2026-07-03).
+            const answered = after.some(m => (m.role === "assistant" && !m.stalled) || m.role === "interrupted");
             if (!answered) {
-              console.log("[auto-retry] response lost, retrying:", session.id);
-              wsSend(ws, "thinking");
-              sendToSession(msgs[lui].text, true);
-              return;
+              // Governor gate (WS3a): machine-initiated re-fire. When parked,
+              // fall through to the stalled-marker path so the session isn't
+              // silently stuck — David can re-prompt (never gated) any time.
+              const _gvAr = governor.check("llmterminal-auto");
+              if (!_gvAr.ok) {
+                console.log("[governor] parked no-result auto-retry", session.id, "—", _gvAr.reason);
+              } else {
+                console.log("[auto-retry] response lost, retrying:", session.id);
+                wsSend(ws, "thinking");
+                sendToSession(msgs[lui].text, true);
+                return;
+              }
             }
           }
         }
@@ -582,6 +676,24 @@ getWss().on("connection", (ws, req) => {
           if (existing.some(m => m.role === "user" && m.client_id === msg.client_id)) {
             console.log("[outbox] resend already processed, skipping:", msg.client_id);
             return;
+          }
+        }
+        // Dedupe voice-note echoes: a stale-cached client / iOS dictation can send
+        // the transcript text as a regular WS prompt right after the /voice-note
+        // endpoint already queued+saved it as a voice-note message. Without this
+        // guard the echo persists as a plain user bubble that shows the full text
+        // by default, defeating the collapsed-transcript UX.
+        if (!msg.resend && msg.text) {
+          const _t = msg.text.trim();
+          if (_t.length >= 30) {
+            const recent = loadMessages(session.id).slice(-6);
+            const now = Date.now();
+            if (recent.some(m => m.role === "user" && m.source === "voice-note"
+                                 && (now - (m.ts || 0)) < 10000
+                                 && (m.text || "").trim() === _t)) {
+              console.log("[voice-note] suppressing echo prompt (matches voice-note from <10s ago)");
+              return;
+            }
           }
         }
         // Dedupe rapid-fire identical prompts: same text, different client_id,

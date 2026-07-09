@@ -5,6 +5,8 @@ const { broadcastToSession } = require("./ws/broadcast");
 const { runCheapClaude } = require("./cheap-model");
 const { spawn } = require("child_process");
 const { _bwrapWrap } = require("./bwrap");
+const governor = require("./governor");
+const runLedger = require("./run-ledger");
 const _titlingInProgress = new Set();
 
 function generateSessionTitle(sessionId) {
@@ -44,6 +46,13 @@ function generateSessionTitle(sessionId) {
     "--dangerously-skip-permissions",
     "--disallowedTools", "Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch", "WebSearch", "Agent", "NotebookEdit",
   ];
+  // Governor gate (WS3a): title-gen is a machine-initiated background spawn;
+  // dropping a round is free (the next trigger re-tries).
+  const _gv = governor.check("llmterminal-cheap");
+  if (!_gv.ok) {
+    console.log("[governor] parked title-gen", sessionId.slice(0, 8), "—", _gv.reason);
+    return;
+  }
   // Title-gen runs in the camoHero sandbox if the session belongs to it,
   // matching the same isolation as the main claude spawn for that project.
   const _titleWrap = _bwrapWrap(session0.project || "", _titleArgs);
@@ -56,14 +65,22 @@ function generateSessionTitle(sessionId) {
     stdio: ["ignore", "pipe", "pipe"],
     detached: true,
   });
+  // Run-ledger L4: the titler is a cheap background claude spawn too. The
+  // "cheap:" prefix keeps it from shadowing the MAIN run's ledger identity for
+  // this session (the sweeper's evidence line reads the bare session id).
+  const _ledger = runLedger.trackRun({ sessionId: "cheap:title-gen:" + sessionId, pid: proc.pid, trigger: "cheap", model: "cli-default", resumeOf: null, argv: _titleArgs });
   let out = "";
   let err = "";
-  proc.stdout.on("data", c => { out += c.toString(); });
+  proc.stdout.on("data", c => { _ledger.output(c.length); out += c.toString(); });
   proc.stderr.on("data", c => { err += c.toString(); });
   const timer = setTimeout(() => { try { proc.kill("SIGTERM"); } catch {} _doneTitling(); }, 30000);
-  proc.on("close", (code) => {
+  proc.on("close", (code, signal) => {
     clearTimeout(timer);
     _doneTitling();
+    _ledger.exit(code, signal, "title-gen-close");
+    // Record-after (WS3a): titler output is plain text (no cost field), so the
+    // row carries cost 0 — it still counts toward the hourly call cap.
+    governor.record("llmterminal-cheap", "cli-default", 0, "title-gen");
     if (code !== 0) {
       console.warn("[title-gen] claude exited non-zero for", sessionId, "code=", code, "err=", err.slice(0, 200));
       return;

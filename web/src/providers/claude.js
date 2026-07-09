@@ -9,13 +9,17 @@ const { loadMessages, saveMessage, loadSessions, updateSessionInStore, _persistS
 const { wsSend, broadcastToSession, getWss } = require("../ws/broadcast");
 const { activeProcs, activeProcBySession } = require("../proc-state");
 const { sessionPermissions, ensurePermissionsLoaded } = require("../permissions");
-const { getProvider } = require("./context");
+const { getProvider, loadChatSystemPrompt } = require("./context");
 const { autoDetectBashFiles, autoCreatePreview, summarizeToolUse } = require("../tools");
+const { logFileAttribution } = require("../attribution");
 const { spawnObserver, spawnDecisionExtractor, spawnContractCheck, reconcileFileAttribution } = require("../supervisors");
 const { generateSessionTitle } = require("../session-title");
 const { _bwrapWrap } = require("../bwrap");
 const { queuePopNext, broadcastQueueState } = require("../queue");
 const throttle = require("../throttle");
+const runReg = require("../run-registry");
+const governor = require("../governor");
+const runLedger = require("../run-ledger");
 
 // ---- Transient rate-limit auto-throttle + retry ----
 // On a *transient* server-side throttle we back off and re-run the same turn via
@@ -29,6 +33,25 @@ const RL_CAP_MS = 60000;     // never wait more than 60s
 function _rlBackoff(attempt) {
   const base = Math.min(RL_CAP_MS, RL_BASE_MS * Math.pow(2, attempt));
   return Math.round(base * (0.8 + Math.random() * 0.4)); // ±20% jitter
+}
+
+// Short human label of what a stream message represents, for the working
+// heartbeat. Returns null for messages that aren't real progress.
+function _workLabel(msg) {
+  if (!msg || typeof msg !== "object") return null;
+  if (msg.type === "assistant") {
+    const c = msg.message && msg.message.content;
+    if (Array.isArray(c)) {
+      for (const b of c) {
+        if (b && b.type === "tool_use") return "running " + (b.name || "tool");
+        if (b && b.type === "text" && b.text && b.text.trim()) return "writing reply";
+      }
+    }
+    return "thinking";
+  }
+  if (msg.type === "user") return "reading result";
+  if (msg.type === "system") return "starting";
+  return null;
 }
 
 function fireQueueHeadless(sessionId) {
@@ -57,8 +80,11 @@ function fireQueueHeadless(sessionId) {
   const _runFn = _provider === "openai" ? runOpenAI : _provider === "google" ? runGoogle : runClaude;
   // Fire the image-augmented prompt (with [Image N: path] refs) if present; else plain text.
   const _firePrompt = next.promptText || next.text;
+  // Wake-sourced items are machine-initiated (sweepDueWakes already governor-
+  // gated them before queueing); everything else in the queue is a user prompt.
+  const _govComponent = next.source === "wake" ? "llmterminal-auto" : "llmterminal-chat";
   const _runArgs = _provider === "claude"
-    ? { project: session.project, prompt: _firePrompt, claudeSessionId: session.claudeSessionId, cwd, extraAllowedTools, model: session.model, sessionId, effort: _effort }
+    ? { project: session.project, prompt: _firePrompt, claudeSessionId: session.claudeSessionId, cwd, extraAllowedTools, model: session.model, sessionId, effort: _effort, governorComponent: _govComponent, spawnTrigger: next.source === "wake" ? "wake" : "user" }
     : { prompt: _firePrompt, sessionId, model: session.model, project: session.project, effort: _effort };
   if (_provider === "claude") killExistingClaudeFor(session.claudeSessionId);
   let _assistantTextEmittedThisTurn = false;
@@ -92,6 +118,11 @@ function fireQueueHeadless(sessionId) {
               if (block.name === "Read" && typeof block.input?.file_path === "string"
                   && block.input.file_path.startsWith("/home/claude-user/projects/"))
                 autoDetectBashFiles(block.input.file_path, sessionId, cwd);
+              if (block.name === "mcp__llmterminal__llmt_show_file"
+                  && typeof block.input?.path === "string"
+                  && block.input.path.startsWith("/home/claude-user/projects/")) {
+                logFileAttribution(block.input.path, sessionId, "show_file");
+              }
               if (block.name !== "AskUserQuestion") {
                 const summary = summarizeToolUse(block.name, block.input);
                 saveMessage(sessionId, { role: "tool_activity", tool_name: block.name, summary, ts: Date.now() });
@@ -126,6 +157,13 @@ function fireQueueHeadless(sessionId) {
       }
       if (data.type === "result") {
         gotResult = true;
+        // Release the per-session busy lock on model-idle (not OS-proc-close)
+        // and drain immediately. Mirrors the same fix in ws/connection.js —
+        // without this, MCP shutdown lag (Playwright especially) keeps the
+        // bySession lock held for minutes after the model is done, stranding
+        // any subsequent queued items until reconnect-drain or proc-close.
+        if (activeProcBySession.get(sessionId) === proc) activeProcBySession.delete(sessionId);
+        setTimeout(() => { try { tryDrainQueue(sessionId); } catch (e) { console.error("[queue-headless] drain after result failed:", e.message); } }, 50);
         const result = data.result || "";
         const isApiError = data.is_error === true || /^API Error:\s*\d{3}/.test(result);
         if (isApiError) {
@@ -155,7 +193,10 @@ function fireQueueHeadless(sessionId) {
       }
     },
     (code, stderr) => {
-      activeProcBySession.delete(sessionId);
+      // Identity-guarded: result-handler above may have already released the
+      // lock and a queued drain may have spawned the next headless run, which
+      // re-set bySession with the NEW proc handle. Don't clobber that entry.
+      if (activeProcBySession.get(sessionId) === proc) activeProcBySession.delete(sessionId);
       if (!gotResult) {
         const msgs2 = loadMessages(sessionId);
         const last = msgs2.length ? msgs2[msgs2.length - 1] : null;
@@ -246,6 +287,15 @@ function killExistingClaudeFor(claudeSessionId) {
 function runClaude(opts, onData, onDone) {
   const { project, prompt, claudeSessionId, cwd, extraAllowedTools, model, sessionId, effort } = opts;
   const _attempt = opts._attempt || 0;
+  // Ledger attribution for the shared usage governor. Interactive turns are the
+  // default; automated re-fire callers (retries, startup recovery, wake drains)
+  // pass "llmterminal-auto". Recording happens centrally on the result event
+  // below, so EVERY claude spawn — user or machine — lands in the ledger.
+  const _govComponent = opts.governorComponent || "llmterminal-chat";
+  // Hoisted from the args-build below so the governor record sees the same
+  // model string the CLI is actually invoked with.
+  const ALLOWED_MODEL_RE = /^[a-z][a-z0-9.-]{1,80}$/;
+  const chosenModel = (model && ALLOWED_MODEL_RE.test(model)) ? model : "claude-opus-4-7";
   ensureProjectTrusted(project);
 
   // --- transient rate-limit auto-retry (per attempt) ---
@@ -259,6 +309,39 @@ function runClaude(opts, onData, onDone) {
   let _forwardedResult = false;
   const _scheduleRetry = (why) => {
     if (_retryScheduled || _attempt >= RL_MAX_RETRIES) return false;
+    // Answered-ness guard (2026-07-03): never re-fire a prompt the store already
+    // shows as answered. Without this, a late/misclassified throttle signal
+    // re-runs a COMPLETED turn ("ghost re-run" — repro'd live 3× on 2026-07-03,
+    // triggered by assistant prose that merely *discussed* rate limits).
+    // Trade-off: a genuine mid-cascade throttle after an interim message was
+    // already saved will end the turn instead of retrying — acceptable; the
+    // stalled-marker path still annotates, and re-prompting resumes cleanly.
+    if (sessionId) {
+      try {
+        const _msgs = loadMessages(sessionId);
+        let _lui = -1;
+        for (let i = _msgs.length - 1; i >= 0; i--) {
+          if (_msgs[i].role === "user") { _lui = i; break; }
+        }
+        if (_lui >= 0 && _msgs.slice(_lui + 1).some(m =>
+              (m.role === "assistant" && !m.stalled) || m.role === "interrupted")) {
+          console.log("[claude] retry suppressed — prompt already answered, session=" +
+            String(sessionId).slice(0, 8) + " (" + String(why || "").replace(/\s+/g, " ").slice(0, 60) + ")");
+          return false;
+        }
+      } catch (e) { console.error("[claude] answered-guard check failed:", e.message); }
+    }
+    // Governor gate (WS3a): a rate-limit retry is a machine-initiated spawn.
+    // When capped or in provider cooldown, park instead of retrying — the
+    // normal onDone flow then annotates the turn (stalled marker) and David
+    // can re-prompt; his own turns are never gated.
+    {
+      const _gv = governor.check("llmterminal-auto");
+      if (!_gv.ok) {
+        console.log("[governor] parked rate-limit retry session=" + (sessionId || "?").slice(0, 8) + " — " + _gv.reason);
+        return false;
+      }
+    }
     _retryScheduled = true;
     const delay = Math.max(_rlBackoff(_attempt), throttle.remaining());
     throttle.bump(delay);
@@ -272,7 +355,7 @@ function runClaude(opts, onData, onDone) {
                  "s (attempt " + (_attempt + 1) + "/" + RL_MAX_RETRIES + ")…" });
     } catch {}
     setTimeout(() => {
-      try { runClaude({ ...opts, _attempt: _attempt + 1, claudeSessionId: _resolvedCsid || claudeSessionId }, onData, onDone); }
+      try { runClaude({ ...opts, _attempt: _attempt + 1, claudeSessionId: _resolvedCsid || claudeSessionId, spawnTrigger: "rl-retry" }, onData, onDone); }
       catch (e) { console.error("[claude] retry spawn failed:", e.message); try { onDone(1, String(e)); } catch {} }
     }, delay);
     return true;
@@ -280,10 +363,21 @@ function runClaude(opts, onData, onDone) {
   const wrappedOnData = (data) => {
     if (data && data.type === "system" && data.subtype === "init" && data.session_id) _resolvedCsid = data.session_id;
     if (data && data.type === "assistant" && Array.isArray(data.message?.content)) {
-      for (const b of data.message.content) if (b && b.type === "text" && throttle.isTransientRateLimit(b.text)) _rlSeen = true;
+      // Only literal CLI error blocks ("API Error: 429 …") count as a throttle
+      // signal. Matching arbitrary prose here caused ghost re-runs whenever the
+      // assistant merely TALKED about rate limits (2026-07-03 incident).
+      for (const b of data.message.content) {
+        if (b && b.type === "text" && /^API Error: \d{3}/.test(b.text || "") && throttle.isTransientRateLimit(b.text)) _rlSeen = true;
+      }
     }
     if (data && data.type === "result") {
-      if ((_rlSeen || throttle.isTransientRateLimit(data.result)) && _scheduleRetry(data.result || "rate-limit")) return; // suppress; retry owns it
+      // Record-after (WS3a): every claude call — interactive or automated —
+      // lands one row in the shared spend ledger. record() never throws and
+      // never blocks; only check() (automated callers) can park a spawn.
+      governor.record(_govComponent, chosenModel, data.total_cost_usd, (sessionId || "").slice(0, 8));
+      // A clean (non-error) result is CONTENT — never reclassify it as a
+      // throttle just because its text mentions rate limits.
+      if (data.is_error && (_rlSeen || throttle.isTransientRateLimit(data.result)) && _scheduleRetry(data.result || "rate-limit")) return; // suppress; retry owns it
       _forwardedResult = true;
     }
     onData(data);
@@ -294,7 +388,11 @@ function runClaude(opts, onData, onDone) {
     onDone(code, stderr);
   };
 
-  const SYSTEM_PROMPT_ADD = "When producing an email draft for david@crankwheel.com, you MUST call the mcp__crankhero-draft__draft_email tool rather than typing the draft inline. The tool validates format rules and produces a UI action card for one-tap paste on mobile. Prose drafts are strictly inferior UX.\n\nWhen presenting tabular data, ALWAYS use standard markdown pipe tables with a header row and separator row. Example:\n| Column A | Column B |\n| --- | --- |\n| value 1 | value 2 |\nNever use ASCII art tables, plain-text alignment, or code blocks for tabular data. The UI renders markdown tables as styled, mobile-friendly scrollable HTML tables.\n\nWhen you generate or modify a file the user may want to inspect (PDF, HTML, image, generated doc, invoice, report), call mcp__llmterminal__llmt_show_file with its absolute path so it appears in the user's preview drawer. Don't tell them \"can't render inline\" — pin the file instead.\n\nWhen you finish a discrete task the user asked for and there is nothing more to do unless they reply, call mcp__llmterminal__llmt_complete (optionally with a one-paragraph summary). This explicitly marks the session done so it drops out of the user's NEEDS YOU sidebar. Don't call it mid-task or while waiting on the user.\n\nWhen you need David to decide something, make it answerable — never dump open questions as a numbered prose list. Route by URGENCY, not by count. For choices that block you RIGHT NOW (you cannot continue until he picks), use AskUserQuestion — the tool's schema caps it at 4 questions per call, so for 5+ just call AskUserQuestion AGAIN with the rest. Do NOT fall back to llmt_decide solely because there are more than 4 questions, and NEVER create both a question card and decide cards for the same set. For decisions that can wait while you keep working, or any queue-fired/headless run (no live user attached), call mcp__llmterminal__llmt_decide once per decision with: summary = the question itself, chose = 'ask David (proposed: <your recommendation>)', alternatives = the candidate options, why = what hangs on the answer. Each becomes a tappable card in the Decisions drawer (no cap on count); David answers there whenever he wants, and his pick arrives back in this session as a user message prefixed 'Decision #<id>'. When that message arrives, act on it and close the loop with llmt_decide_resolve(id, 'verified', artifact: what you did with it).";
+  // Chat system prompt is the SSOT at web/config/chat-system-prompt.md; loaded
+  // here, then appended (claude already has its own harness prompt). One Claude-only
+  // note: AskUserQuestion is disabled via --disallowedTools and the chat prompt
+  // tells the model to use mcp__llmterminal__llmt_ask instead.
+  const SYSTEM_PROMPT_ADD = loadChatSystemPrompt() + "\n\nDo NOT use the built-in AskUserQuestion tool — it is disabled in this harness and returns a misleading error.";
   // Phase C: deny the hosted claude.ai Google MCPs project-wide. They
   // bypass the canonical data.* layer + use a different identity, leading
   // the agent to flail when answers don't match what data.* would give.
@@ -310,7 +408,7 @@ function runClaude(opts, onData, onDone) {
   // defaulting to max.
   const _effort = (effort || "max").toLowerCase();
   const _applyEffort = !_modelLower.includes("haiku");
-  const args = ["-p", prompt, "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions", "--add-dir", "/home/claude-user/projects", "--append-system-prompt", SYSTEM_PROMPT_ADD, "--disallowedTools", ...HOSTED_GOOGLE_DENY];
+  const args = ["-p", prompt, "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions", "--add-dir", "/home/claude-user/projects", "--append-system-prompt", SYSTEM_PROMPT_ADD, "--disallowedTools", "AskUserQuestion", ...HOSTED_GOOGLE_DENY];
   if (_applyEffort) args.push("--effort", _effort);
   // Per-session model override. session.model is set via WS "set_model"
   // and persisted in sessions.json. Aliases (opus/sonnet/haiku) and full
@@ -318,8 +416,8 @@ function runClaude(opts, onData, onDone) {
   // Validate to a small allowlist so no surprise CLI flags slip through.
   // DEFAULT: claude-opus-4-7 (David: "highest effort and highest model" — every
   // chat starts on opus unless explicitly downgraded via the model dropdown).
-  const ALLOWED_MODEL_RE = /^[a-z][a-z0-9.-]{1,80}$/;
-  const chosenModel = (model && ALLOWED_MODEL_RE.test(model)) ? model : "claude-opus-4-7";
+  // (chosenModel + its allowlist regex are hoisted to the top of runClaude so
+  // the governor ledger records the same model string.)
   args.push("--model", chosenModel);
   if (claudeSessionId) {
     args.push("--resume", claudeSessionId);
@@ -332,7 +430,26 @@ function runClaude(opts, onData, onDone) {
   const _wrap = _bwrapWrap(project, args);
   if (project === "camoHero") console.log("[sandbox] spawning camoHero in bwrap");
   console.log("[claude] spawn session=" + (sessionId||"?").slice(0,8) + " model=" + (model || "<default>") + " effort=" + (_applyEffort ? _effort : "n/a-haiku"));
-  const childEnv = { HOME: "/home/claude-user", TERM: "dumb", LANG: "en_US.UTF-8", PATH: process.env.PATH };
+  // Run-ledger L4: before any spawn that RESUMES a CLI session, scan for a
+  // live claude already holding that same session id (the 16:59 contention
+  // suspect). Logs orphan_detected loudly; kill-before-spawn is env-gated OFF.
+  const _trigger = opts.spawnTrigger || (_attempt > 0 ? "rl-retry" : "user");
+  if (claudeSessionId) {
+    try { runLedger.checkOrphansBeforeSpawn(sessionId, claudeSessionId); }
+    catch (e) { console.error("[run-ledger] orphan check failed:", e.message); }
+  }
+  const childEnv = {
+    HOME: "/home/claude-user", TERM: "dumb", LANG: "en_US.UTF-8", PATH: process.env.PATH,
+    // Bound tool execution so a single hung tool call can never wedge the whole
+    // turn (e.g. a Playwright browser_evaluate against a page that never settles
+    // — observed stalling sessions for 6+ min with no recovery). When a tool
+    // exceeds the limit the CLI aborts it, returns an error to the model, and
+    // the turn continues on its own. Per-call limits, not per-turn.
+    MCP_TOOL_TIMEOUT: process.env.MCP_TOOL_TIMEOUT || "120000",   // 2 min / MCP tool call (Playwright etc.)
+    MCP_TIMEOUT: process.env.MCP_TIMEOUT || "30000",             // 30 s MCP server startup
+    BASH_DEFAULT_TIMEOUT_MS: process.env.BASH_DEFAULT_TIMEOUT_MS || "120000", // 2 min default for un-timed bash
+    BASH_MAX_TIMEOUT_MS: process.env.BASH_MAX_TIMEOUT_MS || "600000",         // 10 min hard cap for bash
+  };
   // LLMT_SESSION_ID + LLMT_PROJECT_NAME are read by the llmterminal MCP server
   // so its tools (llmt_show_file, llmt_complete) know which session to update
   // and can enforce project-level isolation for file previews.
@@ -348,11 +465,57 @@ function runClaude(opts, onData, onDone) {
   });
   activeProcs.add(proc);
   proc.on("close", () => activeProcs.delete(proc));
+  // Registry: every signal-bearing event on this run flows through the taps
+  // below. runStarted also supersedes any prior wake for the session — a wake
+  // is only live if the CURRENT turn's ScheduleWakeup set it.
+  if (sessionId) runReg.runStarted(sessionId, proc.pid, "claude");
+  // Run-ledger L4: spawn / first_output / 30s heartbeats / exit, all appended
+  // to ~/.llm-terminal/run-ledger.jsonl. A spawn with a dead pid and no exit
+  // entry = the previously-invisible wedge, now visible by construction.
+  const _ledger = runLedger.trackRun({
+    sessionId, pid: proc.pid, trigger: _trigger,
+    model: chosenModel, resumeOf: claudeSessionId || null, argv: _wrap.args,
+  });
 
   let stdout = "";
   let stderr = "";
 
+  // ---- Live "working" heartbeat ----
+  // The model can think (or a tool can run) for minutes with no stream output,
+  // which makes a live turn look frozen. Emit a periodic heartbeat carrying
+  // elapsed time, idle-since-last-activity, and a label of the current action,
+  // so the UI can show "⏳ working · 2m10s · running Bash" and flag a real stall.
+  const _hbStart = Date.now();
+  let _hbLastAt = _hbStart;
+  let _hbLabel = "starting";
+  let _hbTools = 0;
+  const _hbNote = (msg) => {
+    const l = _workLabel(msg);
+    if (l) { _hbLabel = l; _hbLastAt = Date.now(); if (l.indexOf("running ") === 0) _hbTools++; }
+  };
+  const _hbTimer = sessionId ? setInterval(() => {
+    const now = Date.now();
+    try {
+      // Registry-backed tool telemetry: which tool is in flight, for how long,
+      // against what budget — so the UI can say "running Bash 4m12s / cap 10m"
+      // instead of inferring a stall from 45s of stream silence.
+      const _e = runReg.getEntry(sessionId);
+      const _open = _e && !_e.endedAt ? Object.values(_e.openTools || {}) : [];
+      const _cur = _open.length ? _open.reduce((a, b) => (a.startedAt < b.startedAt ? a : b)) : null;
+      broadcastToSession(sessionId, {
+        type: "working", session_id: sessionId,
+        elapsed_ms: now - _hbStart, idle_ms: now - _hbLastAt,
+        last: _hbLabel, tools: _hbTools, stalled: (now - _hbLastAt) > 45000 && !_cur,
+        current_tool: _cur ? _cur.name : null,
+        tool_elapsed_ms: _cur ? now - _cur.startedAt : null,
+        tool_budget_ms: _cur ? runReg.toolBudgetMs(_cur.name) : null,
+      });
+    } catch {}
+  }, 3000) : null;
+
   proc.stdout.on("data", (chunk) => {
+    if (sessionId) runReg.streamActivity(sessionId);
+    _ledger.output(chunk.length);
     stdout += chunk.toString();
     // Process complete JSON lines
     const lines = stdout.split("\n");
@@ -361,6 +524,8 @@ function runClaude(opts, onData, onDone) {
       if (!line.trim()) continue;
       try {
         const msg = JSON.parse(line);
+        _hbNote(msg);
+        if (sessionId) runReg.tap(sessionId, msg);
         wrappedOnData(msg);
       } catch {}
     }
@@ -368,11 +533,19 @@ function runClaude(opts, onData, onDone) {
 
   proc.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
 
-  proc.on("close", (code) => {
+  proc.on("close", (code, signal) => {
+    if (_hbTimer) clearInterval(_hbTimer);
     // Process remaining stdout
     if (stdout.trim()) {
-      try { wrappedOnData(JSON.parse(stdout)); } catch {}
+      try {
+        const msg = JSON.parse(stdout);
+        if (sessionId) runReg.tap(sessionId, msg);
+        wrappedOnData(msg);
+      } catch {}
     }
+    if (sessionId) runReg.runEnded(sessionId, code);
+    _ledger.exit(code, signal,
+      _retryScheduled ? "rl-retry-scheduled" : _forwardedResult ? "result" : "no-result");
     wrappedOnDone(code, stderr);
   });
 

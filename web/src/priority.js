@@ -4,6 +4,7 @@
 const fs = require("fs");
 const path = require("path");
 const { DATA_DIR } = require("./paths");
+const runRegistry = require("./run-registry");
 
 const ARCHIVE_INACTIVE_DAYS = 30;
 // ─── Priority scoring ────────────────────────────────────────────────────────
@@ -48,7 +49,12 @@ function computeSessionStateServer(s) {
   // which means the agent IS running).
   if (s.awaitingResponse && role === "user") return "user_waiting";
   if (role === "user" || role === "tool_activity" || role === "tool_result" || role === "permission_granted") {
-    return ageMin > 5 ? "stalled" : "working";
+    // Signal-based (2026-07-04): a paused loop or a long-thinking run is
+    // "working", not "stalled" — only provably wedged/dead runs rank as stalled.
+    const rr = runRegistry.sessionRunState(s.id, { lastMessageRole: role, lastActiveTs: s.lastActive });
+    if (rr.state === "wedged" || rr.state === "dead_mid_run") return "stalled";
+    if (rr.state === "user_waiting") return "user_waiting";
+    return "working"; // working / waiting_tool / paused_until / idle-draining
   }
   if (role === "assistant") {
     if (ageMin > 3 * 24 * 60) return "done";

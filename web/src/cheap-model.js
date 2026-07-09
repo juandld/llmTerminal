@@ -4,6 +4,8 @@ const fs = require("fs");
 const { spawn } = require("child_process");
 const path = require("path");
 const throttle = require("./throttle");
+const governor = require("./governor");
+const runLedger = require("./run-ledger");
 
 // Per-hero context chunks parsed from ~/.claude/CLAUDE.md. Each row in the
 // "project table" is one hero's blurb. Cheap-claude spawns auto-load the full
@@ -83,6 +85,15 @@ function _runCheapClaudeCli(prompt, tag, onParsed, project) {
 }
 
 function _spawnCheapClaudeCli(prompt, tag, onParsed, project) {
+  // Governor gate (WS3a): supervisors/background calls are machine-initiated
+  // and fire-and-forget — when capped or in provider cooldown, drop this round
+  // (same semantics as the throttle drop below). Both entry points of
+  // _runCheapClaudeCli (immediate + throttle-deferred) land here.
+  const _gv = governor.check("llmterminal-cheap");
+  if (!_gv.ok) {
+    console.log("[governor] parked " + tag + " — " + _gv.reason);
+    return;
+  }
   const args = [
     "-p", prompt,
     "--model", "haiku",
@@ -96,12 +107,22 @@ function _spawnCheapClaudeCli(prompt, tag, onParsed, project) {
     uid: 1000, gid: 1000,
     stdio: ["ignore", "pipe", "pipe"],
   });
+  // Run-ledger L4: cheap/background spawns land in the same ledger. No llmT
+  // session id here — the tag ("observer"/"decision-extractor"/"roi-haiku")
+  // is the identity.
+  const _ledger = runLedger.trackRun({ sessionId: "cheap:" + tag, pid: proc.pid, trigger: "cheap", model: "haiku", resumeOf: null, argv: args });
   let out = "", err = "";
-  proc.stdout.on("data", c => out += c);
+  proc.stdout.on("data", c => { _ledger.output(c.length); out += c; });
   proc.stderr.on("data", c => err += c);
   const timer = setTimeout(() => { try { proc.kill("SIGTERM"); } catch {} }, 45000);
-  proc.on("close", async () => {
+  proc.on("close", async (code, signal) => {
     clearTimeout(timer);
+    _ledger.exit(code, signal, "cheap-close");
+    // Record-after (WS3a): one ledger row per cheap call. Cost comes from the
+    // --output-format json wrapper; best-effort 0 when the output isn't JSON.
+    let _cost = 0;
+    try { _cost = Number(JSON.parse(out).total_cost_usd) || 0; } catch {}
+    governor.record("llmterminal-cheap", "haiku", _cost, tag);
     // If this cheap call itself got throttled, extend the shared window so the
     // user-facing runner (and other background calls) back off too.
     if (throttle.isTransientRateLimit(out) || throttle.isTransientRateLimit(err)) {
