@@ -1,10 +1,31 @@
 // Provider support layer for llmTerminal: model->provider routing, per-project
-// context blocks for non-Claude providers, conversation-history builders, and
-// the FetchProc abort wrapper. Extracted from server.js (refactor 2026-06-10, phase 2).
+// context blocks for the chat, conversation-history builders, and the FetchProc
+// abort wrapper. Extracted from server.js (refactor 2026-06-10, phase 2).
 const fs = require("fs");
 const path = require("path");
 const { PROJECTS_DIR } = require("../paths");
 const { loadMessages } = require("../store");
+
+// SSOT for the chat's system prompt. Markdown file at web/config/chat-system-prompt.md;
+// every provider runner (claude/openai/google) reads from here so behavior rules
+// stay consistent across models. Mtime-cached so iterating on the prompt is a
+// "save the file + send a new message" loop — no service restart needed.
+const CHAT_SYSTEM_PROMPT_PATH = path.resolve(__dirname, "../../config/chat-system-prompt.md");
+let _promptCache = { key: "", body: "" };
+function loadChatSystemPrompt() {
+  try {
+    const st = fs.statSync(CHAT_SYSTEM_PROMPT_PATH);
+    // mtime+size key — guards against same-second writes that don't tick mtimeMs.
+    const key = st.mtimeMs + ":" + st.size;
+    if (key !== _promptCache.key) {
+      _promptCache = { key, body: fs.readFileSync(CHAT_SYSTEM_PROMPT_PATH, "utf-8").trim() };
+    }
+    return _promptCache.body;
+  } catch (e) {
+    console.warn("[chat-system-prompt] failed to read", CHAT_SYSTEM_PROMPT_PATH, "-", e.message);
+    return "";
+  }
+}
 
 const PROVIDER_MAP = {
   "": "claude", opus: "claude", sonnet: "claude", haiku: "claude",
@@ -20,12 +41,10 @@ function getProvider(model) {
   return "claude";
 }
 
-const CHAT_SYSTEM_PROMPT = "When presenting tabular data, ALWAYS use standard markdown pipe tables with a header row and separator row. Example:\n| Column A | Column B |\n| --- | --- |\n| value 1 | value 2 |\nNever use ASCII art tables, plain-text alignment, or code blocks for tabular data. The UI renders markdown tables as styled, mobile-friendly scrollable HTML tables.\n\nAfter you finish calling tools, you MUST end the turn with a short text reply that explains what you did and answers the user'''s actual question. Never end a turn on a tool call alone.";
-
-// ----- Per-project context block for non-Claude providers -----
-// Claude already auto-loads CLAUDE.md (and any --add-dir paths) — we don't
-// touch its path. For OpenAI/Gemini we prepend the same flavor of info to the
-// system prompt so the model knows: which project, where it lives on disk,
+// ----- Per-project context block prepended to the system prompt -----
+// Claude's CLI auto-loads CLAUDE.md from its --add-dir paths, so passing this
+// to claude.js would be redundant — only the fetch-based runners (openai/google)
+// need it. The block tells the model: which project, where it lives on disk,
 // what the project's conventions are, and what siblings exist.
 function buildProjectContext(project) {
   if (!project) return "";
@@ -149,5 +168,5 @@ class FetchProc {
 
 module.exports = {
   getProvider, buildProjectContext, buildHistory, toGeminiContents,
-  FetchProc, CHAT_SYSTEM_PROMPT,
+  FetchProc, loadChatSystemPrompt,
 };
