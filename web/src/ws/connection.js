@@ -584,6 +584,25 @@ getWss().on("connection", (ws, req) => {
             return;
           }
         }
+        // Dedupe rapid-fire identical prompts: same text, different client_id,
+        // within 15s. Caused by the client sending twice when the first send
+        // wasn't visibly acked, or a mobile double-tap on the send button.
+        // Shipped after the Studi SOW chat (2026-07-09) where the same 60-word
+        // message arrived twice, 11s apart, and the agent processed both.
+        if (!msg.resend && msg.text) {
+          const _t = msg.text.trim();
+          if (_t.length >= 20) {
+            const recent = loadMessages(session.id).slice(-4);
+            const now = Date.now();
+            if (recent.some(m => m.role === "user"
+                                 && (now - (m.ts || 0)) < 15000
+                                 && (m.text || "").trim() === _t
+                                 && (!msg.client_id || m.client_id !== msg.client_id))) {
+              console.log("[prompt] suppressing rapid-fire duplicate (same text, <15s):", _t.slice(0, 60));
+              return;
+            }
+          }
+        }
         // Process images UP FRONT so the queue (if we queue) carries the augmented
         // prompt — otherwise queued prompts would silently drop their images on drain.
         const text = (msg.text || "").trim();

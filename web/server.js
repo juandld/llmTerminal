@@ -1232,21 +1232,28 @@ app.post("/api/email-draft/send", express.json(), (req, res) => {
   ];
   if (cc) { args.push("--cc", cc); }
   if (threadId && /^[A-Za-z0-9_-]+$/.test(threadId)) { args.push("--thread-id", threadId); }
-  // Attachments: each path must be absolute, exist, and live under either
-  // camoHero (canonical) or the session's own project dir. Cross-project
-  // pinning is intentionally disallowed.
+  // Attachments: identity-aware allowlist. crankwheel-account sends can attach
+  // from crankHero/; camofiles-account sends from camoHero/. The session's own
+  // project dir also always qualifies. Fixes the "PDF at crankHero/... from an
+  // orchestratorHero chat sent as david@crankwheel.com" case that previously
+  // 400'd and forced the assistant to fall back to "please attach it yourself".
   if (Array.isArray(attachments) && attachments.length) {
-    const allowedPrefixes = [
+    const identityProject = account === "camofiles" ? "camoHero" : "crankHero";
+    const allowedPrefixes = Array.from(new Set([
       "/home/claude-user/projects/camoHero/",
+      "/home/claude-user/projects/" + identityProject + "/",
       "/home/claude-user/projects/" + session.project + "/",
-    ];
+    ]));
     for (const ap of attachments) {
       if (typeof ap !== "string") {
         return res.status(400).json({ ok: false, error: "attachment must be a string path" });
       }
       const abs = path.resolve(ap);
       if (!allowedPrefixes.some(p => abs.startsWith(p))) {
-        return res.status(400).json({ ok: false, error: `attachment outside allowed dirs (camoHero/ or ${session.project}/): ${ap}` });
+        return res.status(400).json({
+          ok: false,
+          error: `attachment outside allowed dirs (camoHero/, ${identityProject}/, or ${session.project}/): ${ap}`,
+        });
       }
       if (!fs.existsSync(abs)) {
         return res.status(400).json({ ok: false, error: `attachment not found: ${ap}` });
