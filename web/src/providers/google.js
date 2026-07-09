@@ -4,7 +4,8 @@ const path = require("path");
 const { PROJECTS_DIR } = require("../paths");
 const mcpDiscover = require("../mcp/discover");
 const mcpTranslate = require("../mcp/translate");
-const { buildHistory, buildProjectContext, FetchProc, CHAT_SYSTEM_PROMPT, toGeminiContents } = require("./context");
+const builtinTools = require("../tools-builtin");
+const { buildHistory, buildProjectContext, FetchProc, loadChatSystemPrompt, toGeminiContents } = require("./context");
 const { activeProcs } = require("../proc-state");
 
 function runGoogle({ prompt, sessionId, model, project, effort }, onData, onDone) {
@@ -36,12 +37,18 @@ function runGoogle({ prompt, sessionId, model, project, effort }, onData, onDone
       } catch (e) {
         console.warn("[runGoogle] tool discovery failed:", e.message);
       }
-      const ggTools = mcpTools.length ? mcpTranslate.toGoogleTools(mcpTools) : null;
+      // Built-in tools (Bash/Read/Write/Edit/Grep/Glob) merged with MCP tools
+      // — see openai.js for the same merge pattern. Gemini's schema scrubber
+      // (toGoogleTools) strips JSONSchema fields Gemini rejects, including for
+      // built-in schemas.
+      const allTools = [...builtinTools.listBuiltinTools(), ...mcpTools];
+      const ggTools = allTools.length ? mcpTranslate.toGoogleTools(allTools) : null;
       const routing = mcpTranslate.buildRouting(mcpTools);
 
       const history = buildHistory(sessionId, prompt, { includeToolContext: true });
       const projectCtx = buildProjectContext(project);
-      const sysPrompt = projectCtx ? (projectCtx + "\n\n" + CHAT_SYSTEM_PROMPT) : CHAT_SYSTEM_PROMPT;
+      const chatPrompt = loadChatSystemPrompt();
+      const sysPrompt = projectCtx ? (projectCtx + "\n\n" + chatPrompt) : chatPrompt;
       // Gemini wants `contents` (alternating user/model) plus systemInstruction
       const contents = toGeminiContents(history);
 
@@ -134,12 +141,23 @@ function runGoogle({ prompt, sessionId, model, project, effort }, onData, onDone
         const userParts = [];
         for (const tc of turnCalls) {
           const route = routing.get(tc.name);
+          const isBuiltin = builtinTools.hasBuiltin(tc.name);
           const useId = `gg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-          onData({ type: "assistant", message: { content: [{ type: "tool_use", name: route ? route.originalName : tc.name, input: tc.args, id: useId }] } });
+          const displayName = isBuiltin ? tc.name : (route ? route.originalName : tc.name);
+          onData({ type: "assistant", message: { content: [{ type: "tool_use", name: displayName, input: tc.args, id: useId }] } });
 
           let resultContent;
           let isError = false;
-          if (!route) {
+          if (isBuiltin) {
+            try {
+              const r = await builtinTools.callBuiltin(tc.name, tc.args, { projectCwd, sessionId });
+              resultContent = r.content || [];
+              isError = !!r.isError;
+            } catch (e) {
+              resultContent = [{ type: "text", text: `Tool execution error: ${e.message}` }];
+              isError = true;
+            }
+          } else if (!route) {
             resultContent = [{ type: "text", text: `Unknown tool: "${tc.name}"` }];
             isError = true;
           } else {
