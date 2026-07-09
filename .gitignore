@@ -2,7 +2,7 @@
 
 
 # llmTerminal additions
-node_modules/
+node_modules
 web/node_modules
 *.bak
 *.bak-*
@@ -11,4 +11,10 @@ web/uploads/
 
 # clutter / local artifacts
 *.png
+*.jpg
 web/llmt.db
+
+# WIP / gap reports / plan drafts
+wip_*.md
+FEATURE-GAP-REPORT-*.md
+LIVENESS-AND-FRUITION-PLAN-*.md
