@@ -45,6 +45,14 @@ function renderPendingItems(items){
       for(const c of candidates){
         if(c.textContent && c.textContent.includes(item.text.slice(0,40))){dup=true;break;}
       }
+      // Voice-note items: the recording device's local bubble has no transcript
+      // text yet at the moment queue_state arrives (the upload response hasn't
+      // populated it). Any untagged local voice-note-msg is that just-uploaded
+      // bubble — treat it as a dup so we don't render a second one.
+      // queued_prompt_firing will claim the local bubble shortly after.
+      if(!dup && item.source==="voice-note"){
+        if(chat.querySelector('.msg.user.voice-note-msg:not([data-ts])')) dup=true;
+      }
       if(dup) continue;
     }
     const isVoice=item.source==="voice-note";
@@ -268,8 +276,95 @@ function addAssistant(text, opts){
   scrollToBottomIfSticky();
   if(opts && opts.live) preemptTts(text);
 }
-function addQuestion(text){
+// Build the inline answerable-card body (used by addQuestion when a
+// decisionId is present — the llmt_ask path). Buttons POST to
+// /api/decisions/:id/answer; the answer route queues the response back as
+// a follow-up prompt that the agent picks up automatically.
+function renderInlineAnswerCard(container, question, opts){
+  const did = String(opts.decisionId);
+  const options = Array.isArray(opts.options) ? opts.options.slice() : [];
+  const recommend = (opts.recommend || "").trim();
+  // Surface the recommended option as the first button if it isn't already
+  // in the options array (matches the Decisions drawer convention).
+  if (recommend && !options.includes(recommend)) options.unshift(recommend);
+  const label = mk("div","msg-label q-label");
+  label.textContent = "Question — tap an option or type your own";
+  container.appendChild(label);
+  const body = mk("div","q-text");
+  body.innerHTML = fmt(question);
+  container.appendChild(body);
+  if (opts.why) {
+    const ctx = mk("div","q-context");
+    ctx.textContent = opts.why;
+    container.appendChild(ctx);
+  }
+  const optsWrap = mk("div","q-ask-opts");
+  options.forEach((o, i) => {
+    const btn = mk("button","q-ask-btn");
+    btn.textContent = o + (o === recommend ? "  (recommended)" : "");
+    if (o === recommend) btn.classList.add("q-ask-recommend");
+    btn.dataset.did = did;
+    btn.onclick = () => submitInlineAnswer(container, did, o, btn);
+    optsWrap.appendChild(btn);
+  });
+  container.appendChild(optsWrap);
+  const freeWrap = mk("div","q-ask-free");
+  const input = document.createElement("input");
+  input.type = "text"; input.className = "q-ask-input";
+  input.placeholder = "Or type your own answer…";
+  const sendBtn = mk("button","q-ask-send");
+  sendBtn.textContent = "Send";
+  const submit = () => {
+    const v = (input.value || "").trim();
+    if (!v) return;
+    submitInlineAnswer(container, did, v, sendBtn);
+  };
+  sendBtn.onclick = submit;
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); submit(); } });
+  freeWrap.appendChild(input); freeWrap.appendChild(sendBtn);
+  container.appendChild(freeWrap);
+  const err = mk("div","q-ask-err");
+  err.dataset.did = did;
+  container.appendChild(err);
+  container.dataset.did = did;
+}
+async function submitInlineAnswer(container, did, answer, btn) {
+  const err = container.querySelector(".q-ask-err");
+  if (err) err.textContent = "";
+  if (btn) { btn.disabled = true; btn.dataset.prev = btn.textContent; btn.textContent = "Sending…"; }
+  try {
+    const r = await fetch(apiUrl("/api/decisions/" + encodeURIComponent(did) + "/answer"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ answer })
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || !data.ok) throw new Error((data && data.error) || ("HTTP " + r.status));
+    // Replace the answer surface with a resolved-state line. The card stays
+    // in the transcript as a record; David sees what he picked.
+    container.querySelectorAll(".q-ask-opts, .q-ask-free, .q-ask-err").forEach(el => el.remove());
+    const resolved = mk("div","q-ask-resolved");
+    resolved.textContent = "Answered: " + answer;
+    container.appendChild(resolved);
+    try { refreshDecisionsBadge(); } catch {}
+  } catch (e) {
+    if (btn) { btn.disabled = false; btn.textContent = btn.dataset.prev || "Send"; }
+    if (err) err.textContent = "⚠ " + (e.message || "failed");
+  }
+}
+function addQuestion(text, opts){
   const d=mk("div","msg question");
+  // llmt_ask path — render an answerable card with one-tap option buttons
+  // that POST directly to /api/decisions/:id/answer. The agent then resumes
+  // when the answer is queued back as a follow-up prompt.
+  if(opts && opts.decisionId){
+    renderInlineAnswerCard(d, text, opts);
+    chat.appendChild(d);
+    scrollToBottomForce();
+    if(window.matchMedia(_DESKTOP_FOCUS_MQ).matches)inp.focus();
+    inp.setAttribute("placeholder","Tap an option above, or type your own answer…");
+    return;
+  }
   // Try to parse structured questions (array of {question, header, options, multiSelect})
   let structured=null;
   try{
@@ -373,6 +468,6 @@ function addQuestion(text){
   }
   chat.appendChild(d);
   scrollToBottomForce();
-  if(window.innerWidth>768)inp.focus();
+  if(window.matchMedia(_DESKTOP_FOCUS_MQ).matches)inp.focus();
   inp.setAttribute("placeholder","Answer the question above...");
 }

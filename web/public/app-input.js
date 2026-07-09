@@ -11,11 +11,15 @@ document.addEventListener("visibilitychange",()=>{
   // Page just became visible (phone unlocked, tab refocused)
   if(!session) return;
   const wsAlive = ws && ws.readyState===WebSocket.OPEN;
-  const stale = Date.now()-lastServerMsgTs > 10000; // >10s since last server msg
+  // Server pings every 20s; 30s covers one skipped/late ping without a false reconnect.
+  const stale = Date.now()-lastServerMsgTs > 30000;
   if(!wsAlive || stale){
     const sid=session.id, proj=session.project; // capture before any async weirdness
     console.log("[visibility] page visible, reconnecting (wsAlive="+wsAlive+", stale="+stale+", session="+sid+")");
-    chat.innerHTML=""; lastRenderedTs=0;
+    // Don't pre-emptively wipe chat.innerHTML: the incoming `history` event will
+    // wipe-and-re-render if it sees existing content. Wiping here causes a
+    // visible blank-chat flash during every reconnect — matching David's
+    // "the chat is inactive, refresh, and the answer was there" report.
     connect(proj,sid); // connect() already cleans up old ws
     return; // connect() will refreshPreviews on `ready`
   }
@@ -35,6 +39,9 @@ function send(){
   const text = preamble ? (preamble + (rawText || "(no message — attached files for context)")) : rawText;
   if(!text&&pendingImages.length===0) return;
   if (preamble) { selectedPreviewIds.clear(); _saveSelection(); renderDrawer(); renderSelectedTray(); }
+  // Engaging an archived/done chat bumps it back to the active list immediately
+  // — covers the queued, no-WS and live-send branches below in one place.
+  promoteCurrentSessionToActive();
   // Request notification permission on first send (idempotent if already decided)
   requestNotifPermission();
   // Push to input history (for ArrowUp recall)
@@ -46,7 +53,9 @@ function send(){
     const images=pendingImages.map(i=>({data:i.data,mimeType:i.mimeType}));
     const previews=pendingImages.map(i=>i.preview);
     const queuedId=genMsgId();
-    messageQueue.push({text,images,previews,clientId:queuedId});
+    // Tag with the session id so the drain in setBusy(false) can refuse to fire
+    // it into a different chat if the user switches away (2026-07-03 bug).
+    messageQueue.push({text,images,previews,clientId:queuedId,sessionId:session?.id||null});
     addQueued(text,previews,queuedId);
     _clearInput();
     renderQueueCount();
@@ -56,9 +65,12 @@ function send(){
   const images=pendingImages.map(i=>({data:i.data,mimeType:i.mimeType}));
   const previews=pendingImages.map(i=>i.preview);
 
+  // sid: bind the message to the chat it was typed in, so a reconnect on a
+  // DIFFERENT chat can never flush it there (2026-07-07 lost-messages incident).
+  const _sid=(session&&session.id)||localStorage.getItem("llmt_session")||null;
   if(!ws||ws.readyState!==1){
     const clientId=genMsgId();
-    outbox.push({id:clientId,text,images,ts:Date.now()});saveOutbox();
+    outbox.push({id:clientId,text,images,ts:Date.now(),sid:_sid});saveOutbox();
     // Reconnect — outbox will be flushed when "ready" arrives (no ws.onopen overwrite,
     // which would race the flush and double-send the prompt)
     connect(session?.project||_defaultProject(),session?.id);
@@ -67,7 +79,7 @@ function send(){
     return;
   }
   const clientId=genMsgId();
-  outbox.push({id:clientId,text,images,ts:Date.now()});saveOutbox();
+  outbox.push({id:clientId,text,images,ts:Date.now(),sid:_sid});saveOutbox();
   ws.send(JSON.stringify({type:"prompt",client_id:clientId,text:prompt,images}));
   addUser(text,previews,clientId);
   // Tag live-rendered message so history replay doesn't duplicate

@@ -94,7 +94,7 @@ function loadTaskIntoChat(el){
   // Link this session to the task
   if(ws&&ws.readyState===1) ws.send(JSON.stringify({type:"link_task",task_id:tid}));
   toggleTaskBoard();
-  if(window.innerWidth>768) inp.focus();
+  if(window.matchMedia(_DESKTOP_FOCUS_MQ).matches) inp.focus();
 }
 // ── Floating Action Button (FAB) — round-robin + quick actions ──
 (function(){
@@ -102,8 +102,39 @@ function loadTaskIntoChat(el){
   if(!fab)return;
   const fabCount=document.getElementById("fabCount");
   let isDragging=false, dragStartX=0, dragStartY=0, fabX=0, fabY=0, pressTimer=null;
+  // Clamp the FAB into a sane area for the current viewport: not off-screen,
+  // and (on tablet/desktop, where the sidebar is permanently visible) not
+  // hidden behind the 280px sidebar gutter. Phone-dragged positions used to
+  // leak onto iPad portrait/landscape and bury the FAB under the sidebar,
+  // which made David think the "assistant button" was missing on iPad.
+  function _clampFabIntoView(){
+    // Match the CSS breakpoint where the sidebar is overlay vs permanent —
+    // ≤1023px = overlay (iPhone + iPad portrait), >1023px = permanent (iPad landscape + desktop).
+    const sidebarIsOverlay = window.innerWidth <= 1023;
+    const sidebarReserve = sidebarIsOverlay ? 0 : 300; // 280 sidebar + 20 gutter
+    const fabSize = 56;
+    const margin = 10;
+    const minLeft = sidebarReserve + margin;
+    const maxLeft = Math.max(minLeft, window.innerWidth - fabSize - margin);
+    const minTop = margin;
+    const maxTop = Math.max(minTop, window.innerHeight - fabSize - margin);
+    const r = fab.getBoundingClientRect();
+    let x = r.left, y = r.top;
+    let needs = false;
+    if(x < minLeft){ x = sidebarIsOverlay ? maxLeft : minLeft; needs = true; }
+    else if(x > maxLeft){ x = maxLeft; needs = true; }
+    if(y < minTop){ y = minTop; needs = true; }
+    else if(y > maxTop){ y = maxTop; needs = true; }
+    if(needs){
+      fab.style.right="auto"; fab.style.bottom="auto";
+      fab.style.left=x+"px"; fab.style.top=y+"px";
+    }
+  }
   // Restore position
   try{const p=JSON.parse(localStorage.getItem("llmt_fab_pos"));if(p){fab.style.right="auto";fab.style.left=p.x+"px";fab.style.top=p.y+"px";fab.style.bottom="auto";}}catch{}
+  // Clamp now (in case restored position is off-screen / behind sidebar) and on every resize.
+  _clampFabIntoView();
+  window.addEventListener("resize", _clampFabIntoView);
 
   function updateFabCount(){
     const n=attentionSessionsList().length;

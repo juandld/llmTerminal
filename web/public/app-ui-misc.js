@@ -28,7 +28,19 @@ function syncMobileFilesBadge(){
 function toggleSB(){
   const sb=document.getElementById("sidebar");
   sb.classList.toggle("show");
-  try{localStorage.setItem("llmt_sidebar_open",String(sb.classList.contains("show")))}catch{}
+  const shown=sb.classList.contains("show");
+  document.body.classList.toggle("sb-open",shown);
+  try{localStorage.setItem("llmt_sidebar_open",String(shown))}catch{}
+}
+// Topbar chat-title — kept in sync with the active session so tablet jumps via
+// the bell or sidebar always land with the chat name visible (the att-banner
+// auto-hides; this is the persistent identifier).
+function setTopbarTitle(title){
+  const el = document.getElementById("topbarTitle");
+  if (!el) return;
+  const t = (title || "").trim();
+  el.textContent = t;
+  el.title = t;
 }
 function mk(tag,cls){const d=document.createElement(tag);d.className=cls;return d}
 function esc(s){const d=document.createElement("div");d.textContent=s;return d.innerHTML}
@@ -301,6 +313,24 @@ function notifyDone(resultText){
       tag:"llmt-done",
     });
     n.onclick=()=>{window.focus();n.close()};
+  }catch{}
+}
+// Fired when an agent posts a blocking question via llmt_ask. Cuts through
+// other notifications with requireInteraction so it stays on-screen until
+// David acknowledges. Tag includes session id so multiple chats don't
+// collapse into one notification.
+function notifyQuestion(question, sessionTitle){
+  if(typeof Notification==="undefined")return;
+  if(notifPermission!=="granted")return;
+  try{
+    const title = sessionTitle ? ("❓ " + sessionTitle) : "❓ Question pending";
+    const n = new Notification(title, {
+      body: (question || "").slice(0, 160),
+      icon: "/favicon.ico",
+      tag: "llmt-question-" + (session?.id || ""),
+      requireInteraction: true,
+    });
+    n.onclick = () => { window.focus(); n.close(); };
   }catch{}
 }
 

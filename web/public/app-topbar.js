@@ -16,7 +16,7 @@
   // The project badge is NOT budgeted at its floor: it's chat identity, so
   // buttons collapse before the name compresses. Its CSS floor still acts as
   // a last-resort relief valve when even a fully-collapsed bar overflows.
-  var MIN_W = { topbarAtt: 48, browserBtn: 64 };
+  var MIN_W = { topbarAtt: 48, browserBtn: 64, topbarTitle: 60 };
   var OVERFLOW_W = 36;  // ⋮ button width
   var nav, topbar, scheduled = false;
 

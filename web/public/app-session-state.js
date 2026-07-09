@@ -164,6 +164,20 @@ function markSessionDone(sessionId) {
   .then(() => { _pendingDone.delete(sessionId); loadSessions(); })
   .catch(() => {});
 }
+// Re-engaging an archived/done chat (sending a message or voice note) should
+// instantly bump it to the top of the active list — not wait 15s for the next
+// poll. Mirror the server-side updates locally: bump lastActive, clear
+// manualDone, drop the soft-archive flag. The next loadSessions() roundtrip
+// will confirm.
+function promoteCurrentSessionToActive() {
+  if (!session || !Array.isArray(_allSessions)) return;
+  const s = _allSessions.find(x => x.id === session.id);
+  if (!s) return;
+  s.lastActive = Date.now();
+  s.manualDone = null;
+  s.archived = false;
+  try { _renderSidebar(); } catch {}
+}
 const STATE_ICONS = {
   blocked:      "❗",       // ❗
   decision:     "⚡",       // ⚡
@@ -220,9 +234,11 @@ function showAttentionBanner(s) {
     banner.appendChild(snipEl);
   }
   banner.style.display = "flex";
-  // Auto-hide after 5s
-  if (banner._timer) clearTimeout(banner._timer);
-  banner._timer = setTimeout(() => { banner.style.display = "none"; }, 5000);
+  // Stay until the next bell-jump or an explicit tap. Previously auto-hid at
+  // 5s, which on tablet meant David often missed the only on-screen indicator
+  // of "what chat did I just land on" — the persistent topbar title now backs
+  // this up but the banner stays as the richer first-glance card.
+  if (banner._timer) { clearTimeout(banner._timer); banner._timer = null; }
   banner.onclick = () => { banner.style.display = "none"; };
 }
 function refreshAttentionCounter() {

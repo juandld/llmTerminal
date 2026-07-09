@@ -36,6 +36,14 @@ function _teardownAndConnect(project, sessionId){
   }
   chat.innerHTML=""; session=null; ws=null; busy=false; lastRenderedTs=0; removeThinking();
   try { localStorage.setItem("llmt_project", project); } catch {}
+  // Locally-queued messages are session-scoped. If we're changing sessions,
+  // drop items tied to the outgoing session so the setBusy(false) drain below
+  // (and the "history" handler that flips busy per server state) can't fire
+  // them into the incoming chat (2026-07-03 bug).
+  if (switching) {
+    messageQueue = messageQueue.filter(m => m.sessionId && m.sessionId === sessionId);
+    try { renderQueueCount(); } catch {}
+  }
   setBusy(false);
   connect(project, sessionId);
   _updateNewSessionLabel();
@@ -150,6 +158,7 @@ function connect(project,sessionId){
         addApiErrorCard(msg);
         setBusy(false);
         setStatus("error","");
+        try { loadSessions(); } catch {}
         break;
       case "session_summary":
         renderSummary(msg.data);
@@ -162,6 +171,7 @@ function connect(project,sessionId){
         localStorage.setItem("llmt_project", session.project);
         location.hash = session.id;
         markSessionViewed(session.id);
+        setTopbarTitle(session.title);
         loadSessions();
         refreshPreviews(false);
         startBrowserPoll();
@@ -195,11 +205,12 @@ function connect(project,sessionId){
           const ts=m.ts||0;
           if(m.role==="user"&&m.source==="voice-note") addVoiceNoteFromHistory(m);
           else if(m.role==="user") addUser(m.text, null, m.client_id || null);
-          else if(m.role==="question") addQuestion(m.text);
+          else if(m.role==="question") addQuestion(m.text, m.decisionId ? { decisionId: m.decisionId, options: m.options || [], recommend: m.recommend || null, why: m.why || null } : null);
           else if(m.role==="permission_denied") addPermissionCardFromHistory({tool_name:m.tool_name,tool_input:m.tool_input,message:m.message});
           else if(m.role==="assistant") addAssistant(m.text, { source: m.source });
           else if(m.role==="tool_activity") addToolActivityLine(m.tool_name, m.summary);
           else if(m.role==="email_draft") addEmailDraft(m);
+          else if(m.role==="email_reply") addEmailReply(m, {suppressScroll: true});
           // Tag the newly-appended element with ts for future diffing
           if(ts){
             const last=chat.lastElementChild;
@@ -241,7 +252,13 @@ function connect(project,sessionId){
           }
           const d=mk("div","msg "+(m.role==="user"?"user":m.role==="question"?"question":"assistant"));
           if(m.role==="user") d.appendChild(document.createTextNode(m.text));
-          else if(m.role==="question"){const l=mk("div","msg-label q-label");l.textContent="Question";const b=mk("div","q-text");b.innerHTML=fmt(m.text);d.appendChild(l);d.appendChild(b);}
+          else if(m.role==="question"){
+            if(m.decisionId){
+              renderInlineAnswerCard(d, m.text, { decisionId: m.decisionId, options: m.options || [], recommend: m.recommend || null, why: m.why || null });
+            } else {
+              const l=mk("div","msg-label q-label");l.textContent="Question";const b=mk("div","q-text");b.innerHTML=fmt(m.text);d.appendChild(l);d.appendChild(b);
+            }
+          }
           else{const b=mk("div","bubble");b.innerHTML=fmt(m.text);d.appendChild(b);}
           frag.appendChild(d);
         });
@@ -256,6 +273,11 @@ function connect(project,sessionId){
         resetLiveBubble();
         showThinking();
         setStatus("thinking...","thinking");
+        break;
+      case "working":
+        // Live heartbeat from the server while a turn runs — drives the
+        // elapsed/last-action indicator so a slow turn doesn't look frozen.
+        updateWorking(msg);
         break;
       case "text":
         // Claude's response text — show in bubble (append to existing live bubble if streaming)
@@ -279,6 +301,7 @@ function connect(project,sessionId){
       case "email_draft":
         removeThinking();
         addEmailDraft(msg);
+        try { loadSessions(); } catch {}
         break;
             case "queued":
         // Server confirmed it queued our prompt while busy. Treat as ack so outbox drops it.
@@ -294,6 +317,24 @@ function connect(project,sessionId){
         _serverQueueDepth = msg.queueDepth || 0;
         renderQueueCount();
         renderPendingItems(msg.items || []);
+        break;
+      case "messages_deleted":
+        // Server confirmed a delete. Drop the bubble(s) from DOM and, for a
+        // client-side-only queued item (Claude was busy, message never made it
+        // to the server), also strip the pending entry from messageQueue so
+        // setBusy(false) doesn't drain and re-send it.
+        {
+          const cids = Array.isArray(msg.client_ids) ? msg.client_ids : [];
+          for (const cid of cids) {
+            if (!cid) continue;
+            chat.querySelectorAll('.msg[data-client-id="'+CSS.escape(String(cid))+'"]').forEach(el => el.remove());
+          }
+          if (cids.length) {
+            const before = messageQueue.length;
+            messageQueue = messageQueue.filter(it => !cids.includes(it.clientId));
+            if (messageQueue.length !== before) renderQueueCount();
+          }
+        }
         break;
       case "queued_prompt_firing":
         // If the bubble was already rendered locally (user typed it while connected),
@@ -367,9 +408,37 @@ function connect(project,sessionId){
           if (_dw && !_dw.classList.contains("hidden")) loadDecisions();
         } catch {}
         break;
+      case "question_card":
+        // llmt_ask posted a blocking question. Render an inline answerable
+        // card in the chat scroll so David can't miss it. Also fire a
+        // browser notification if the tab is backgrounded.
+        try {
+          if (msg.decisionId) {
+            removeThinking();
+            addQuestion(msg.question || "", {
+              decisionId: msg.decisionId,
+              options: msg.options || [],
+              recommend: msg.recommend || null,
+              why: msg.why || null,
+            });
+            refreshDecisionsBadge();
+            try { loadSessions(); } catch {}
+            if (document.hidden) {
+              try {
+                const title = (session && (session.title || session.id)) || "";
+                notifyQuestion(msg.question || "", title);
+              } catch {}
+            }
+          }
+        } catch (e) { console.error("[question_card] render failed:", e); }
+        break;
       case "title_updated":
         // Refresh the sidebar so the new title shows up.
         try { loadSessions(); } catch {}
+        if (session && msg.sessionId === session.id) {
+          session.title = msg.title;
+          setTopbarTitle(msg.title);
+        }
         break;
       case "permissions_state":
         grantedPerms=new Set(msg.permissions||[]);
@@ -378,6 +447,7 @@ function connect(project,sessionId){
         setBusy(false);
         removeThinking();
         addSystemNote("Stopped.");
+        try { loadSessions(); } catch {}
         break;
             case "done":
         removeThinking();
@@ -392,17 +462,25 @@ function connect(project,sessionId){
         if(msg.result && document.hidden) notifyDone(msg.result);
         setBusy(false);
         setStatus("ready","active");
+        // Sidebar was showing this chat as "working" (or "stalled" after 5min).
+        // Server just wrote lastMessageRole="assistant"; refresh _allSessions so
+        // the sidebar snaps to "responded" instead of staying stale until a
+        // refresh. Was David's "the answer was there but the chat said stale" bug.
+        try { loadSessions(); } catch {}
         break;
       case "idle":
+        removeThinking();
         resetLiveBubble();
         setBusy(false);
         setStatus("ready","active");
+        try { loadSessions(); } catch {}
         break;
       case "error":
         removeThinking();
         addError(msg.message);
         setBusy(false);
         setStatus("error","");
+        try { loadSessions(); } catch {}
         break;
       case "exit":
         addSystem("Session ended");
@@ -419,7 +497,10 @@ function connect(project,sessionId){
       reconnectTimer=null;
       if(closedEpoch!==connectEpoch) return; // session switched since this ws closed
       if(!ws&&session){
-        chat.innerHTML=""; lastRenderedTs=0;
+        // Don't pre-emptively wipe chat.innerHTML: the incoming `history` event
+        // handles wipe-and-re-render if it sees existing content. Wiping here
+        // caused a visible blank-chat flash on every auto-reconnect ("the chat
+        // is inactive, refresh, and the answer was there" report 2026-07-04).
         connect(session.project,session.id);
       }
     },2000);

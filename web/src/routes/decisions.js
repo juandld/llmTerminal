@@ -1,7 +1,13 @@
 // Decision timeline/tree API (David's decisions framework). Extracted from
 // server.js (refactor 2026-06-10, phase 11). Read/writes the `decisions` table.
 const express = require("express");
-const { db, loadSessions } = require("../store");
+const { db, loadSessions, saveSessions, saveMessage } = require("../store");
+
+// llmt_ask convention: chose starts with "ask david/user/me" — agent is
+// blocked on David's answer. We mirror this into the chat scroll as a
+// role="question" message so the sidebar flips to "blocked" and the
+// inline answer card renders in the chat itself, not just the drawer.
+const _DEC_ASK_RE = /^ask\s+(david|user|me)\b/i;
 
 function _arrText(x) {
   if (Array.isArray(x)) return JSON.stringify(x);
@@ -62,11 +68,50 @@ module.exports = function mountDecisions(app) {
         .run(id, parentId, ts, summary, chose, alts, why, cons, cost, mined);
       const newId = Number(result.lastInsertRowid);
       const row = db.prepare("SELECT * FROM decisions WHERE id = ?").get(newId);
+      const normalized = _normalizeDecisionRow(row);
       try {
         const { broadcastToSession } = require("../ws/broadcast");
         broadcastToSession(id, { type: "decisions_updated" });
+        // Ask-style decisions are BLOCKING questions. Mirror into the chat
+        // transcript as role="question" so (a) the sidebar flips to blocked,
+        // (b) the inline answer card renders in the chat scroll itself, and
+        // (c) reloads/history rebuilds show the question where it happened.
+        if (!mined && _DEC_ASK_RE.test(chose)) {
+          // A pending question is not "done". Clear manualDone if set so the
+          // sidebar pulls the session out of the DONE pile and into blocked.
+          try {
+            const sessions = loadSessions();
+            const s = sessions.find(x => x.id === id);
+            if (s && s.manualDone) {
+              delete s.manualDone;
+              saveSessions(sessions);
+            }
+          } catch (e) { console.error("[decisions] manualDone clear failed:", e.message); }
+          try {
+            saveMessage(id, {
+              role: "question",
+              text: summary,
+              ts,
+              decisionId: newId,
+              options: normalized.alternatives || [],
+              recommend: (chose.match(/\(proposed:?\s*([^)]+)\)/i) || [])[1] || null,
+              why: why || null,
+            });
+          } catch (e) { console.error("[decisions] question mirror failed:", e.message); }
+          try {
+            broadcastToSession(id, {
+              type: "question_card",
+              decisionId: newId,
+              question: summary,
+              options: normalized.alternatives || [],
+              recommend: (chose.match(/\(proposed:?\s*([^)]+)\)/i) || [])[1] || null,
+              why: why || null,
+              ts,
+            });
+          } catch {}
+        }
       } catch {}
-      res.json({ ok: true, decision: _normalizeDecisionRow(row) });
+      res.json({ ok: true, decision: normalized });
     } catch (e) {
       console.error("[decisions] insert failed:", e.message);
       res.status(500).json({ ok: false, error: "insert failed" });

@@ -1,11 +1,35 @@
 // Status/busy indicator + browser-poll controls — classic script, shares global scope with app.js.
 // Extracted (refactor 2026-06-10).
 
+// `(pointer:fine) and (hover:hover) and (min-width:1280px)` — desktop only.
+// iPad 11" landscape (1194px) and Magic Keyboard trackpad still report pointer:fine,
+// so the pointer test alone wasn't enough — David was getting the soft keyboard popping
+// on every chat switch. Adding the min-width gate excludes both iPad orientations.
+const _DESKTOP_FOCUS_MQ = '(pointer:fine) and (hover:hover) and (min-width:1280px)';
 function setBusy(b){
-  busy=b;sendBtn.disabled=b||!isSynced;sendBtn.style.display=b?"none":"";stopBtn.style.display=b?"":"none";
+  const wasBusy = busy;
+  // Keep Send visible while busy — tapping it queues (send() detects busy and
+  // pushes to messageQueue). Hiding the button on mobile stranded users with
+  // no way to queue (no hardware Enter). Show Stop alongside so interrupt is
+  // still one-tap. Only isSynced disables the button now.
+  // NOTE: .btn-stop has display:none in styles.css, so `style.display=""` never
+  // unhid it — Stop was permanently invisible. Set inline-block explicitly.
+  busy=b;sendBtn.disabled=!isSynced;sendBtn.style.display="";sendBtn.textContent=b?"Queue":"Send";stopBtn.style.display=b?"inline-block":"none";
   if(!b){
-    if(window.innerWidth>768)inp.focus();
-    // Drain queue
+    // Only refocus when a turn just ended (true→false) — not on history load /
+    // chat switch where wasBusy was already false. Pre-fix this fired on every
+    // chat switch and popped the soft keyboard on iPad.
+    if(wasBusy && window.matchMedia(_DESKTOP_FOCUS_MQ).matches) inp.focus();
+    // Drain queue — ONLY items belonging to the current session. A queued
+    // message tagged with chat A's session id must never fire into chat B
+    // (2026-07-03 bug: opening a new chat drained the previous chat's queue
+    // into whichever WS was now attached). Belt-and-suspenders: teardown
+    // already drops old-session items, but this guard makes the invariant
+    // local to the drain site so future refactors can't reintroduce the leak.
+    const curSid = session?.id || null;
+    while(messageQueue.length && messageQueue[0].sessionId && messageQueue[0].sessionId !== curSid){
+      messageQueue.shift(); // stale — drop silently, bubble is gone with the DOM wipe
+    }
     if(messageQueue.length>0){
       const next=messageQueue.shift();
       renderQueueCount();
@@ -19,6 +43,8 @@ function setBusy(b){
       pendingImages=next.images?.map((img,i)=>({data:img.data,mimeType:img.mimeType,preview:next.previews?.[i]||""}))||[];
       inp.value=next.text;
       setTimeout(send,100);
+    } else {
+      renderQueueCount();
     }
   }
 }

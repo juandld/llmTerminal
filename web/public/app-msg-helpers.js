@@ -55,7 +55,39 @@ function showThinking(){
   chat.appendChild(thinkingEl);
   scrollToBottomIfSticky();
 }
-function removeThinking(){if(thinkingEl){thinkingEl.remove();thinkingEl=null;}}
+function removeThinking(){
+  if(_workTicker){clearInterval(_workTicker);_workTicker=null;}
+  _workState=null;
+  if(thinkingEl){thinkingEl.remove();thinkingEl=null;}
+}
+
+// ---- Live "working" indicator (driven by server `working` heartbeats) ----
+// Shows elapsed time + current action so a slow turn is visibly alive; flips to
+// a red stall warning if the agent goes quiet too long. A local 1s ticker keeps
+// the elapsed time smooth between the ~3s server heartbeats.
+let _workState=null, _workTicker=null;
+function _fmtDur(ms){
+  const s=Math.max(0,Math.floor(ms/1000));
+  if(s<60) return s+"s";
+  const m=Math.floor(s/60); return m+"m"+String(s%60).padStart(2,"0")+"s";
+}
+function renderWorking(){
+  if(!thinkingEl||!_workState) return;
+  const now=Date.now(), drift=now-_workState.recvAt;
+  const elapsed=_workState.elapsed_ms+drift, idle=_workState.idle_ms+drift;
+  const stalled=idle>45000;
+  const last=_workState.last? (" · "+_workState.last):"";
+  thinkingEl.textContent = stalled
+    ? ("⚠ no activity for "+_fmtDur(idle)+" · working "+_fmtDur(elapsed)+last)
+    : ("⏳ working · "+_fmtDur(elapsed)+last);
+  thinkingEl.style.color = stalled ? "#d23" : "";
+}
+function updateWorking(msg){
+  if(!thinkingEl) showThinking();
+  _workState={elapsed_ms:msg.elapsed_ms||0, idle_ms:msg.idle_ms||0, last:msg.last||"", recvAt:Date.now()};
+  renderWorking();
+  if(!_workTicker) _workTicker=setInterval(renderWorking,1000);
+}
 
 function fmtTable(block){
   const rows=block.trim().split('\n').filter(r=>r.trim());

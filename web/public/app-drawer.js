@@ -576,9 +576,11 @@ function renderAttachmentsHtml(previewId,attachments){
 // ── File preview modal ──
 function openFileModal(title, filePath) {
   const ext = filePath.split('.').pop().toLowerCase();
-  const url = apiUrl('/api/file?path=' + encodeURIComponent(filePath));
   const isAudio = ['mp3','wav','m4a','ogg','webm','aac','flac','opus'].includes(ext);
   const isVideo = ['mp4','mov'].includes(ext);
+  // Same staleness fix as fileBodyHtml — version non-media fetches so the
+  // modal never shows a heuristically-cached copy of an edited file.
+  const url = apiUrl('/api/file?path=' + encodeURIComponent(filePath)) + (isAudio || isVideo ? '' : '&v=' + Date.now());
   const icon = ext === 'pdf' ? '📕' : ['png','jpg','jpeg','gif','svg'].includes(ext) ? '🖼' : isAudio ? '🎵' : isVideo ? '🎬' : '📄';
   document.getElementById('fm-icon').textContent = icon;
   document.getElementById('fm-title').textContent = title;
@@ -635,6 +637,12 @@ function fileBodyHtml(bodyText, title, query) {
     var fp = bodyText.slice('FILE_PATH:'.length);
     var ext = fp.split('.').pop().toLowerCase();
     var url = apiUrl('/api/file?path=' + encodeURIComponent(fp));
+    // /api/file sends no cache headers, so browsers heuristically cache it
+    // and edited files render stale (2026-07-05: an updated plan doc kept
+    // showing its pre-edit content). Version non-media fetches per render;
+    // audio/video renders are immutable — keep their URLs stable and cached.
+    var _mediaExts = ['mp3','wav','m4a','ogg','webm','aac','flac','opus','mp4','mov'];
+    if (_mediaExts.indexOf(ext) === -1) url += '&v=' + Date.now();
     const openModal = "openFileModal('" + esc(fp.split('/').pop()).replace(/'/g,"\\'") + "','" + fp.replace(/'/g,"\\'") + "')";
     if (ext === 'pdf') {
       return '<div class="fp-pdf-wrap">'
@@ -652,6 +660,15 @@ function fileBodyHtml(bodyText, title, query) {
     if (['mp3','wav','m4a','ogg','webm','aac','flac','opus'].includes(ext)) {
       // Inline audio player — no need to open a new tab for audio review.
       return '<div class="fp-audio-wrap"><audio controls preload="metadata" src="' + esc(url) + '" style="width:100%"></audio>'
+           + '<div style="font-size:10px;color:var(--dim);margin-top:4px;word-break:break-all">' + esc(fp) + '</div></div>';
+    }
+    if (['mp4','mov'].includes(ext)) {
+      return '<div class="fp-video-wrap">'
+           + '<div style="display:flex;gap:8px;margin-bottom:6px">'
+           + '<button class="fm-btn" onclick="' + openModal + '" style="font-size:12px">&#x26F6; Full screen</button>'
+           + '<a class="fm-btn" href="' + esc(url) + '" target="_blank" rel="noopener noreferrer" style="font-size:12px;text-decoration:none">&#8599; New tab</a>'
+           + '</div>'
+           + '<video controls preload="metadata" playsinline src="' + esc(url) + '" style="max-width:100%;border-radius:6px;display:block"></video>'
            + '<div style="font-size:10px;color:var(--dim);margin-top:4px;word-break:break-all">' + esc(fp) + '</div></div>';
     }
     return '<a class="fp-att" href="' + esc(url) + '" target="_blank" rel="noopener noreferrer">&#8599; ' + esc(fp.split('/').pop()) + '</a>';

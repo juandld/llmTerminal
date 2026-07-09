@@ -23,10 +23,40 @@ let reconnectTimer=null;  // tracks pending auto-reconnect so we can cancel on s
 let connectEpoch=0;       // incremented on every connect(); stale handlers check this before acting
 function flushOutbox(){
   if(!ws||ws.readyState!==1) return;
+  // Outbox items are tagged with the session they were typed in (sid). Only
+  // flush items belonging to THIS session — flushing the global outbox into
+  // whatever chat reconnected first delivered messages to the WRONG chat
+  // (real incident 2026-07-07: a queued message landed in another session).
+  // Untagged (legacy) items keep the old behavior so nothing is stranded.
+  const sid=session&&session.id;
   for(const item of outbox){
+    if(item.sid&&sid&&item.sid!==sid) continue;
     try{ws.send(JSON.stringify({type:"prompt",client_id:item.id,text:item.text,images:item.images||[],resend:true}))}catch{}
   }
 }
+// ---- NO-LOSS net (2026-07-07) ----
+// Any outbox item still unacked after a few seconds gets POSTed to
+// /api/outbox-capture, which makes it durable in the session's server-side
+// queue immediately (plain HTTP works when the WS is dead or a zombie).
+// On ok:true the server owns delivery, so we drop the item locally.
+// Image-bearing prompts are skipped (data too large for the net; the WS
+// resend path still covers them) — text is what must never be lost.
+function captureOutbox(){
+  const now=Date.now();
+  for(const item of outbox.slice()){
+    if(item.images&&item.images.length) continue;
+    if(now-(item.ts||0)<4000) continue;             // give the WS path first shot
+    const sid=item.sid||localStorage.getItem("llmt_session");
+    if(!sid||!item.text) continue;
+    fetch(apiUrl("/api/outbox-capture"),{
+      method:"POST",headers:{"Content-Type":"application/json"},keepalive:true,
+      body:JSON.stringify({sessionId:sid,client_id:item.id,text:item.text})
+    }).then(r=>r.ok?r.json():null).then(d=>{
+      if(d&&d.ok){outbox=outbox.filter(x=>x.id!==item.id);saveOutbox();}
+    }).catch(()=>{});
+  }
+}
+setInterval(captureOutbox,6000);
 function saveInputSelection(){try{localStorage.setItem("llmt_draft_sel",JSON.stringify({s:inp.selectionStart,e:inp.selectionEnd}))}catch{}}
 let scrollSaveT=null;
 function saveChatScroll(){
@@ -267,7 +297,7 @@ function interrupt(){
 // (app-status.js)
 // (app-ui-misc.js)
 function updateSendButton(){
-  if(sendBtn){sendBtn.disabled=busy||!isSynced}
+  if(sendBtn){sendBtn.disabled=!isSynced}
 }
 
 inp.addEventListener("input",()=>{
@@ -283,10 +313,13 @@ try{
 }catch{}
 try{
   const isMobile=window.innerWidth<=768;
+  // Sidebar is overlay (not permanent) at ≤1023px — covers iPhone and iPad portrait.
+  // Don't auto-open it there: David explicitly wants to see the chat, not the session list.
+  const sidebarIsOverlay=window.innerWidth<=1023;
   if(!isMobile&&localStorage.getItem("llmt_drawer_open")==="true"){
     document.getElementById("drawer").classList.remove("hidden");
   }
-  if(!isMobile&&localStorage.getItem("llmt_sidebar_open")==="true"){
+  if(!sidebarIsOverlay&&localStorage.getItem("llmt_sidebar_open")==="true"){
     document.getElementById("sidebar").classList.add("show");
   }
   // (fileFilter restore moved to app-permcards.js — it owns the `let fileFilter` binding;

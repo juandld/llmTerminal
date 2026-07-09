@@ -25,6 +25,8 @@
 
 
 
+<div class="sidebar-backdrop" id="sidebarBackdrop" onclick="toggleSB()"></div>
+<div class="drawer-backdrop" id="drawerBackdrop" onclick="closeAllDrawers()"></div>
 <div class="sidebar" id="sidebar">
   <div class="sb-head"><h1>llmTerminal</h1><button class="hide-mobile" onclick="toggleSB()">&times;</button></div>
   <div class="sb-ctrl">
@@ -39,6 +41,7 @@
     <div class="topbar-nav">
       <button class="menu-btn" onclick="toggleSB()" title="Sessions">&#9776;</button>
       <span class="badge" id="badge">-</span>
+      <span class="topbar-title" id="topbarTitle" title="" onclick="toggleSB()" role="button" aria-label="Open chats"></span>
       <button class="topbar-star" id="starBtn" onclick="toggleSessionStar()" title="Star — keeps this chat at high priority in the sidebar" aria-label="Star this chat">☆</button>
       <a href="/" class="app-btn" id="appBtn">App</a>
       <button class="topbar-att hide-mobile" id="topbarAtt" onclick="nextAttentionSession()" title="Next chat needing attention"><span class="topbar-att-icon" id="topbarAttIcon"></span><span class="topbar-att-text" id="topbarAttText">All clear</span></button>
@@ -171,6 +174,7 @@
 <script src="app-tts.js"></script>
 <script src="app-decisions.js"></script>
 <script src="app-email-draft.js"></script>
+<script src="app-drawer-backdrop.js"></script>
 
   <!-- Shared Win95 model picker overlay (opened by both desktop topbar btn and mobile overflow btn) -->
   <div id="modelPickerBackdrop" class="win95-backdrop" hidden></div>

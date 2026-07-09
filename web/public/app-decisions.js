@@ -148,6 +148,16 @@ function _decStatusIcon(s){
 // alternatives — but any open fork can be answered/redirected.
 const _DEC_ASK_RE = /^ask\s+(david|user|me)\b/i;
 function _decIsAnswerable(d){ return !!d && !d.mined && d.status === "pending"; }
+// If the decision's origin session != the currently viewed session, return
+// {id,title} for the origin so the card can flag "answer will post to: X".
+// Returns null when the card belongs to the chat you're already looking at.
+function _decOriginChat(d){
+  if (!d || !d.session_id) return null;
+  if (typeof session === "undefined" || !session || d.session_id === session.id) return null;
+  const s = (typeof _allSessions !== "undefined" && Array.isArray(_allSessions))
+    ? _allSessions.find(x => x && x.id === d.session_id) : null;
+  return { id: d.session_id, title: (s && s.title) || "(unknown chat)" };
+}
 function _decAnswerOptions(d){
   const opts = [];
   if (d.chose) {
@@ -227,14 +237,19 @@ function _renderDecisionRow(d, depth){
       } catch {}
     }
     const mined = d.mined ? ` <span class="dec-mined" title="Auto-extracted, lower confidence">mined</span>` : "";
+    const origin = _decOriginChat(d);
     let answerBlock = "";
     if (answerable) {
       const opts = _decAnswerOptions(d);
       const optBtns = opts.map((o, i) =>
         `<button class="dec-answer-btn" data-answer-did="${id}" data-answer-idx="${i}">${esc(o)}</button>`).join("");
+      const answerLabel = origin
+        ? `Answer posts to: <b>${esc(origin.title)}</b>`
+        : "Your answer";
+      const answerCls = origin ? "dec-answer dec-answer-foreign" : "dec-answer";
       answerBlock = `
-        <div class="dec-answer">
-          <div class="dec-label">Your answer</div>
+        <div class="${answerCls}">
+          <div class="dec-label">${answerLabel}</div>
           <div class="dec-answer-opts">${optBtns}</div>
           <div class="dec-answer-free">
             <input type="text" class="dec-answer-input" data-answer-input="${id}" placeholder="Or type your own…">
@@ -254,10 +269,15 @@ function _renderDecisionRow(d, depth){
       </div>`;
   }
   const chip = answerable ? `<span class="dec-answer-chip">answer</span>` : "";
+  const headlineOrigin = _decOriginChat(d);
+  const originChip = headlineOrigin
+    ? `<span class="dec-origin-chip" title="Origin chat: ${esc(headlineOrigin.title)} — answering here posts there, not in this chat">↪ ${esc(headlineOrigin.title)}</span>`
+    : "";
   return `<div class="dec-row" data-did="${id}" ${indent}>
     <div class="dec-headline">
       <span class="dec-dot ${stClass}" title="${esc(d.status)}">${ic}</span>
       <div class="dec-title">${esc(d.summary)}</div>
+      ${originChip}
       ${chip}
       <div class="dec-when">${relativeTime(d.ts)}</div>
     </div>

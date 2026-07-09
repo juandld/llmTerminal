@@ -94,10 +94,16 @@
   /* Isolate links on mobile so long-press shows "Copy Link" instead of selecting card text */
   .bubble .link-island{display:inline-block;padding:2px 0;-webkit-user-select:auto;user-select:auto;-webkit-touch-callout:default}
   .msg.email-draft,.msg.question,.msg.permission,.file-preview,.msg.api-error-card{-webkit-user-select:none;user-select:none}
-  .msg.email-draft a,.msg.question a,.msg.permission a,.file-preview a{-webkit-user-select:auto;user-select:auto;-webkit-touch-callout:default}
+  .msg.email-draft a,.msg.email-draft input,.msg.email-draft textarea,.msg.question a,.msg.permission a,.file-preview a{-webkit-user-select:auto;user-select:auto;-webkit-touch-callout:default}
 
   .main{flex:1;display:flex;flex-direction:column;min-width:0;overflow-x:hidden}
-  .topbar{display:flex;align-items:center;border-bottom:1px solid var(--border);background:var(--surface);flex-shrink:0}
+  /* z-index 30 keeps the topbar above the chat content and the drawer
+     backdrop (z:10) so ☰ stays tappable while a drawer is open. The mobile
+     overlays themselves sit ABOVE it (drawer 33, summary 34, sidebar 40):
+     they share the topbar's top edge, so anything below z:30 gets its
+     title row + × close button covered by the topbar — taps then hit the
+     topbar and "do nothing". Don't lower those without moving the ×. */
+  .topbar{display:flex;align-items:center;border-bottom:1px solid var(--border);background:var(--surface);flex-shrink:0;position:relative;z-index:30}
   .topbar-nav{flex:1;min-width:0;overflow:hidden;display:flex;align-items:center;gap:10px;padding:8px 8px 8px 14px}
   /* Buttons keep natural width — app-topbar.js collapses whole buttons into ⋮
      instead of letting flexbox squish them all. The bell (.topbar-att) is the
@@ -107,8 +113,10 @@
      so the fit calculation can use natural widths. display stays untouched. */
   .topbar-nav .tb-collapsed{position:absolute!important;visibility:hidden!important;pointer-events:none!important;left:-9999px;top:0}
   .topbar.tb-has-collapsed .topbar-overflow{display:inline-flex}
-  .menu-btn{background:none;border:none;color:var(--dim);cursor:pointer;font-size:18px;display:none}
-  @media (max-width:768px){.menu-btn{display:inline-flex;align-items:center;justify-content:center}}
+  .menu-btn{background:none;border:none;color:var(--dim);cursor:pointer;font-size:18px;display:none;touch-action:manipulation}
+  /* Hamburger visible on phone AND iPad portrait (834px) — sidebar is overlay
+     at ≤1023px, so the toggle has to be reachable there too. */
+  @media (max-width:1023px){.menu-btn{display:inline-flex;align-items:center;justify-content:center}}
   .btn-icon{font-size:15px;line-height:1;margin-right:0}
   .btn-label{margin-left:6px}
   .files-btn .btn-icon,.files-btn .btn-label{display:inline-block}
@@ -117,6 +125,13 @@
   .topbar-btn .badge-count,.topbar-collapsible .badge-count{margin-left:6px;background:var(--accent);color:#000;font-size:9px;font-weight:700;padding:1px 6px;border-radius:9px;min-width:15px;text-align:center}
   @media (max-width:768px){.btn-label{display:none}.btn-icon{margin-right:0}}
   .badge{background:var(--border);padding:2px 10px;border-radius:10px;font-size:11px;color:var(--accent);white-space:nowrap}
+  /* Chat title — sits beside the project badge so the active chat is always
+     identifiable after bell/sidebar jumps. Flex-shrinks past every other
+     topbar item (incl. badge) so it absorbs the leftover width and ellipsizes
+     instead of pushing buttons off-screen. Tap = open sidebar (handy on tablet
+     where the title is the easiest re-entry into the chat list). */
+  .topbar-title{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;color:var(--text);font-weight:500;cursor:pointer;padding:2px 0}
+  .topbar-title:empty{display:none}
   .dot-status{flex-shrink:0;display:flex;align-items:center;gap:6px;font-size:11px;color:var(--dim);padding:3px 14px 3px 10px;border-radius:20px;border:1px solid transparent;transition:all .3s}
   .dot-status .dot{width:8px;height:8px;border-radius:50%;background:var(--dim);flex-shrink:0;transition:all .3s}
   .dot-status.active{color:var(--green);border-color:rgba(78,204,163,.2)}
@@ -184,7 +199,7 @@
   .topbar-overflow-btn.nav-dormant .overflow-dot { background: #666; box-shadow: none; }
   .browser-btn.off .browser-dot { background: transparent; border: 1px dashed #444; box-shadow: none; }
   .topbar-overflow{position:relative;display:none}
-  .topbar-overflow-btn{background:var(--surface2);color:var(--dim);border:1px solid var(--border);padding:0;border-radius:10px;font-size:16px;cursor:pointer;font-family:var(--mono);height:36px;width:36px;display:grid;place-items:center;position:relative}
+  .topbar-overflow-btn{background:var(--surface2);color:var(--dim);border:1px solid var(--border);padding:0;border-radius:10px;font-size:16px;cursor:pointer;font-family:var(--mono);height:36px;width:36px;display:grid;place-items:center;position:relative;touch-action:manipulation}
   @media(max-width:768px){.topbar-overflow-btn{height:36px;width:36px;border-radius:10px;font-size:16px}}
   .topbar-overflow-btn:hover{color:var(--accent);border-color:var(--accent)}
   .topbar-overflow-btn .overflow-dot{position:absolute;top:5px;right:5px;width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 6px var(--green);display:none}
@@ -261,6 +276,22 @@
   .q-custom-toggle:hover{color:var(--accent);border-color:var(--accent)}
   .q-custom-input{width:100%;margin-top:6px;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:8px 10px;border-radius:8px;font-family:var(--mono);font-size:12px;resize:vertical;min-height:44px}
   .q-custom-input:focus{border-color:var(--accent);outline:none}
+  /* llmt_ask inline answer card (decisionId path) */
+  .q-context{font-size:11px;color:var(--dim);margin:6px 0 10px;line-height:1.4;font-style:italic}
+  .q-ask-opts{display:flex;flex-direction:column;gap:6px;margin-top:10px}
+  .q-ask-btn{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:10px 14px;border-radius:8px;font-size:13px;cursor:pointer;font-family:var(--mono);text-align:left;transition:all .15s;min-height:44px}
+  .q-ask-btn:hover{border-color:var(--yellow);color:var(--yellow)}
+  .q-ask-btn:disabled{opacity:.6;cursor:default}
+  .q-ask-btn.q-ask-recommend{border-color:var(--green);color:var(--green)}
+  .q-ask-btn.q-ask-recommend:hover{background:rgba(78,204,163,.1)}
+  .q-ask-free{display:flex;gap:6px;margin-top:10px}
+  .q-ask-input{flex:1;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:8px 10px;border-radius:8px;font-family:var(--mono);font-size:12px;min-height:44px}
+  .q-ask-input:focus{border-color:var(--yellow);outline:none}
+  .q-ask-send{background:var(--yellow);color:#000;border:none;padding:0 16px;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;font-family:var(--mono);min-height:44px}
+  .q-ask-send:hover{opacity:.9}
+  .q-ask-send:disabled{opacity:.5;cursor:default}
+  .q-ask-err{color:var(--accent2);font-size:11px;margin-top:6px;min-height:0}
+  .q-ask-resolved{margin-top:10px;padding:8px 12px;background:rgba(78,204,163,.08);border:1px solid var(--green);border-radius:8px;color:var(--green);font-size:12px}
   .msg.tool-activity-line{align-self:flex-start;color:#9aa0a6;font-size:11px;font-family:var(--mono);padding:3px 8px;margin:2px 0;max-width:95%;word-break:break-all;border-left:2px solid var(--border);background:rgba(255,255,255,.02)}
   .msg.api-error-card{align-self:flex-start;max-width:95%;background:rgba(233,69,96,.1);border:1px solid var(--accent2);border-radius:12px;padding:12px 14px}
   .api-err-label{color:var(--accent2)}
@@ -328,7 +359,8 @@
   .drawer-group-h-play{background:none;border:none;color:var(--accent);font-size:12px;line-height:1;padding:2px 8px;min-height:24px;min-width:28px;border-radius:6px;cursor:pointer;font-family:var(--mono);flex-shrink:0}
   .drawer-group-h-play:hover,.drawer-group-h-play:active{background:rgba(0,170,255,.12)}
   .drawer-group-minor .fp-card{margin-left:14px}
-  @media (max-width:768px){.summary-panel{position:fixed;right:0;top:env(safe-area-inset-top, 0px);z-index:12;height:calc(100% - env(safe-area-inset-top, 0px));width:85vw;max-width:360px}}
+  /* z-index 34: above the topbar (z:30) so its × isn't covered — see .drawer note. */
+  @media (max-width:768px){.summary-panel{position:fixed;right:0;top:env(safe-area-inset-top, 0px);z-index:34;height:calc(100% - env(safe-area-inset-top, 0px));width:85vw;max-width:360px}}
   .btn-mic{background:var(--surface2);color:var(--dim);border:1px solid var(--border);padding:10px 14px;border-radius:10px;font-size:16px;cursor:pointer;font-family:var(--mono);min-height:44px;min-width:44px;transition:all .15s}
   .btn-mic:hover{color:var(--accent);border-color:var(--accent)}
   .btn-mic.recording{background:var(--accent);color:#000;border-color:var(--accent);animation:micPulse 1.2s ease-in-out infinite;width:44px;min-width:44px;max-width:44px;padding:10px 0;font-size:16px;text-align:center}
@@ -562,7 +594,22 @@
   .files-btn .badge-count{position:absolute;top:-4px;right:-4px;background:var(--accent);color:#000;font-size:9px;font-weight:700;padding:1px 5px;border-radius:8px;min-width:14px;text-align:center}
 
   @media(max-width:768px){
-    .drawer{position:fixed;right:0;top:env(safe-area-inset-top, 0px);z-index:11;height:calc(100% - env(safe-area-inset-top, 0px));width:85vw;max-width:320px}
+    /* z-index 33: ABOVE the topbar (z:30) — the drawer and topbar both start at
+       env(safe-area-inset-top), so at z:11 the topbar covered the drawer's
+       title row and swallowed taps on the × close button (David's "drawer
+       won't close on mobile"). Same fix as the sidebar (z:40, see below).
+       Stays below the sidebar-backdrop (35) / sidebar (40). */
+    .drawer{position:fixed;right:0;top:env(safe-area-inset-top, 0px);z-index:33;height:calc(100% - env(safe-area-inset-top, 0px));width:85vw;max-width:320px}
+    /* Backdrop tap-to-close for all drawers (Files, Summary, Jobs, Tasks,
+       Decisions). Sits BELOW the drawers (z:10) and ABOVE the main chat, so a
+       tap on the ~70px strip left of the drawer closes it — the sidebar UX
+       pattern extended to every drawer. See app-drawer-backdrop.js. */
+    .drawer-backdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:10;touch-action:manipulation}
+    body.drawer-open .drawer-backdrop{display:block}
+  }
+  /* Desktop: no backdrop — drawers are side-panels, not overlays. */
+  @media(min-width:769px){
+    .drawer-backdrop{display:none !important}
   }
 
   .img-preview-bar{display:flex;gap:6px;padding:4px 14px;background:var(--surface);border-top:1px solid var(--border);flex-wrap:wrap}
@@ -585,9 +632,20 @@
   .btn-stop{background:var(--accent2);color:#fff;display:none}
 
   .hide-mobile{display:none}
-  @media(max-width:768px){
-    .sidebar{position:fixed;z-index:10;top:env(safe-area-inset-top, 0px);height:calc(100% - env(safe-area-inset-top, 0px));width:85vw;max-width:320px;display:none}
+  /* Sidebar overlay + backdrop active on phone AND iPad portrait (834px).
+     Before 2026-06-27 this lived inside the 768px block, so iPad portrait
+     ended up with a permanent 280px sidebar and no way to collapse it —
+     David's "the sidebar isn't usable, I can't get rid of it" complaint.
+     z-index 40 puts an open sidebar above the topbar (z-index:30) so the X
+     close button isn't hidden behind it. Backdrop sits at 35 — above topbar,
+     below sidebar — and dismisses on tap. */
+  @media(max-width:1023px){
+    .sidebar{position:fixed;z-index:40;top:env(safe-area-inset-top, 0px);height:calc(100% - env(safe-area-inset-top, 0px));width:85vw;max-width:320px;display:none}
     .sidebar.show{display:flex}
+    .sidebar-backdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:35;touch-action:manipulation}
+    body.sb-open .sidebar-backdrop{display:block}
+  }
+  @media(max-width:768px){
     .hide-mobile{display:block}
     .chat{padding:6px 6px;gap:8px}
     .msg{max-width:98%;font-size:14px}
@@ -680,7 +738,7 @@
   .fm-btn{padding:6px 12px;border-radius:6px;border:1px solid #444;background:#2a2a2a;color:#ccc;font-size:12px;cursor:pointer;font-family:inherit;white-space:nowrap}
   .fm-btn:hover{background:#333;color:#fff}
   /* ── File preview modal (Google Drive-style) ── */
-  #file-modal{position:fixed;inset:0;z-index:9999;display:flex;flex-direction:column;background:rgba(0,0,0,.88);opacity:0;pointer-events:none;transition:opacity .15s}
+  #file-modal{position:fixed;inset:0;z-index:9999;display:flex;flex-direction:column;background:rgba(0,0,0,.88);opacity:0;pointer-events:none;transition:opacity .15s;padding-top:env(safe-area-inset-top, 0px);padding-bottom:env(safe-area-inset-bottom, 0px)}
   #file-modal.open{opacity:1;pointer-events:all}
   #file-modal .fm-bar{display:flex;align-items:center;gap:10px;padding:10px 16px;background:#1a1a1a;border-bottom:1px solid #333;flex-shrink:0;min-height:50px}
   #file-modal .fm-icon{font-size:18px;flex-shrink:0}
@@ -704,15 +762,44 @@
   .att-label{font-weight:600;margin-bottom:6px;color:var(--accent,#4aa3df)}
   .att-row{font-family:var(--mono);padding:2px 0;color:#cfd6dd}
   .att-note{margin-top:6px;font-size:11px;color:var(--dim,#999);font-style:italic}
-  .msg.email-draft{align-self:flex-start;max-width:95%;background:#1a2e1a;border:1px solid var(--green);border-radius:14px;padding:14px 18px}
+  /* width:100% paired with max-width:95% is the workaround for an
+     inline-size container on a flex-start item: without an explicit
+     inline width, container-type:inline-size collapses the box. */
+  .msg.email-draft{align-self:flex-start;width:100%;max-width:95%;background:#1a2e1a;border:1px solid var(--green);border-radius:14px;padding:14px 18px;container-type:inline-size;container-name:emaildraft}
   .msg.email-draft .draft-label{color:var(--green);margin-bottom:8px}
-  .msg.email-draft .draft-hdr{display:grid;grid-template-columns:64px 1fr;gap:4px 10px;font-size:12px;margin-bottom:10px;line-height:1.4}
+  /* Inbound email reply — distinct color from outbound draft (green) so at a
+     glance David can tell "someone replied to us" apart from "we drafted a reply".
+     Blue = inbound; matches the msg-label voice of other alert cards. */
+  .msg.email-reply{align-self:flex-start;width:100%;max-width:95%;background:#12222e;border:1px solid var(--accent);border-radius:14px;padding:14px 18px}
+  .msg.email-reply .email-reply-label{color:var(--accent);margin-bottom:8px;font-weight:600}
+  .msg.email-reply .email-reply-header{font-size:12px;line-height:1.5;margin-bottom:10px;color:var(--text)}
+  .msg.email-reply .email-reply-header strong{color:var(--dim);font-weight:600;margin-right:4px}
+  .msg.email-reply .email-reply-body{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:10px;font-size:13px;line-height:1.5;max-width:100%}
+  .msg.email-reply .email-reply-expand{padding:6px 12px;margin-bottom:10px;background:transparent;color:var(--accent);border:1px solid var(--accent);border-radius:8px;font-size:12px;font-family:var(--mono);cursor:pointer}
+  .msg.email-reply .email-reply-expand:hover,.msg.email-reply .email-reply-expand:active{opacity:.85}
+  .msg.email-reply .email-reply-actions{display:flex;gap:8px;flex-wrap:wrap}
+  .msg.email-reply .draft-btn.open{padding:8px 14px;background:var(--accent);color:#000;border-radius:8px;font-size:12px;text-decoration:none;font-family:var(--mono);font-weight:600;min-height:36px;display:inline-flex;align-items:center}
+  .msg.email-reply .draft-btn.open:hover,.msg.email-reply .draft-btn.open:active{opacity:.85}
+  .msg.email-draft .draft-hdr{display:grid;grid-template-columns:64px 1fr;gap:6px 10px;font-size:12px;margin-bottom:10px;line-height:1.4;align-items:center}
   .msg.email-draft .draft-hdr .k{color:var(--dim);font-weight:600}
-  .msg.email-draft .draft-hdr .v{color:var(--text);word-break:break-word}
-  .msg.email-draft .draft-body{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px 12px;font-size:12px;line-height:1.6;white-space:pre-wrap;word-break:break-word;max-height:180px;overflow:hidden;position:relative;margin-bottom:10px;color:var(--text)}
-  .msg.email-draft .draft-body a{color:var(--accent);text-decoration:underline;cursor:pointer}
-  .msg.email-draft .draft-body.expanded{max-height:none}
-  .msg.email-draft .draft-body-toggle{display:block;text-align:center;color:var(--accent);font-size:11px;cursor:pointer;padding:6px;background:transparent;border:none;width:100%;font-family:var(--mono);margin-bottom:8px}
+  .msg.email-draft .draft-hdr input.draft-input{background:var(--bg);border:1px solid var(--border);color:var(--text);font-family:var(--mono);font-size:12px;padding:7px 9px;border-radius:6px;width:100%;box-sizing:border-box;min-height:34px;outline:none;word-break:break-word}
+  .msg.email-draft .draft-hdr input.draft-input::placeholder{color:var(--dim);opacity:.7}
+  .msg.email-draft .draft-hdr input.draft-input:focus{border-color:var(--accent);background:var(--surface2)}
+  .msg.email-draft .draft-hdr input.draft-input:disabled{background:transparent;border-color:transparent;padding-left:0;color:var(--text);opacity:.85}
+  .msg.email-draft .draft-participants{margin:0 0 10px;padding:8px 10px;background:var(--surface2);border:1px solid var(--border);border-radius:8px}
+  .msg.email-draft .draft-participants-presets{display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap}
+  .msg.email-draft .draft-mini-btn{padding:6px 10px;background:transparent;border:1px solid var(--border);color:var(--text);border-radius:6px;font-size:11px;font-family:var(--mono);cursor:pointer;min-height:28px}
+  .msg.email-draft .draft-mini-btn:hover,.msg.email-draft .draft-mini-btn:active{background:var(--border)}
+  .msg.email-draft .draft-participants-chips{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px}
+  .msg.email-draft .draft-chip{padding:5px 9px;border-radius:14px;font-size:11px;font-family:var(--mono);cursor:pointer;border:1px solid var(--border);background:transparent;color:var(--dim);min-height:26px;word-break:break-all}
+  .msg.email-draft .draft-chip.chip-to{background:var(--accent);color:#000;border-color:var(--accent);font-weight:600}
+  .msg.email-draft .draft-chip.chip-cc{background:transparent;color:var(--accent);border-color:var(--accent)}
+  .msg.email-draft .draft-chip.chip-off{opacity:.55;text-decoration:line-through}
+  .msg.email-draft .draft-chip:disabled{cursor:default;opacity:.5}
+  .msg.email-draft .draft-participants-hint{font-size:10px;color:var(--dim);opacity:.8}
+  .msg.email-draft .draft-body{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px 12px;font-size:12px;line-height:1.6;white-space:pre-wrap;word-break:break-word;position:relative;margin-bottom:10px;color:var(--text);width:100%;box-sizing:border-box;display:block;font-family:var(--mono);min-height:120px;max-height:60vh;overflow:auto;resize:vertical;outline:none}
+  .msg.email-draft .draft-body:focus{border-color:var(--accent)}
+  .msg.email-draft .draft-body:disabled{opacity:.85;cursor:default;resize:none}
   .msg.email-draft .draft-actions{display:grid;grid-template-columns:1fr 1fr;gap:6px}
   .msg.email-draft .draft-btn{padding:12px;background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:8px;font-size:13px;font-family:var(--mono);cursor:pointer;min-height:44px;transition:all .15s}
   .msg.email-draft .draft-btn:hover,.msg.email-draft .draft-btn:active{background:var(--border)}
@@ -722,6 +809,22 @@
   .msg.email-draft .draft-btn.force.sent{background:#4caf50;color:#000;border-color:#4caf50}
   .msg.email-draft .draft-btn.force.failed{border-color:#c0392b;color:#ff7d6e}
   .msg.email-draft .draft-btn.primary:hover,.msg.email-draft .draft-btn.primary:active{opacity:.85}
+  .msg.email-draft.sent{background:#142214;border-color:#3a5a3a}
+  .msg.email-draft.sent .draft-label{color:#9be09b}
+  .msg.email-draft .draft-sent-id{margin-top:10px;font-size:11px;color:var(--dim);font-family:var(--mono);word-break:break-all;border-top:1px solid var(--border);padding-top:8px}
+  /* Narrow chat column (desktop with sidebars open): stack the field labels
+     above the inputs so long To: / Subject: text isn't clipped to a 200-px
+     input, and drop the secondary-actions row to a single column.
+     Placed AFTER the base .draft-hdr / .draft-actions rules so the cascade
+     resolves in the @container block's favor at the same specificity. */
+  @container emaildraft (max-width: 380px) {
+    .msg.email-draft{padding:12px 12px}
+    .msg.email-draft .draft-hdr{grid-template-columns:1fr;gap:2px 0;margin-bottom:8px}
+    .msg.email-draft .draft-hdr .k{margin-top:6px;font-size:11px}
+    .msg.email-draft .draft-hdr>.k:first-child{margin-top:0}
+    .msg.email-draft .draft-hdr input.draft-input{padding:6px 8px;min-height:32px}
+    .msg.email-draft .draft-actions{grid-template-columns:1fr}
+  }
 
 /* 5-state sidebar triage: blocked → decision → responded → working → done */
 .sb-item { position: relative; }
@@ -781,7 +884,7 @@
   user-select:none;-webkit-user-select:none;
 }
 .fab:active{transform:scale(.92)}
-@media(min-width:769px){.fab{display:none}}
+@media(min-width:1367px){.fab{display:none}}
 .fab-icon{font-size:20px;line-height:1}
 .fab-count{font-size:10px;font-weight:700;font-family:var(--mono);line-height:1}
 .fab.fab-zero{opacity:.3}
@@ -1077,7 +1180,20 @@
   background:var(--accent);color:#000;border-radius:7px;padding:2px 6px;
   margin-left:6px;flex-shrink:0;align-self:center;font-weight:700;
 }
+/* Cross-chat origin chip: this decision belongs to ANOTHER chat in the project.
+   Tapping its answer posts there, not here. Amber so it actually catches the eye. */
+.dec-origin-chip{
+  font-size:10px;letter-spacing:.2px;
+  background:#5a3d00;color:#ffdf99;border:1px solid #8c5e00;border-radius:7px;
+  padding:2px 7px;margin-left:6px;flex-shrink:1;align-self:center;font-weight:600;
+  max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
 .dec-answer{margin-top:10px;padding-top:8px;border-top:1px dashed var(--border)}
+.dec-answer-foreign{
+  background:rgba(140,94,0,.08);border:1px solid #8c5e00;border-radius:8px;
+  padding:8px 10px;margin-top:10px;border-top:1px solid #8c5e00;
+}
+.dec-answer-foreign .dec-label{color:#ffdf99}
 .dec-answer-opts{display:flex;flex-direction:column;gap:6px;margin:6px 0}
 .dec-answer-btn{
   text-align:left;background:var(--surface2);border:1px solid var(--accent);

@@ -51,11 +51,26 @@ function makeSbItem(x, currentProject) {
     pb.onclick = (e) => { e.stopPropagation(); showPriorityBreakdown(x, pb); };
     d.appendChild(pb);
   }
-  // \u2713 button: mark a "responded" or "stalled" session done without further fuss.
-  // Hidden for blocked/decision/working/done (those need real action, not dismissal).
-  if (state === "responded" || state === "stalled") {
+  // \u2713 button: mark a session done without opening it. Available for:
+  //   responded \u2014 agent replied, no follow-up needed
+  //   stalled   \u2014 claude process exited mid-run, dismiss the ghost
+  //   decision  \u2014 email_reply/email_draft arrived; sometimes David just skims
+  //               the sender/subject and knows there's no action to take.
+  //               Without this the only way out was the destructive \u00d7 button.
+  //   blocked   \u2014 urgent chats too (2026-07-07 voice note): often reading the
+  //               email/question IS the resolution, and the only remaining
+  //               button was the destructive \u00d7. Marking done sticks \u2014
+  //               manualDone wins over blocked in computeSessionState.
+  // Still hidden for working/done \u2014 those really do need a different action.
+  if (state === "responded" || state === "stalled" || state === "decision" || state === "blocked") {
     const okb = mk("button", "sb-done-btn"); okb.textContent = "\u2713";
-    okb.title = state === "stalled" ? "Dismiss (claude process exited without responding)" : "Mark done";
+    okb.title = state === "stalled"
+      ? "Dismiss (claude process exited without responding)"
+      : state === "decision"
+        ? "Mark done (no action needed)"
+        : state === "blocked"
+          ? "Mark done (dismiss \u2014 no answer needed)"
+          : "Mark done";
     okb.onclick = (e) => { e.stopPropagation(); markSessionDone(x.id); };
     d.appendChild(okb);
   }

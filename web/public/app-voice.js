@@ -155,6 +155,10 @@ async function sendVoiceNote(blob){
   const vnPreviews=pendingImages.map(i=>i.preview);
   const msgEl=addVoiceNoteUser(blob,duration,vnPreviews);
   if(vnImages.length) clearImages();
+  // Voice note is an engagement signal — promote the chat out of done/archived
+  // immediately so the recording device sees it move in the sidebar without
+  // waiting for the 15s poll.
+  promoteCurrentSessionToActive();
   const statusEl=msgEl.querySelector(".vn-status");
   const setVnStatus=(txt,cls)=>{
     if(statusEl){statusEl.textContent=txt;statusEl.className="vn-status"+(cls?" "+cls:"");}
@@ -216,7 +220,11 @@ async function sendVoiceNote(blob){
     // as a proper voice-note bubble on reload.
     if(data.transcript&&vnImages.length){
       const clientId=genMsgId();
-      outbox.push({id:clientId,text:data.transcript,images:vnImages,ts:Date.now()});saveOutbox();
+      // Tag the local bubble with this client_id so a server-side queue_state
+      // (busy session → queueAppend with client_id) finds it via data-client-id
+      // and just marks it queued instead of rendering a second voice-note bubble.
+      msgEl.dataset.clientId=clientId;
+      outbox.push({id:clientId,text:data.transcript,images:vnImages,ts:Date.now(),sid:(session&&session.id)||localStorage.getItem("llmt_session")||null});saveOutbox();
       if(ws&&ws.readyState===1){
         ws.send(JSON.stringify({type:"prompt",client_id:clientId,text:data.transcript,images:vnImages,source:"voice-note",audioUrl:data.audioUrl}));
         setBusy(true);
