@@ -740,6 +740,9 @@ app.post("/api/sessions/:id/reactivate", express.json(), (req, res) => {
   const from = (req.body?.fromEmail || "someone").trim();
   const subject = (req.body?.subject || "").trim();
   const snippet = (req.body?.snippet || "").trim().slice(0, 200);
+  // Full email body (plain text, extracted by the poller) so the chat card can
+  // show the actual email — David shouldn't have to jump to Gmail to read it.
+  const emailBody = String(req.body?.body || "").trim().slice(0, 20000);
   const ts = Number(req.body?.ts) || now;
   s.lastActive = ts;
   s.lastMessageRole = "email_reply";
@@ -753,6 +756,7 @@ app.post("/api/sessions/:id/reactivate", express.json(), (req, res) => {
       role: "email_reply",
       ts,
       text: `📬 Reply received from ${from}` + (subject ? ` — *${subject}*` : "") + (snippet ? `\n\n> ${snippet}` : ""),
+      body: emailBody || null,
       fromEmail: from, subject, messageId: req.body?.messageId || null,
     });
   } catch (e) { console.error("[reactivate] saveMessage failed:", e.message); }
@@ -1320,6 +1324,41 @@ app.post("/api/email-draft/send", express.json(), (req, res) => {
   proc.on("error", (e) => {
     res.status(500).json({ ok: false, error: "spawn failed: " + e.message });
   });
+});
+
+// ---- /api/outbox-capture ----
+// The NO-LOSS net (2026-07-07, after David's queued messages vanished): the
+// client posts every unacked outbox message here over plain HTTP (works when
+// the WS is dead/zombie). The message becomes durable in the session's
+// persistent queue file immediately and fires via the normal drain machinery.
+// Exactly-once: skipped if the client_id was already delivered (saved message)
+// or is already queued (queueAppend dedupes). The client drops the item from
+// its outbox only after this returns ok:true.
+app.post("/api/outbox-capture", express.json(), (req, res) => {
+  const { sessionId, client_id, text, source } = req.body || {};
+  if (!sessionId || !client_id || !text) {
+    return res.status(400).json({ ok: false, error: "sessionId, client_id, text required" });
+  }
+  const sessions = loadSessions();
+  if (!sessions.find(s => s.id === sessionId)) {
+    return res.status(404).json({ ok: false, error: "session not found" });
+  }
+  // Already delivered via WS? (saved as a user message)
+  try {
+    const existing = loadMessages(sessionId);
+    if (existing.some(m => m.role === "user" && m.client_id === client_id)) {
+      return res.json({ ok: true, dup: "delivered" });
+    }
+  } catch {}
+  const appended = queueAppend(sessionId, {
+    text: String(text), source: source || "outbox-capture", client_id, ts: Date.now(),
+  });
+  if (!appended) return res.status(500).json({ ok: false, error: "queue append failed" });
+  console.log("[outbox-capture] secured message for", sessionId, ":", String(text).slice(0, 60));
+  try { broadcastQueueState(sessionId); } catch {}
+  // Fire it if the session is idle (drain no-ops when a run is active).
+  setTimeout(() => { try { tryDrainQueue(sessionId); } catch (e) { console.error("[outbox-capture] drain failed:", e.message); } }, 100);
+  return res.json({ ok: true });
 });
 
 // ---- /api/email-draft/test-send ----

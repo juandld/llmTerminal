@@ -13,6 +13,8 @@ Driven by gmail-reply-poller.timer (systemd) every 5 minutes.
 """
 from __future__ import annotations
 
+import base64
+import html as html_mod
 import json
 import os
 import re
@@ -32,6 +34,45 @@ from data.accounts import load_accounts  # noqa: E402
 SESSIONS_PATH = Path("/home/claude-user/.llm-terminal/sessions.json")
 LLMT_BASE_URL = os.environ.get("LLMT_BASE_URL", "http://127.0.0.1:7683")
 DEFAULT_ACCOUNT = "camofiles"
+BODY_MAX_CHARS = 20000  # server clamps to the same limit
+
+
+def _extract_text(payload: dict) -> str:
+    """Best-effort plain text from a Gmail message payload (multipart-aware)."""
+    def walk(part: dict, want: str) -> str:
+        if part.get("mimeType", "") == want:
+            data = part.get("body", {}).get("data")
+            if data:
+                return base64.urlsafe_b64decode(data + "===").decode("utf-8", "replace")
+        for sub in part.get("parts") or []:
+            got = walk(sub, want)
+            if got:
+                return got
+        return ""
+
+    text = walk(payload, "text/plain")
+    if not text:
+        html = walk(payload, "text/html")
+        if html:
+            text = re.sub(r"<(style|script).*?</\1>", "", html, flags=re.S | re.I)
+            text = re.sub(r"<br\s*/?>|</p>|</div>|</tr>", "\n", text, flags=re.I)
+            text = re.sub(r"<[^>]+>", "", text)
+            text = html_mod.unescape(text)
+            text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _fetch_body(service, message_id: str) -> str:
+    """Full-body fetch for the one reply we surface — so the chat card can show
+    the actual email, not just Gmail's ~200-char snippet."""
+    if not message_id:
+        return ""
+    try:
+        m = service.users().messages().get(userId="me", id=message_id, format="full").execute()
+    except Exception as e:
+        print(f"[poll] body fetch failed for {message_id}: {e}", file=sys.stderr)
+        return ""
+    return _extract_text(m.get("payload", {}))[:BODY_MAX_CHARS]
 
 
 def _post_reactivate(session_id: str, payload: dict) -> bool:
@@ -118,6 +159,7 @@ def main() -> int:
                 "fromEmail": reply["fromEmail"],
                 "subject": reply["subject"],
                 "snippet": reply["snippet"],
+                "body": _fetch_body(service, reply["messageId"]),
                 "messageId": reply["messageId"],
                 "ts": reply["ts"],
             }
