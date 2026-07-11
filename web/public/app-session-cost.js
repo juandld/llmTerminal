@@ -18,20 +18,23 @@
   }
 
   function _label(d) {
+    // ACTUAL dollars only: API spend is billed money; the plan number is this
+    // chat's slice of the flat Max bill (never list-price theory).
     const bits = [];
     if (d.api_usd > 0) bits.push(_fmt(d.api_usd) + " api");
-    bits.push(_fmt(d.plan_usd) + " plan");
+    bits.push(_fmt(d.plan_share_usd || 0) + " of plan");
     return bits.join(" · ");
   }
 
   function _title(d) {
     const lines = [
-      "This chat's spend:",
-      "API (billed dollars, OpenAI/Gemini): " + _fmt(d.api_usd),
-      "Claude Max plan (included; list-equivalent): " + _fmt(d.own ? d.own.plan_usd : d.plan_usd),
+      "This chat's ACTUAL cost:",
+      "API (billed, OpenAI/Gemini): " + _fmt(d.api_usd),
+      "Claude: " + _fmt(d.plan_share_usd || 0) + " — its slice of the flat $" +
+        (d.plan_month_bill_usd || 200) + "/mo Max plan (" + (d.plan_usage_fraction || 0) + "% of this month's usage)",
     ];
     if (d.downstream && d.downstream.available && d.downstream.items) {
-      lines.push("Downstream queue items: " + d.downstream.items + " (" + _fmt(d.downstream.plan_usd) + " plan)");
+      lines.push("Includes " + d.downstream.items + " downstream queue item(s), " + d.downstream.runs + " run(s)");
     }
     for (const n of d.notes || []) lines.push("• " + n);
     return lines.join("\n");
