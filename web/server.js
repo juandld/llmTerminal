@@ -318,7 +318,10 @@ const { spawn: _spawnRaw } = require("child_process");
 const { fetchProviderModels, clearModelsCache } = require("./src/models");
 // Per-chat cost rollup: api_usd (real OpenAI/Google dollars) vs plan_usd
 // (Claude Max list-equivalent, included) + downstream queue-item spend.
-const { sessionCost } = require("./src/session-cost");
+const { sessionCost, allSessionCosts } = require("./src/session-cost");
+app.get("/api/session-costs", (_req, res) => {
+  try { res.json(allSessionCosts()); } catch (e) { res.status(500).json({ error: e.message }); }
+});
 const { claudeBilling } = require("./src/claude-billing");
 // Console-true Anthropic numbers (usage credits, plan-limit meters) — same
 // figures as claude.ai Settings→Usage, via the persisted browser session.

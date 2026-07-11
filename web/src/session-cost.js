@@ -155,4 +155,42 @@ async function sessionCost(sessionId) {
   };
 }
 
-module.exports = { sessionCost };
+// Bulk per-session rollup for the sidebar badges: ONE ledger scan, every
+// session's api dollars + plan share. Keys are the row's session id (full)
+// or, for legacy rows, the 8-char meta prefix — clients fall back to
+// id.slice(0,8). No downstream/org fetches here (badge = own spend; the
+// in-chat tooltip carries the full detail).
+function allSessionCosts() {
+  const perKey = {};   // key -> { api: n, w: {month: n} }
+  const totals = {};   // month -> total plan weight
+  let text = "";
+  try { text = fs.readFileSync(LEDGER, "utf8"); } catch { return { costs: {}, month_bill_usd: MAX_PLAN_USD_MONTH }; }
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    let row;
+    try { row = JSON.parse(line); } catch { continue; }
+    const isApi = row.billing === "api";
+    const m = _month(row);
+    if (!isApi) totals[m] = (totals[m] || 0) + (Number(row.cost_usd) || 0);
+    const key = row.session || (String(row.component || "").startsWith("llmterminal") ? row.meta : null);
+    if (!key) continue;
+    const e = (perKey[key] = perKey[key] || { api: 0, w: {} });
+    if (isApi) e.api += Number(row.cost_usd) || 0;
+    else e.w[m] = (e.w[m] || 0) + (Number(row.cost_usd) || 0);
+  }
+  const costs = {};
+  for (const [key, e] of Object.entries(perKey)) {
+    let share = 0;
+    for (const [m, w] of Object.entries(e.w)) {
+      const t = totals[m] || 0;
+      if (t > 0) share += Math.min(1, w / t) * MAX_PLAN_USD_MONTH;
+    }
+    costs[key] = {
+      api_usd: Math.round(e.api * 100) / 100,
+      plan_share_usd: Math.round(share * 100) / 100,
+    };
+  }
+  return { costs, month_bill_usd: MAX_PLAN_USD_MONTH };
+}
+
+module.exports = { sessionCost, allSessionCosts };

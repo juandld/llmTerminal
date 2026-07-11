@@ -83,6 +83,47 @@
     } catch {}
   }
 
+  // ── Sidebar badges: each chat label shows its actual total, top-right ──
+  let _bulk = null;
+  async function _fetchBulk() {
+    try {
+      const base = typeof apiUrl === "function" ? apiUrl("/api/session-costs") : "/api/session-costs";
+      const r = await fetch(base);
+      if (r.ok) _bulk = await r.json();
+      _decorateSidebar();
+    } catch {}
+  }
+  function _lookup(sid) {
+    if (!_bulk || !_bulk.costs) return null;
+    return _bulk.costs[sid] || _bulk.costs[String(sid).slice(0, 8)] || null;
+  }
+  function _decorateSidebar() {
+    if (!_bulk) return;
+    document.querySelectorAll("#sbList .sb-item[data-sid]").forEach((el) => {
+      const c = _lookup(el.dataset.sid);
+      let badge = el.querySelector(".sb-cost");
+      if (!c || (c.api_usd <= 0 && c.plan_share_usd <= 0)) { if (badge) badge.remove(); return; }
+      if (!badge) {
+        badge = document.createElement("div");
+        badge.className = "sb-cost";
+        el.appendChild(badge);
+      }
+      const total = (c.api_usd || 0) + (c.plan_share_usd || 0);
+      badge.textContent = _fmt(total);
+      badge.title = "Actual cost: " + _fmt(c.plan_share_usd) + " plan share" +
+        (c.api_usd > 0 ? " + " + _fmt(c.api_usd) + " API" : "");
+    });
+  }
+  const _sbObserver = new MutationObserver(() => _decorateSidebar());
+  function _armSidebar() {
+    const list = document.getElementById("sbList");
+    if (!list) { setTimeout(_armSidebar, 1000); return; }
+    _sbObserver.observe(list, { childList: true, subtree: true });
+    _fetchBulk();
+  }
+  _armSidebar();
+  setInterval(() => { if (document.visibilityState === "visible") _fetchBulk(); }, 60000);
+
   window.refreshSessionCost = refreshSessionCost;
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") refreshSessionCost();

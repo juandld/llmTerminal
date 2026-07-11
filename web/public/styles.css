@@ -1311,3 +1311,6 @@
 .job-row.js-stalled{background:rgba(255,180,0,.10)}
 .job-row.js-failed,.job-row.js-killed{background:rgba(231,76,60,.10)}
 .job-row.js-done .job-prog{color:var(--green,#4ECCA3)}
+  /* Per-chat actual-cost badge — top-right of each sidebar chat label
+     (decorated by app-session-cost.js from /api/session-costs) */
+  .sb-cost{position:absolute;top:4px;right:8px;font-size:10px;line-height:1;color:var(--dim);pointer-events:none;background:var(--surface);border-radius:4px;padding:1px 3px}
