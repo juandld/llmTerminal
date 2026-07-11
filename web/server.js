@@ -883,7 +883,8 @@ Respond as JSON: {"type":"reply"} or {"type":"idea","title":"...","description":
         description: (parsed.description || "") + "\n\n[Auto-captured from voice note" + (sessionId ? " in session " + sessionId : "") + "]\nAudio: " + audioUrl + "\n\nOriginal transcript:\n" + transcript.slice(0, 3000),
         project_id: parsed.project || "unknown",
         priority: parsed.priority || "normal",
-        owner: "operator"
+        owner: "operator",
+        origin_session: sessionId || undefined
       })
     });
     if (orchRes.ok) {
