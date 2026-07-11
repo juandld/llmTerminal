@@ -136,17 +136,25 @@ let _modelsCache = null;
 let _modelsCacheTs = 0;
 const MODELS_CACHE_TTL = 60 * 60 * 1000; // 1 hour
 
+// At most this many models render above the picker's "Show more" fold. The
+// TOP lists are full RANKINGS (order for the sort); the fold is a SHORTLIST —
+// without the cap OpenAI put 19 rows above the fold, which is the scroll
+// David complained about.
+const FEATURED_CAP = 6;
+
 function _rankSort(models, topList) {
   const topIdx = new Map(topList.map((id, i) => [id, i]));
-  return models.slice().sort((a, b) => {
+  const sorted = models.slice().sort((a, b) => {
     const ai = topIdx.has(a.id) ? topIdx.get(a.id) : Infinity;
     const bi = topIdx.has(b.id) ? topIdx.get(b.id) : Infinity;
     if (ai !== bi) return ai - bi;
     return (b.created || 0) - (a.created || 0);
-  }).map(m => (topIdx.has(m.id) ? { ...m, featured: true } : m));
-  // featured drives the picker's fold: curated TOP models render above the
-  // "Show all" line, the long catalog tail stays behind it. One curation
-  // source (the TOP lists here) — the client only reads the flag.
+  });
+  // featured drives the picker's fold: the first FEATURED_CAP top-listed
+  // models render above the "Show more" line, everything else behind it.
+  // One curation source (the TOP lists here) — the client only reads the flag.
+  let n = 0;
+  return sorted.map(m => (topIdx.has(m.id) && n < FEATURED_CAP ? (n++, { ...m, featured: true }) : m));
 }
 
 async function fetchProviderModels() {
