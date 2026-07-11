@@ -1265,6 +1265,8 @@
   .win95-model.selected::after{content:"●";margin-left:auto;color:var(--accent);font-size:8px}
   .win95-model-star{color:var(--yellow);width:10px;display:inline-block;text-align:center;font-size:11px}
   .win95-model:not(.selected) .win95-model-star{opacity:.85}
+  .win95-showall{padding:7px 14px 7px 32px;cursor:pointer;display:flex;align-items:center;min-height:30px;color:var(--dim);font-size:12px;border-left:2px solid transparent;transition:background .1s,color .1s}
+  .win95-showall:hover{background:var(--surface2);color:var(--accent)}
   @media(max-width:768px){.win95-model{min-height:36px;padding:8px 14px 8px 34px;font-size:13px}.win95-prov{min-height:36px;padding:9px 14px;font-size:13px}.win95-titlebar{padding:10px 16px;font-size:13px}}
 
   .win95-empty{padding:6px 14px 12px 36px;color:var(--dim);font-style:italic;font-size:11px}

@@ -100,6 +100,9 @@ setInterval(() => { resolveClaudeAliases().catch(() => {}); }, 6 * 60 * 60 * 100
 // OpenAI's Responses API endpoint and 404 against /v1/chat/completions — they
 // are also filtered out in `skipPatterns` below.
 const OPENAI_TOP = [
+  "gpt-5.6-sol",
+  "gpt-5.6-terra",
+  "gpt-5.6-luna",
   "gpt-5.5",
   "gpt-5.4",
   "gpt-5.3-chat-latest",
@@ -140,7 +143,10 @@ function _rankSort(models, topList) {
     const bi = topIdx.has(b.id) ? topIdx.get(b.id) : Infinity;
     if (ai !== bi) return ai - bi;
     return (b.created || 0) - (a.created || 0);
-  });
+  }).map(m => (topIdx.has(m.id) ? { ...m, featured: true } : m));
+  // featured drives the picker's fold: curated TOP models render above the
+  // "Show all" line, the long catalog tail stays behind it. One curation
+  // source (the TOP lists here) — the client only reads the flag.
 }
 
 async function fetchProviderModels() {
@@ -178,6 +184,7 @@ async function fetchProviderModels() {
     result.claude = ["fable", "opus", "sonnet", "haiku"].map(a => ({
       id: a,
       name: (_claudeAliasModels[a] && _claudeAliasModels[a].label) || _static[a],
+      featured: true,
     }));
   }
 

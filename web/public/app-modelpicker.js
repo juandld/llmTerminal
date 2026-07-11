@@ -1,6 +1,13 @@
 // Model/effort picker UI for llmTerminal — classic script, shares global
 // scope with app.js (loaded after it). Extracted (refactor 2026-06-10, app.js phase 1).
 
+// Per-provider "Show all" fold state. The server marks curated TOP models
+// featured:true; only those render by default — the catalog tail (old
+// snapshots, minor variants) hides behind a "Show N more" row so the best
+// model is one glance away, not a scroll (David, 2026-07-11). Reset on every
+// menu open.
+const _provShowAll = { claude: false, openai: false, google: false };
+
 function _findModelMeta(id) {
   if (!_allModelsData) return null;
   for (const prov of ["claude", "openai", "google"]) {
@@ -91,7 +98,15 @@ function renderModelMenu() {
       const e = document.createElement("div"); e.className = "win95-empty"; e.textContent = "(add " + key.toUpperCase() + "_API_KEY to enable)";
       items.appendChild(e);
     }
-    models.forEach((m, idx) => {
+    // Fold: featured (curated TOP) models — plus the current selection, so it
+    // can never vanish behind the fold — render by default; the catalog tail
+    // waits behind "Show N more". Providers without featured flags (stale
+    // server cache / old server) render everything, as before.
+    const hasFeatured = models.some((m) => m.featured);
+    const aboveFold = hasFeatured ? models.filter((m) => m.featured || m.id === selected) : models;
+    const tail = hasFeatured ? models.filter((m) => !(m.featured || m.id === selected)) : [];
+    const visible = _provShowAll[key] ? models : aboveFold;
+    visible.forEach((m, idx) => {
       const el = document.createElement("div");
       el.className = "win95-model" + (m.id === selected ? " selected" : "");
       el.dataset.id = m.id;
@@ -104,6 +119,20 @@ function renderModelMenu() {
       el.addEventListener("click", (e) => { e.stopPropagation(); selectModel(m.id); });
       items.appendChild(el);
     });
+    if (tail.length) {
+      const fold = document.createElement("div");
+      fold.className = "win95-showall";
+      fold.tabIndex = 0;
+      fold.textContent = _provShowAll[key]
+        ? "▴ Show fewer"
+        : "▾ Show " + tail.length + " more (older / variants)";
+      fold.addEventListener("click", (e) => {
+        e.stopPropagation();
+        _provShowAll[key] = !_provShowAll[key];
+        renderModelMenu();
+      });
+      items.appendChild(fold);
+    }
     prov.addEventListener("click", () => {
       _provExpanded[key] = !_provExpanded[key];
       prov.dataset.expanded = String(_provExpanded[key]);
@@ -139,6 +168,7 @@ function showModelMenu(evt) {
   const _meta = _findModelMeta(_curId);
   const _curProv = _meta?.provider || "claude";
   for (const k of Object.keys(_provExpanded)) _provExpanded[k] = (k === _curProv);
+  for (const k of Object.keys(_provShowAll)) _provShowAll[k] = false;
   renderModelMenu();
   const trigger = evt?.currentTarget;
   if (window.innerWidth > 768 && trigger && trigger.getBoundingClientRect) {
