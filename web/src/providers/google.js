@@ -7,6 +7,8 @@ const mcpTranslate = require("../mcp/translate");
 const builtinTools = require("../tools-builtin");
 const { buildHistory, buildProjectContext, FetchProc, loadChatSystemPrompt, toGeminiContents } = require("./context");
 const { activeProcs } = require("../proc-state");
+const governor = require("../governor");
+const { priceTokens } = require("../pricing");
 
 function runGoogle({ prompt, sessionId, model, project, effort }, onData, onDone) {
   const key = process.env.GOOGLE_API_KEY;
@@ -18,6 +20,17 @@ function runGoogle({ prompt, sessionId, model, project, effort }, onData, onDone
   const proc = new FetchProc(controller);
   activeProcs.add(proc);
   const startTime = Date.now();
+  // Real-dollar accounting. Gemini's usageMetadata is CUMULATIVE within one
+  // request's stream — keep the latest per request, fold it into the turn
+  // total before the next request starts and once at the end.
+  const _usage = { in: 0, out: 0 };
+  let _reqU = null;
+  const _foldReq = () => {
+    if (!_reqU) return;
+    _usage.in += _reqU.promptTokenCount || 0;
+    _usage.out += (_reqU.candidatesTokenCount || 0) + (_reqU.thoughtsTokenCount || 0);
+    _reqU = null;
+  };
   const projectCwd = project ? path.join(PROJECTS_DIR, project) : null;
   const geminiModel = model || "gemini-2.5-flash";
   const MAX_TOOL_ITERATIONS = 20;
@@ -63,6 +76,7 @@ function runGoogle({ prompt, sessionId, model, project, effort }, onData, onDone
         };
         if (ggTools) body.tools = ggTools;
 
+        _foldReq();
         const url = `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:streamGenerateContent?alt=sse&key=${key}`;
         const res = await fetch(url, {
           method: "POST",
@@ -96,6 +110,7 @@ function runGoogle({ prompt, sessionId, model, project, effort }, onData, onDone
             if (!payload) continue;
             try {
               const obj = JSON.parse(payload);
+              if (obj.usageMetadata) _reqU = obj.usageMetadata;
               const parts = obj.candidates?.[0]?.content?.parts || [];
               for (const part of parts) {
                 if (part.text) {
@@ -188,6 +203,7 @@ function runGoogle({ prompt, sessionId, model, project, effort }, onData, onDone
       if (!fullText.trim() && contents.some(c => c.parts?.some(p => p.functionResponse))) {
         contents.push({ role: "user", parts: [{ text: "[system] You called tools but did not write a final reply to the user. Now reply IN PLAIN TEXT only — describe what you did, the outcome, and any remaining gaps. Do NOT call any more tools." }] });
         try {
+          _foldReq();
           const url = `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:streamGenerateContent?alt=sse&key=${key}`;
           const finalRes = await fetch(url, {
             method: "POST",
@@ -208,6 +224,7 @@ function runGoogle({ prompt, sessionId, model, project, effort }, onData, onDone
                 if (!payload) continue;
                 try {
                   const obj = JSON.parse(payload);
+                  if (obj.usageMetadata) _reqU = obj.usageMetadata;
                   const parts = obj.candidates?.[0]?.content?.parts || [];
                   for (const part of parts) {
                     if (part.text) {
@@ -222,7 +239,11 @@ function runGoogle({ prompt, sessionId, model, project, effort }, onData, onDone
         } catch (e) { console.warn("[runGoogle] forced-summary turn failed:", e.message); }
       }
       const duration = Date.now() - startTime;
-      onData({ type: "result", result: fullText, duration_ms: duration, total_cost_usd: null, session_id: null });
+      _foldReq();
+      const _priced = priceTokens("google", geminiModel, _usage.in, _usage.out);
+      governor.record("llmterminal-chat", geminiModel || "gemini", _priced.cost_usd || 0, (sessionId || "").slice(0, 8),
+        { session: sessionId || "", billing: "api", unpriced: _priced.unpriced, tokens_in: _usage.in, tokens_out: _usage.out });
+      onData({ type: "result", result: fullText, duration_ms: duration, total_cost_usd: _priced.cost_usd, session_id: null });
       activeProcs.delete(proc);
       proc._emitClose(0);
       onDone(0, "");

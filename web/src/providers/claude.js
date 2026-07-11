@@ -374,7 +374,10 @@ function runClaude(opts, onData, onDone) {
       // Record-after (WS3a): every claude call — interactive or automated —
       // lands one row in the shared spend ledger. record() never throws and
       // never blocks; only check() (automated callers) can park a spawn.
-      governor.record(_govComponent, chosenModel, data.total_cost_usd, (sessionId || "").slice(0, 8));
+      governor.record(_govComponent, chosenModel, data.total_cost_usd, (sessionId || "").slice(0, 8),
+        // Claude runs on the Max plan: cost_usd is the CLI's list-price
+        // equivalent, not billed dollars. Full session id → per-chat rollup.
+        { session: sessionId || "", billing: "plan" });
       // A clean (non-error) result is CONTENT — never reclassify it as a
       // throttle just because its text mentions rate limits.
       if (data.is_error && (_rlSeen || throttle.isTransientRateLimit(data.result)) && _scheduleRetry(data.result || "rate-limit")) return; // suppress; retry owns it

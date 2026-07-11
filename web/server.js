@@ -316,6 +316,20 @@ app.get("/api/providers", (_req, res) => {
 // auto-update), we Telegram-notify David: that's a model upgrade.
 const { spawn: _spawnRaw } = require("child_process");
 const { fetchProviderModels, clearModelsCache } = require("./src/models");
+// Per-chat cost rollup: api_usd (real OpenAI/Google dollars) vs plan_usd
+// (Claude Max list-equivalent, included) + downstream queue-item spend.
+const { sessionCost } = require("./src/session-cost");
+app.get("/api/session-cost", async (req, res) => {
+  const sid = String(req.query.session || "").trim();
+  if (!sid || sid.length < 8 || !/^[a-zA-Z0-9-]+$/.test(sid)) {
+    return res.status(400).json({ error: "session query param required" });
+  }
+  try {
+    res.json(await sessionCost(sid));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 app.get("/api/models", async (_req, res) => {
   try {
     const models = await fetchProviderModels();

@@ -8,6 +8,8 @@ const mcpTranslate = require("../mcp/translate");
 const builtinTools = require("../tools-builtin");
 const { buildHistory, buildProjectContext, FetchProc, loadChatSystemPrompt } = require("./context");
 const { activeProcs } = require("../proc-state");
+const governor = require("../governor");
+const { priceTokens } = require("../pricing");
 
 // Map our internal tool list to the Responses API tool shape — flat
 // {type:"function", name, description, parameters} — distinct from the
@@ -27,7 +29,7 @@ function toResponsesTools(allTools) {
 // previous_response_id chaining — which carries reasoning items server-side,
 // as OpenAI recommends for function calling with reasoning models. Returns the
 // accumulated assistant text.
-async function runResponsesLoop({ key, model, effort, sysPrompt, history, respTools, routing, projectCwd, sessionId, controller, onData, MAX_TOOL_ITERATIONS }) {
+async function runResponsesLoop({ key, model, effort, sysPrompt, history, respTools, routing, projectCwd, sessionId, controller, onData, MAX_TOOL_ITERATIONS, usageAcc }) {
   const RESP_URL = "https://api.openai.com/v1/responses";
   // Responses supports none|low|medium|high|xhigh. We expose low/medium/high
   // and map our "max" to "high" (xhigh is reserved for async eval-grade work —
@@ -70,6 +72,11 @@ async function runResponsesLoop({ key, model, effort, sysPrompt, history, respTo
         let obj;
         try { obj = JSON.parse(payload); } catch { continue; }
         if (obj.response && obj.response.id) responseId = obj.response.id;
+        // response.completed carries the request's final token usage.
+        if (usageAcc && obj.response && obj.response.usage) {
+          usageAcc.in += obj.response.usage.input_tokens || 0;
+          usageAcc.out += obj.response.usage.output_tokens || 0;
+        }
         const t = obj.type;
         if (t === "response.output_text.delta" && typeof obj.delta === "string") {
           fullText += obj.delta;
@@ -86,7 +93,7 @@ async function runResponsesLoop({ key, model, effort, sysPrompt, history, respTo
   };
 
   for (let iter = 0; iter < MAX_TOOL_ITERATIONS; iter++) {
-    const body = { model: model || "gpt-5.5", stream: true, reasoning: { effort: reasoningEffort } };
+    const body = { model: model || "gpt-5.6-sol", stream: true, reasoning: { effort: reasoningEffort } };
     if (respTools.length) body.tools = respTools;
     if (prevId) { body.previous_response_id = prevId; body.input = nextInput; }
     else { body.instructions = sysPrompt; body.input = nextInput; }
@@ -128,7 +135,7 @@ async function runResponsesLoop({ key, model, effort, sysPrompt, history, respTo
   if (!fullText.trim() && prevId) {
     try {
       await _stream({
-        model: model || "gpt-5.5", stream: true, reasoning: { effort: reasoningEffort },
+        model: model || "gpt-5.6-sol", stream: true, reasoning: { effort: reasoningEffort },
         previous_response_id: prevId, tool_choice: "none",
         input: [{ role: "developer", content: "You called tools but did not write a final reply to the user. Now reply IN PLAIN TEXT only: what you did, the outcome, and any remaining gaps. Do NOT call any more tools." }],
       });
@@ -185,11 +192,14 @@ function runOpenAI({ prompt, sessionId, model, project, effort }, onData, onDone
       //    "-chat" variants are non-reasoning and stay on chat/completions, as
       //    do gpt-4.x and the o-series.
       let fullText = "";
+      // Real-dollar accounting: every request in this turn (tool loop,
+      // responses API, forced summary) folds its token usage in here.
+      const _usage = { in: 0, out: 0 };
       const _rName = (model || "").toLowerCase();
       const _useResponses = /^gpt-5/.test(_rName) && !_rName.includes("chat");
       if (_useResponses) {
         const respTools = allTools.length ? toResponsesTools(allTools) : [];
-        fullText = await runResponsesLoop({ key, model, effort, sysPrompt, history, respTools, routing, projectCwd, sessionId, controller, onData, MAX_TOOL_ITERATIONS });
+        fullText = await runResponsesLoop({ key, model, effort, sysPrompt, history, respTools, routing, projectCwd, sessionId, controller, onData, MAX_TOOL_ITERATIONS, usageAcc: _usage });
       } else {
       // Outer loop — alternate model→tool→model until the model returns a
       // text-only response or we hit the iteration cap.
@@ -240,6 +250,7 @@ function runOpenAI({ prompt, sessionId, model, project, effort }, onData, onDone
             if (payload === "[DONE]") continue;
             try {
               const obj = JSON.parse(payload);
+              if (obj.usage) { _usage.in += obj.usage.prompt_tokens || 0; _usage.out += obj.usage.completion_tokens || 0; }
               const choice = obj.choices?.[0];
               if (!choice) continue;
               const delta = choice.delta || {};
@@ -337,7 +348,7 @@ function runOpenAI({ prompt, sessionId, model, project, effort }, onData, onDone
           const finalRes = await fetch("https://api.openai.com/v1/chat/completions", {
             method: "POST",
             headers: { Authorization: "Bearer " + key, "Content-Type": "application/json" },
-            body: JSON.stringify({ model: model || "gpt-4.1", stream: true, messages }),
+            body: JSON.stringify({ model: model || "gpt-4.1", stream: true, stream_options: { include_usage: true }, messages }),
             signal: controller.signal,
           });
           if (finalRes.ok) {
@@ -353,6 +364,7 @@ function runOpenAI({ prompt, sessionId, model, project, effort }, onData, onDone
                 if (payload === "[DONE]") continue;
                 try {
                   const obj = JSON.parse(payload);
+                  if (obj.usage) { _usage.in += obj.usage.prompt_tokens || 0; _usage.out += obj.usage.completion_tokens || 0; }
                   const t = obj.choices?.[0]?.delta?.content;
                   if (t) {
                     fullText += t;
@@ -366,7 +378,11 @@ function runOpenAI({ prompt, sessionId, model, project, effort }, onData, onDone
       }
       } // end chat/completions branch
       const duration = Date.now() - startTime;
-      onData({ type: "result", result: fullText, duration_ms: duration, total_cost_usd: null, session_id: null });
+      // API-key billing: price the turn's tokens and ledger it (per-chat cost).
+      const _priced = priceTokens("openai", model, _usage.in, _usage.out);
+      governor.record("llmterminal-chat", model || "openai", _priced.cost_usd || 0, (sessionId || "").slice(0, 8),
+        { session: sessionId || "", billing: "api", unpriced: _priced.unpriced, tokens_in: _usage.in, tokens_out: _usage.out });
+      onData({ type: "result", result: fullText, duration_ms: duration, total_cost_usd: _priced.cost_usd, session_id: null });
       activeProcs.delete(proc);
       proc._emitClose(0);
       onDone(0, "");

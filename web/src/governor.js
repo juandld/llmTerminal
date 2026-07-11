@@ -38,7 +38,15 @@ const INTERACTIVE_COMPONENTS = new Set(["llmterminal-chat"]);
 // Append one claude call to the shared ledger. Same row schema as the python
 // governor (epoch-seconds ts, iso, component, model, cost_usd, meta<=120ch).
 // Never throws — a ledger hiccup must not take down a chat turn.
-function record(component, model, costUsd, meta) {
+//
+// extra (2026-07-11, per-chat cost accounting):
+//   session — FULL llmTerminal session id, so /api/session-cost can attribute
+//             the row exactly (meta keeps the legacy 8-char prefix).
+//   billing — "plan" (Claude Max subscription: cost_usd is the LIST-PRICE
+//             EQUIVALENT the CLI reports; marginal cost to David is $0) or
+//             "api" (OpenAI/Google keys: cost_usd is real billed dollars).
+//   Unknown keys are ignored by the python governor's _window — additive-safe.
+function record(component, model, costUsd, meta, extra) {
   try {
     fs.mkdirSync(USAGE_DIR, { recursive: true });
     const row = {
@@ -49,6 +57,13 @@ function record(component, model, costUsd, meta) {
       cost_usd: Math.round((Number(costUsd) || 0) * 1e6) / 1e6,
     };
     if (meta) row.meta = String(meta).slice(0, 120);
+    if (extra && typeof extra === "object") {
+      if (extra.session) row.session = String(extra.session).slice(0, 64);
+      if (extra.billing) row.billing = extra.billing === "api" ? "api" : "plan";
+      if (extra.unpriced) row.unpriced = true; // usage counted, no price known
+      if (extra.tokens_in != null) row.tokens_in = Number(extra.tokens_in) || 0;
+      if (extra.tokens_out != null) row.tokens_out = Number(extra.tokens_out) || 0;
+    }
     fs.appendFileSync(LEDGER, JSON.stringify(row) + "\n");
   } catch (e) {
     console.error("[governor] record failed:", e.message);
