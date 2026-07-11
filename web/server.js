@@ -319,6 +319,12 @@ const { fetchProviderModels, clearModelsCache } = require("./src/models");
 // Per-chat cost rollup: api_usd (real OpenAI/Google dollars) vs plan_usd
 // (Claude Max list-equivalent, included) + downstream queue-item spend.
 const { sessionCost } = require("./src/session-cost");
+const { claudeBilling } = require("./src/claude-billing");
+// Console-true Anthropic numbers (usage credits, plan-limit meters) — same
+// figures as claude.ai Settings→Usage, via the persisted browser session.
+app.get("/api/claude-billing", async (_req, res) => {
+  res.json(await claudeBilling());
+});
 app.get("/api/session-cost", async (req, res) => {
   const sid = String(req.query.session || "").trim();
   if (!sid || sid.length < 8 || !/^[a-zA-Z0-9-]+$/.test(sid)) {

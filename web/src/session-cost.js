@@ -118,6 +118,8 @@ async function _downstream(sessionId) {
 async function sessionCost(sessionId) {
   const own = _scanLedger(sessionId);
   const down = await _downstream(sessionId);
+  let org = null;
+  try { org = await require("./claude-billing").claudeBilling(); } catch {}
   const r2 = (n) => Math.round(n * 100) / 100;
   const r6 = (n) => Math.round(n * 1e6) / 1e6;
   const plan = _planShare(own.plan_weight_by_month, own.plan_total_by_month, down.plan_weight_by_month);
@@ -130,10 +132,21 @@ async function sessionCost(sessionId) {
     plan_usage_fraction: Math.round(plan.fractionLatest * 1000) / 10, // % of this month's plan usage
     calls: own.calls,
     downstream: { items: down.items, runs: down.runs, available: down.available },
+    // Console-true org numbers (same as claude.ai Settings→Usage):
+    anthropic_console: org && org.available ? {
+      overage_used_usd: org.overage_used_usd,
+      overage_limit_usd: org.overage_limit_usd,
+      session_pct: org.session_pct,
+      weekly_pct: org.weekly_pct,
+      fetched_at: org.fetched_at,
+    } : { available: false, reason: org ? org.reason : "unavailable" },
     notes: [
       `Claude runs on the Max plan: a flat $${MAX_PLAN_USD_MONTH}/mo regardless of usage. ` +
         "plan_share_usd = this chat's slice of that actual bill, weighted by its share of the month's total plan usage.",
       "api_usd = real billed dollars on the OpenAI/Google keys.",
+      ...(org && org.available
+        ? [`Anthropic console (live): $${org.overage_used_usd.toFixed(2)} usage credits spent of $${org.overage_limit_usd.toFixed(0)} this month — real overage dollars ON TOP of the subscription (org-wide; Anthropic does not expose per-chat overage).`]
+        : []),
       ...(own.unpriced_calls
         ? [`${own.unpriced_calls} API call(s) have no rate in pricing.js — tokens counted, dollars unknown`]
         : []),
