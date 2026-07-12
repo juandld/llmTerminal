@@ -18,11 +18,12 @@
   }
 
   function _label(d) {
-    // ACTUAL dollars only: API spend is billed money; the plan number is this
-    // chat's slice of the flat Max bill (never list-price theory).
+    // Claude usage displays as % OF THE PLAN — the sub is flat $200/mo, so
+    // dollar-slices read like fake charges (David 2026-07-11). API spend
+    // stays in dollars: that IS billed money.
     const bits = [];
     if (d.api_usd > 0) bits.push(_fmt(d.api_usd) + " api");
-    bits.push(_fmt(d.plan_share_usd || 0) + " of plan");
+    bits.push((d.plan_usage_fraction || 0) + "% of plan");
     return bits.join(" · ");
   }
 
@@ -30,8 +31,8 @@
     const lines = [
       "This chat's ACTUAL cost:",
       "API (billed, OpenAI/Gemini): " + _fmt(d.api_usd),
-      "Claude: " + _fmt(d.plan_share_usd || 0) + " — its slice of the flat $" +
-        (d.plan_month_bill_usd || 200) + "/mo Max plan (" + (d.plan_usage_fraction || 0) + "% of this month's usage)",
+      "Claude: " + (d.plan_usage_fraction || 0) + "% of this month's Max-plan usage " +
+        "(the plan is a flat $" + (d.plan_month_bill_usd || 200) + "/mo — that share ≈ " + _fmt(d.plan_share_usd || 0) + " of the bill)",
     ];
     if (d.downstream && d.downstream.available && d.downstream.items) {
       lines.push("Includes " + d.downstream.items + " downstream queue item(s), " + d.downstream.runs + " run(s)");
@@ -99,26 +100,32 @@
   }
   function _decorateSidebar() {
     if (!_bulk) return;
+    if (_sbObserver) _sbObserver.disconnect();
+    try {
     document.querySelectorAll("#sbList .sb-item[data-sid]").forEach((el) => {
       const c = _lookup(el.dataset.sid);
       let badge = el.querySelector(".sb-cost");
-      if (!c || (c.api_usd <= 0 && c.plan_share_usd <= 0)) { if (badge) badge.remove(); return; }
+      if (!c || (c.api_usd <= 0 && !(c.plan_pct > 0))) { if (badge) badge.remove(); return; }
       if (!badge) {
         badge = document.createElement("div");
         badge.className = "sb-cost";
         el.appendChild(badge);
       }
-      const total = (c.api_usd || 0) + (c.plan_share_usd || 0);
-      badge.textContent = _fmt(total);
-      badge.title = "Actual cost: " + _fmt(c.plan_share_usd) + " plan share" +
-        (c.api_usd > 0 ? " + " + _fmt(c.api_usd) + " API" : "");
+      const pct = c.plan_pct || 0;
+      badge.textContent = (c.api_usd > 0 ? _fmt(c.api_usd) + " · " : "") + pct + "%";
+      badge.title = pct + "% of the Max plan's " + (c.plan_pct_month || "monthly") + " usage" +
+        (c.api_usd > 0 ? " + " + _fmt(c.api_usd) + " API (billed)" : "");
     });
+    } finally {
+      const _l = document.getElementById("sbList");
+      if (_l && _sbObserver) _sbObserver.observe(_l, { childList: true });
+    }
   }
   const _sbObserver = new MutationObserver(() => _decorateSidebar());
   function _armSidebar() {
     const list = document.getElementById("sbList");
     if (!list) { setTimeout(_armSidebar, 1000); return; }
-    _sbObserver.observe(list, { childList: true, subtree: true });
+    _sbObserver.observe(list, { childList: true }); // NOT subtree: badges live inside items; subtree caused an observer->mutate->observer infinite loop (100% CPU / tab crash)
     _fetchBulk();
   }
   _armSidebar();

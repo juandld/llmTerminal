@@ -180,6 +180,14 @@ function allSessionCosts() {
   }
   const costs = {};
   for (const [key, e] of Object.entries(perKey)) {
+    // % of the plan: the chat's share of its latest-active month's total plan
+    // usage — the unit David actually pays in (the sub is flat; dollars on
+    // Claude usage read as fake charges, 2026-07-11).
+    const months = Object.keys(e.w).sort();
+    const lastM = months[months.length - 1];
+    const pct = lastM && totals[lastM] > 0 ? Math.min(100, (e.w[lastM] / totals[lastM]) * 100) : 0;
+    e._pct = Math.round(pct * 10) / 10;
+    e._pctMonth = lastM || null;
     let share = 0;
     for (const [m, w] of Object.entries(e.w)) {
       const t = totals[m] || 0;
@@ -188,6 +196,8 @@ function allSessionCosts() {
     costs[key] = {
       api_usd: Math.round(e.api * 100) / 100,
       plan_share_usd: Math.round(share * 100) / 100,
+      plan_pct: e._pct,
+      plan_pct_month: e._pctMonth,
     };
   }
   return { costs, month_bill_usd: MAX_PLAN_USD_MONTH };
