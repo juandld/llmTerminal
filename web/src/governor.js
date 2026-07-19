@@ -120,6 +120,20 @@ function check(component) {
   if (day.spend >= DAILY_USD) {
     return { ok: false, reason: "daily spend cap: $" + day.spend.toFixed(2) + " >= $" + DAILY_USD.toFixed(2) };
   }
+  // Claude-pace smoothing (pace.js, 2026-07-19): the auto lane ALSO defers
+  // while the box burns Claude's own session/weekly limits faster than the
+  // smoothed daily curve allows (day hot, or 5h window >85% of the observed
+  // ceiling). Callers already treat any not-ok as defer-not-drop — the
+  // wake-sweep retries next sweep with wakeAt intact. "llmterminal-auto"
+  // ONLY: interactive chat and the cheap lane are never pace-gated.
+  // Escape hatch: LLMT_PACE_GOVERNOR=off. Lazy require keeps the module
+  // graph cycle-free; pace trouble must never park the lane by accident.
+  if (component === "llmterminal-auto" && process.env.LLMT_PACE_GOVERNOR !== "off") {
+    try {
+      const pv = require("./pace").governorVerdict();
+      if (pv.defer) return { ok: false, reason: "claude-pace: " + pv.detail };
+    } catch (e) { console.warn("[governor] pace consult failed (ignored):", e.message); }
+  }
   return { ok: true, reason: "" };
 }
 

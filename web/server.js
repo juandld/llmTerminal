@@ -344,6 +344,13 @@ app.get("/api/session-cost", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+// Claude-limit pace engine: rolling 5h/7d usage from the shared spend ledger,
+// ceilings calibrated from observed limit hits (attention.js → recordLimitHit),
+// smoothed daily target + offload signal. GET /api/pace — loopback, no auth,
+// same posture as the cost endpoints above. Consumers (nh-backend enrichment,
+// future routers) read it to route work to the capped GPT/Gemini lanes in the
+// gaps; governor.js consults it for the "llmterminal-auto" lane.
+require("./src/pace").registerRoutes(app);
 app.get("/api/models", async (_req, res) => {
   try {
     const models = await fetchProviderModels();

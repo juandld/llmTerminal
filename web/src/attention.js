@@ -125,6 +125,11 @@ function handleTokenLimitError(sessionId, resultText, nowMs = Date.now()) {
     if (!sessionId) return null;
     const parsed = parseUsageLimitReset(resultText, nowMs);
     if (!parsed) return null;
+    // Calibrate the pace engine on EVERY observed hit — before the per-session
+    // 6h dedupe below (ceilings want each observation; pace dedupes its own
+    // file writes). Lazy require + catch: calibration can never break the run
+    // pipeline.
+    try { require("./pace").recordLimitHit({ resetAtMs: parsed.resetAtMs, text: resultText, nowMs }); } catch {}
     const sid8 = String(sessionId).slice(0, 8);
     const lastFire = _tokenLimitLastFire.get(sessionId) || 0;
     if (nowMs - lastFire < SIX_HOURS_MS) {
