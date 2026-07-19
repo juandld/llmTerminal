@@ -61,6 +61,47 @@ async function callOpenAI(model, maxTokens, systemPrompt, userContent) {
   return (data.choices?.[0]?.message?.content || "").trim();
 }
 
+// Extract the first JSON value from cheap-model output. Models sometimes wrap
+// the JSON in markdown fences AND append prose after the closing fence — the
+// old anchored strip (`^```...|...```$`) only handled fences at the exact
+// string edges, so trailing prose left the closing fence mid-string and the
+// whole supervisor round was dropped as a parse failure. Order of attempts:
+//   1. first fenced ``` block whose contents parse as JSON
+//   2. the whole trimmed text as raw JSON
+//   3. the first balanced {...} object that parses (string/escape aware)
+// Returns the parsed value or throws (caller warns + drops the round).
+function extractFirstJson(text) {
+  const s = String(text == null ? "" : text);
+  const fenceRe = /```(?:json)?\s*([\s\S]*?)```/g;
+  let m;
+  while ((m = fenceRe.exec(s)) !== null) {
+    try { return JSON.parse(m[1].trim()); } catch {}
+  }
+  try { return JSON.parse(s.trim()); } catch {}
+  for (let i = s.indexOf("{"); i !== -1; i = s.indexOf("{", i + 1)) {
+    let depth = 0, inStr = false, esc = false;
+    for (let j = i; j < s.length; j++) {
+      const c = s[j];
+      if (esc) { esc = false; continue; }
+      if (inStr) {
+        if (c === "\\") esc = true;
+        else if (c === '"') inStr = false;
+        continue;
+      }
+      if (c === '"') inStr = true;
+      else if (c === "{") depth++;
+      else if (c === "}") {
+        depth--;
+        if (depth === 0) {
+          try { return JSON.parse(s.slice(i, j + 1)); } catch {}
+          break;
+        }
+      }
+    }
+  }
+  throw new Error("no parseable JSON found in model output");
+}
+
 // Classify voice note transcript and auto-create orchestrator task if it's a new idea/direction
 
 function runCheapClaude(prompt, tag, onParsed, project) {
@@ -133,8 +174,7 @@ function _spawnCheapClaudeCli(prompt, tag, onParsed, project) {
     try {
       const wrap = JSON.parse(out);
       const text = (wrap.result || wrap.text || out).toString();
-      const json = text.replace(/^```(?:json)?\s*|\s*```$/g, "").trim();
-      const parsed = JSON.parse(json);
+      const parsed = extractFirstJson(text);
       await onParsed(parsed, err);
     } catch (e) {
       console.warn(`[${tag}] parse failed:`, e.message, "raw:", out.slice(0, 300));
@@ -154,9 +194,8 @@ async function _runCheapOpenAI(prompt, tag, onParsed, project) {
       console.warn(`[${tag}] openai returned empty/null`);
       return;
     }
-    const json = content.replace(/^```(?:json)?\s*|\s*```$/g, "").trim();
     let parsed;
-    try { parsed = JSON.parse(json); }
+    try { parsed = extractFirstJson(content); }
     catch (e) {
       console.warn(`[${tag}] openai parse failed:`, e.message, "raw:", content.slice(0, 300));
       return;
@@ -167,13 +206,4 @@ async function _runCheapOpenAI(prompt, tag, onParsed, project) {
   }
 }
 
-// ── End-of-run observer (Tier 2 "supervisor pattern") ──
-// After each agent run completes, fire a cheap Haiku call to read the recent
-// messages and identify anything David asked for that the agent didn't address.
-// Creates tasks with status "review" on the narrativeHero orchestrator queue.
-// Fire-and-forget, doesn't block the user's chat. Skipped if too soon since last run.
-const _observerLastRun = {};  // sessionId -> ts of last observer fire
-const OBSERVER_COOLDOWN_MS = 30000;  // don't re-observe a session within 30s
-const OBSERVER_MIN_MESSAGES = 4;     // skip if conversation is trivial
-
-module.exports = { callOpenAI, runCheapClaude, _runCheapClaudeCli, _runCheapOpenAI };
+module.exports = { callOpenAI, runCheapClaude, extractFirstJson, _runCheapClaudeCli, _runCheapOpenAI };

@@ -1541,7 +1541,7 @@ const { sessionPermissions, loadPermissions, savePermissions, ensurePermissionsL
 // so the file shows up in the Files drawer without the agent having to do it.
 // Track file_path -> preview_id per session so we update instead of duplicating
 const { summarizeToolUse, autoCreatePreview, autoDetectBashFiles } = require("./src/tools");
-const { spawnObserver, spawnDecisionExtractor, spawnContractCheck, reconcileFileAttribution } = require("./src/supervisors");
+const { spawnDecisionExtractor, spawnContractCheck, reconcileFileAttribution } = require("./src/supervisors");
 const { runClaude, fireQueueHeadless, tryDrainQueue, killExistingClaudeFor } = require("./src/providers/claude");
 require("./src/ws/connection").registerWsHandlers();
 const PORT = process.env.PORT || 7683;

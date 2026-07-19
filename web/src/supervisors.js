@@ -1,7 +1,8 @@
 // Supervisors: the per-agent watchers (the downward axis of the agent model,
-// ARCHITECTURE.md §4). spawnObserver mines what the run did; spawnDecisionExtractor
-// records decisions; spawnContractCheck verifies the run actually finished;
-// reconcileFileAttribution settles which files it touched. Extracted 2026-06-10.
+// ARCHITECTURE.md §4). spawnObserver mines what the run did (disabled — see
+// note above it); spawnDecisionExtractor records decisions; spawnContractCheck
+// verifies the run actually finished; reconcileFileAttribution settles which
+// files it touched. Extracted 2026-06-10.
 const http = require("http");
 const path = require("path");
 const fs = require("fs");
@@ -12,6 +13,19 @@ const { runCheapClaude } = require("./cheap-model");
 const { logFileAttribution, buildAttributionMap, DRAWER_EXT_WHITELIST, DRAWER_EXCLUDED_DIRS } = require("./attribution");
 const { autoDetectBashFiles, autoCreatePreview } = require("./tools");
 
+// ── End-of-run observer (Tier 2 "supervisor pattern") — DISABLED ──
+// Disabled 2026-05-28 (snapshotted in commit 9285194): it enqueued duplicate
+// Opus tasks into the orchestratorHero queue with a 0% PR-ship rate. The only
+// call site (ws/connection.js) is commented out with the same note. Definition
+// kept for the planned redesign (reviewable diffs/PRs); deliberately NOT
+// exported — re-add the export if/when it's redesigned and re-enabled.
+// State moved here from cheap-model.js 2026-07-19 (stranded by the 2026-06-10
+// extraction, which left spawnObserver referencing them cross-file).
+const _observerLastRun = {};  // sessionId -> ts of last observer fire
+const OBSERVER_COOLDOWN_MS = 30000;  // don't re-observe a session within 30s
+const OBSERVER_MIN_MESSAGES = 4;     // skip if conversation is trivial
+
+// eslint-disable-next-line no-unused-vars -- kept (unexported) pending redesign, see note above
 function spawnObserver(sessionId, projectName) {
   try {
     if (!sessionId) return;
@@ -278,6 +292,27 @@ function reconcileFileAttribution(sessionOrId, projectNameOrStartTs, runStartTs)
   }
 }
 
+// Compact transcript for cheap-model prompts. This was the missing dependency
+// that killed the original auto-done judge: the judge's code referenced
+// buildRecentTranscript() but no version of the repo ever defined it, so the
+// judge always threw and was deleted as dead code in 5552153. Defined now
+// (reinstate, 2026-07-19); same shape as the inline builder in
+// spawnDecisionExtractor above.
+function buildRecentTranscript(msgs, opts) {
+  const maxChars = (opts && opts.maxChars) || 600;
+  return msgs.map(m => {
+    const r = (m.role || "").toUpperCase();
+    let t = m.text || m.summary || "";
+    if (r === "TOOL_ACTIVITY") {
+      t = `(${m.tool_name || "tool"}) ${String(t)}`.slice(0, 200);
+    } else {
+      t = String(t).slice(0, maxChars);
+    }
+    if (!t) return null;
+    return `${r}: ${t}`;
+  }).filter(Boolean).join("\n\n");
+}
+
 // ─── Contract-check supervisor (set + clear manualDone) ───────────────────
 // Fires after each assistant reply. Haiku judges whether the discrete task
 // the user asked for has wrapped up. Two-way arbiter:
@@ -391,9 +426,74 @@ function spawnContractCheck(sessionId, projectName) {
       return;
     }
 
-    // [removed 2026-06-11] contract-check auto-done Haiku judge — depended on
-    // buildRecentTranscript() which was never defined in any version, so this
-    // path always threw and the feature was dead. Clarifying-question clear above is kept.
+    // ── Auto-done cheap-model judge (reinstated 2026-07-19) ───────────────
+    // Deleted in 5552153 as dead code because it depended on the never-defined
+    // buildRecentTranscript() (now defined above). Reinstated because the
+    // ecosystem treats this as the enforcement layer for llmt_complete
+    // (CLAUDE.md "supervisor contract-check" + the saveMessage note in
+    // store.js both describe it as live). Conservative arbiter: acts only on
+    // a strict done:true / done:false verdict — parse failures never reach
+    // this callback (runCheapClaude drops them), and any other shape no-ops.
+    const lines = buildRecentTranscript(recent, { maxChars: 600 });
+    if (lines.length < 80) return;
+
+    const prompt = `You are deciding whether the agent has FINISHED its current discrete task in this chat. The user just got the assistant's most-recent reply. Output JSON ONLY:
+{"done": true|false, "reason": "short reason", "summary": "<one-line wrap-up of what was finished, ONLY if done=true, max 18 words>"}
+
+Mark done=true when ALL true:
+  - The assistant's last message is a concluding statement, not a question
+  - There is no pending action the agent could continue without user input
+  - The user's most recent ask has been substantively addressed
+  - The agent did not say it is "going to" / "about to" / "next will" do something
+
+Otherwise done=false.
+
+Conversation (NEWEST AT BOTTOM):
+${lines}`;
+
+    console.log("[contract-check] firing for", sessionId.slice(0,8), "(", recent.length, "msgs, wasDone=", wasDone, ")");
+    runCheapClaude(prompt, "contract-check", async (parsed) => {
+      if (!parsed || (parsed.done !== true && parsed.done !== false)) {
+        console.log("[contract-check]", sessionId.slice(0,8), "→ ambiguous verdict, no-op");
+        return;
+      }
+      const sessions2 = loadSessions();
+      const s2 = sessions2.find(x => x.id === sessionId);
+      if (!s2) return;
+      const msgs2 = loadMessages(sessionId);
+      const lastNow = msgs2[msgs2.length - 1];
+      // Abort if conversation moved on (a new message arrived during judge latency).
+      if (!lastNow || lastNow.ts !== last.ts) {
+        console.log("[contract-check]", sessionId.slice(0,8), "→ conversation moved on, aborting");
+        return;
+      }
+      if (parsed.done === true) {
+        if (s2.manualDone) {
+          console.log("[contract-check]", sessionId.slice(0,8), "→ DONE (already marked, preserving)");
+          return;
+        }
+        const summary = String(parsed.summary || "").trim().slice(0, 240);
+        s2.manualDone = Date.now();
+        saveSessions(sessions2);
+        if (summary && !lastText.includes(summary.slice(0, 30))) {
+          try { saveMessage(sessionId, { role: "assistant", text: "✓ " + summary, ts: Date.now(), source: "contract_check" }); }
+          catch (e) { console.warn("[contract-check] append failed:", e.message); }
+        }
+        try { broadcastToSession(sessionId, { type: "history", messages: loadMessages(sessionId) }); } catch {}
+        console.log("[contract-check]", sessionId.slice(0,8), "→ DONE:", summary || "(no summary)");
+      } else {
+        if (s2.manualDone && s2.doneSource !== "mcp") {
+          delete s2.manualDone; delete s2.doneSource;
+          saveSessions(sessions2);
+          try { broadcastToSession(sessionId, { type: "history", messages: loadMessages(sessionId) }); } catch {}
+          console.log("[contract-check]", sessionId.slice(0,8), "→ CLEARED:", parsed.reason || "(work resumed)");
+        } else if (s2.manualDone && s2.doneSource === "mcp") {
+          console.log("[contract-check]", sessionId.slice(0,8), "→ keeping MCP-set done (judge disagreed but llmt_complete takes precedence)");
+        } else {
+          console.log("[contract-check]", sessionId.slice(0,8), "→ not done:", parsed.reason || "");
+        }
+      }
+    }, projectName);
   } catch (e) {
     console.error("[contract-check] outer error:", e.message);
   }
@@ -403,4 +503,5 @@ function spawnContractCheck(sessionId, projectName) {
 // broadcasts to any clients that join mid-run. Mirrors sendToSession logic
 // without the WS-specific streaming layer.
 
-module.exports = { spawnObserver, spawnDecisionExtractor, spawnContractCheck, reconcileFileAttribution };
+// spawnObserver deliberately not exported — disabled 2026-05-28, see its note.
+module.exports = { spawnDecisionExtractor, spawnContractCheck, reconcileFileAttribution };
