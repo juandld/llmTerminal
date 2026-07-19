@@ -20,6 +20,7 @@ const { summarizeToolUse, autoCreatePreview, autoDetectBashFiles } = require("..
 const { logFileAttribution } = require("../attribution");
 const { saveUploadedImage } = require("../uploads");
 const governor = require("../governor");
+const attention = require("../attention");
 
 // Answered-ness guard, shared by every automated re-fire in onDone below: the
 // most-recent user message already has a real assistant response (stalled
@@ -455,6 +456,12 @@ getWss().on("connection", (ws, req) => {
           const isApiError = data.is_error === true || /^API Error:\s*\d{3}/.test(result);
           gotResult = true;
           if (isApiError) {
+            // Token-limit protocol (call-for-David A): a session/usage-limit
+            // result arms an auto-resume wake at reset+7min + files a
+            // low-urgency secretary item. No-op for every other API error;
+            // must never break the error handling below.
+            try { attention.handleTokenLimitError(session.id, result); }
+            catch (e) { console.warn("[token-limit] hook failed:", e.message); }
             const statusCode = apiErrorMatch ? apiErrorMatch[1] : "";
             const requestId = apiErrorMatch ? (apiErrorMatch[3] || "") : "";
             // Model-unavailable detection: Anthropic returns a friendly

@@ -12,6 +12,7 @@ const { broadcastToSession } = require("./ws/broadcast");
 const { runCheapClaude } = require("./cheap-model");
 const { logFileAttribution, buildAttributionMap, DRAWER_EXT_WHITELIST, DRAWER_EXCLUDED_DIRS } = require("./attribution");
 const { autoDetectBashFiles, autoCreatePreview } = require("./tools");
+const { postSecretaryItem } = require("./attention");
 
 // ── End-of-run observer (Tier 2 "supervisor pattern") — DISABLED ──
 // Disabled 2026-05-28 (snapshotted in commit 9285194): it enqueued duplicate
@@ -437,8 +438,8 @@ function spawnContractCheck(sessionId, projectName) {
     const lines = buildRecentTranscript(recent, { maxChars: 600 });
     if (lines.length < 80) return;
 
-    const prompt = `You are deciding whether the agent has FINISHED its current discrete task in this chat. The user just got the assistant's most-recent reply. Output JSON ONLY:
-{"done": true|false, "reason": "short reason", "summary": "<one-line wrap-up of what was finished, ONLY if done=true, max 18 words>"}
+    const prompt = `You are deciding whether the agent has FINISHED its current discrete task in this chat, and whether David (the human) is needed RIGHT NOW. The user just got the assistant's most-recent reply. Output JSON ONLY:
+{"done": true|false, "reason": "short reason", "summary": "<one-line wrap-up: what was finished (if done) or where things stand (if not), max 18 words>", "needs_david_now": true|false, "david_ask": "<the ONE thing David must do right now, or null>"}
 
 Mark done=true when ALL true:
   - The assistant's last message is a concluding statement, not a question
@@ -448,11 +449,34 @@ Mark done=true when ALL true:
 
 Otherwise done=false.
 
+Set needs_david_now=true ONLY when the run is blocked on something ONLY David can do (a decision, an approval, an auth/credentials grant, a tap on his device) or the agent explicitly asked him to act and he has not. Routine completions and work the agent can continue on its own are needs_david_now=false. If false, david_ask MUST be null; if true, david_ask is ONE imperative sentence naming the exact action.
+
 Conversation (NEWEST AT BOTTOM):
 ${lines}`;
 
     console.log("[contract-check] firing for", sessionId.slice(0,8), "(", recent.length, "msgs, wasDone=", wasDone, ")");
     runCheapClaude(prompt, "contract-check", async (parsed) => {
+      // ── Needs-you → secretary routing (call-for-David C) ────────────────
+      // Strictly literal: needs_david_now === true (the boolean) AND a
+      // non-empty string ask. Anything else — "yes", 1, missing, null/blank
+      // ask — is a no-op. Runs ALONGSIDE the done/manualDone arbiter below,
+      // never instead of it; a posting failure never blocks the arbiter.
+      try {
+        if (parsed && parsed.needs_david_now === true &&
+            typeof parsed.david_ask === "string" && parsed.david_ask.trim()) {
+          const _sNow = loadSessions().find(x => x.id === sessionId);
+          const _title = (_sNow && _sNow.title) ? String(_sNow.title).slice(0, 120) : sessionId.slice(0, 8);
+          postSecretaryItem({
+            sessionId,
+            urgency: "high",
+            title: "Needs you: " + _title,
+            ask: parsed.david_ask.trim(),
+            observation: String(parsed.summary || "").trim(),
+            attentionMinutes: 4,
+          });
+          console.log("[contract-check]", sessionId.slice(0, 8), "→ NEEDS-YOU routed to secretary:", parsed.david_ask.trim().slice(0, 80));
+        }
+      } catch (e) { console.warn("[contract-check] needs-you routing failed:", e.message); }
       if (!parsed || (parsed.done !== true && parsed.done !== false)) {
         console.log("[contract-check]", sessionId.slice(0,8), "→ ambiguous verdict, no-op");
         return;

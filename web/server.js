@@ -197,6 +197,11 @@ function sweepStalledSessions() {
         saveMessage(s.id, { role: "assistant", text: note, ts: now, recovered: true, stalled: true });
         try { broadcastToSession(s.id, { type: "history", messages: loadMessages(s.id) }); } catch {}
         console.log("[stalled-sweep] dead mid-run, marked:", s.id, v.legacy ? "(legacy-age fallback)" : "(pid " + v.pid + ", exit " + v.exitCode + ")", "—", runLedger.evidence(s.id));
+        // Dead-run auto-continuation (call-for-David B): same revive/cap logic
+        // as the in-proc onClose hook, for deaths only the sweep can see
+        // (procs SIGKILLed with the server, orphans with no close handler).
+        try { require("./src/attention").handleDeadRun(s.id, { claudeSessionId: s.claudeSessionId, exitCode: v.exitCode, cause: "stalled" }); }
+        catch (e) { console.warn("[auto-continue] sweep hook failed:", e.message); }
         marked++;
       }
       // working / waiting_tool / paused_until / awaiting_user / idle → leave alone

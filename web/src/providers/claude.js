@@ -20,6 +20,7 @@ const throttle = require("../throttle");
 const runReg = require("../run-registry");
 const governor = require("../governor");
 const runLedger = require("../run-ledger");
+const attention = require("../attention");
 
 // ---- Transient rate-limit auto-throttle + retry ----
 // On a *transient* server-side throttle we back off and re-run the same turn via
@@ -169,6 +170,12 @@ function fireQueueHeadless(sessionId) {
         if (isApiError) {
           broadcastToSession(sessionId, { type: "api_error", message: result.slice(0, 500), session_id: sessionId });
           saveMessage(sessionId, { role: "api_error", text: result.slice(0, 500), ts: Date.now() });
+          // Token-limit protocol (call-for-David A): a session/usage-limit
+          // result arms an auto-resume wake at reset+7min + files a
+          // low-urgency secretary item. No-op for every other API error;
+          // must never break the error path.
+          try { attention.handleTokenLimitError(sessionId, result); }
+          catch (e) { console.warn("[token-limit] hook failed:", e.message); }
         } else {
           let _resultClean = result.replace(/```email-draft\n[\s\S]*?\n```\s*/g, "").trim();
           if (_resultClean) {
@@ -205,6 +212,12 @@ function fireQueueHeadless(sessionId) {
             ? "⚠️ The agent stopped mid-run without producing a final response. Re-prompt to continue."
             : "⚠️ The agent process exited (code " + code + ") before producing a final response. Re-prompt to retry.";
           saveMessage(sessionId, { role: "assistant", text: note, ts: Date.now(), recovered: true, stalled: true });
+          // Dead-run auto-continuation (call-for-David B): revive the task
+          // through the queue unless this death was our own user-message
+          // replacement kill; hard cap 2 revives/6h, secretary escalation
+          // on the second death. All checks live in attention.handleDeadRun.
+          try { attention.handleDeadRun(sessionId, { claudeSessionId: session.claudeSessionId, exitCode: code, cause: "exit" }); }
+          catch (e) { console.warn("[auto-continue] hook failed:", e.message); }
         }
       }
       broadcastToSession(sessionId, { type: "idle", session_id: sessionId });
@@ -265,6 +278,10 @@ function tryDrainQueue(sessionId) {
 // claude survives across the restart.
 function killExistingClaudeFor(claudeSessionId) {
   if (!claudeSessionId || !/^[A-Za-z0-9-]{8,}$/.test(claudeSessionId)) return;
+  // Call-for-David B instrumentation: any death of this CLI session observed
+  // within ~15s of this mark is OUR replacement kill (a new user message is
+  // about to run) — the dead-run auto-continuer must not also revive it.
+  attention.noteReplaceKill(claudeSessionId);
   try {
     const cmd = 'pkill -TERM -f "claude.*--resume ' + claudeSessionId + '" || true';
     require("child_process").execSync(cmd, { stdio: "ignore", shell: "/bin/bash" });
