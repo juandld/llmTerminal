@@ -124,7 +124,10 @@ function fireQueueHeadless(sessionId) {
             }
             if (block.type === "tool_use") {
               lastToolUse = { name: block.name, input: block.input, id: block.id };
-              if (emailDraft.isDraftToolUse(block)) pendingDrafts.add(block.id);
+              if (emailDraft.isDraftToolUse(block)) {
+                pendingDrafts.add(block.id);
+                emailDraft.noteRequested(block, sessionId, "queue-drain");
+              }
               if (["Write","Edit","MultiEdit","NotebookEdit"].includes(block.name))
                 pendingPreviews[block.id] = { tool_name: block.name, input: block.input };
               if (block.name === "Bash")
@@ -176,6 +179,8 @@ function fireQueueHeadless(sessionId) {
       }
       if (data.type === "result") {
         gotResult = true;
+        // Anything still pending here was requested and never captured.
+        emailDraft.reconcile(pendingDrafts, sessionId, session.project, "queue-drain");
         // Release the per-session busy lock on model-idle (not OS-proc-close)
         // and drain immediately. Mirrors the same fix in ws/connection.js —
         // without this, MCP shutdown lag (Playwright especially) keeps the

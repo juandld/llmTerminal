@@ -248,6 +248,7 @@ getWss().on("connection", (ws, req) => {
                 // Track draft_email so we forward the result as a special message
                 if (emailDraft.isDraftToolUse(block)) {
                   pendingDrafts.add(block.id);
+                  emailDraft.noteRequested(block, session.id, "ws-attached");
                 }
                 // Pin attribution for llmt_show_file so the file appears in the
                 // chat-scoped drawer. The MCP tool POSTs to orchestratorHero's
@@ -352,6 +353,8 @@ getWss().on("connection", (ws, req) => {
           wsSend(ws, "tool_result", { name: data.tool_name || "", content: data.content || "" });
         }
         if (data.type === "result") {
+          // Anything still pending here was requested and never captured.
+          emailDraft.reconcile(pendingDrafts, session.id, session.project, "ws-attached");
           // Release the per-session busy lock NOW (model turn done) instead of
           // waiting for `proc.on("close")`. The claude CLI's MCP-server shutdown
           // (Playwright in particular) can hang minutes after the result event,

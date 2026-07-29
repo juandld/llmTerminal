@@ -103,6 +103,43 @@ check("incomplete payload is rejected, not half-saved", () => {
   assert.strictEqual(after, before, "a draft with no subject/body was persisted anyway");
 });
 
+// ── 4. Tracking: a lost draft must never be silent again ──────────────────
+for (const rel of RUNNERS) {
+  const src = fs.readFileSync(path.join(WEB, rel), "utf8");
+  check(`${rel} ledgers the draft request`, () => {
+    assert(src.includes("noteRequested"), "does not record the draft request");
+  });
+  check(`${rel} reconciles pending drafts at end of run`, () => {
+    assert(src.includes("emailDraft.reconcile("), "no reconcile() — a lost draft would be silent");
+  });
+}
+
+check("reconcile marks lost drafts in ledger, journal AND chat", () => {
+  const pending = new Set(["toolu_never_captured"]);
+  const errs = [];
+  const realErr = console.error;
+  console.error = (...a) => errs.push(a.join(" "));
+  let n;
+  try { n = emailDraft.reconcile(pending, SID, "orchestratorHero", "test-path"); }
+  finally { console.error = realErr; }
+  assert.strictEqual(n, 1, "reconcile did not report the lost draft");
+  assert.strictEqual(pending.size, 0, "pending set not cleared");
+  assert(errs.some(e => e.includes("LOST")), "nothing logged to the journal");
+  const marker = loadMessages(SID).filter(m => m.synthetic === "email-draft-lost");
+  assert.strictEqual(marker.length, 1, "the loss was not surfaced in the chat");
+  const led = fs.readFileSync(emailDraft.LEDGER, "utf8").trim().split("\n");
+  const last = JSON.parse(led[led.length - 1]);
+  assert.strictEqual(last.event, "lost");
+  assert.strictEqual(last.run_path, "test-path", "ledger does not record WHICH path lost it");
+});
+
+check("reconcile is a no-op when everything was captured", () => {
+  const before = loadMessages(SID).filter(m => m.synthetic === "email-draft-lost").length;
+  assert.strictEqual(emailDraft.reconcile(new Set(), SID, "crankHero", "test-path"), 0);
+  const after = loadMessages(SID).filter(m => m.synthetic === "email-draft-lost").length;
+  assert.strictEqual(after, before, "clean run produced a false loss alarm");
+});
+
 // Clean up the synthetic session's rows.
 try {
   const { db } = require(path.join(WEB, "src/store.js"));

@@ -18,10 +18,35 @@
 // for whoever happens to be watching. Any future runner (a third provider, a
 // cron executor) gets correct behaviour by calling into here rather than
 // re-deriving it — that duplication is exactly what broke this.
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
 const { saveMessage } = require("./store");
 const { broadcastToSession } = require("./ws/broadcast");
 
 const DRAFT_TOOL = "mcp__crankhero-draft__draft_email";
+
+// ── Ledger ────────────────────────────────────────────────────────────────
+// Every draft's lifecycle, appended as JSON lines. The failure this module was
+// written for was invisible for months: 401 draft tool calls, 363 cards, and
+// nothing anywhere recording the difference. Silence is the bug; a draft that
+// dies must now leave a body.
+//
+//   requested — the model called the draft tool (tool_use seen)
+//   saved     — persisted + pushed (the good path)
+//   lost      — the run ended with a requested draft never captured  ← ALARM
+//   orphan    — a payload arrived for a call we never saw requested
+const LEDGER = path.join(os.homedir(), ".llm-terminal", "draft-ledger.jsonl");
+
+function ledger(event, fields) {
+  const row = Object.assign({ at: new Date().toISOString(), event }, fields);
+  try {
+    fs.appendFileSync(LEDGER, JSON.stringify(row) + "\n");
+  } catch (e) {
+    console.error("[email_draft] ledger append failed:", e.message);
+  }
+  return row;
+}
 
 // Matches the ```email-draft fenced block emitted by the /draft-email skill
 // (the non-MCP path). Global + non-greedy: a turn may carry several.
@@ -40,6 +65,45 @@ function defaultFromAccountForProject(project) {
 // True when this tool_use block is a draft call whose result we must capture.
 function isDraftToolUse(block) {
   return !!block && block.type === "tool_use" && block.name === DRAFT_TOOL;
+}
+
+// Record the intent to draft, at the moment the model asks for it. Pairs with
+// reconcile() below: anything requested and not saved is a LOST draft.
+// `runPath` names which of the two stream loops is handling this run, so the
+// ledger says WHERE a loss happened, not just that one did.
+function noteRequested(block, sessionId, runPath) {
+  ledger("requested", { session_id: sessionId, tool_use_id: block.id,
+                        to: (block.input && block.input.to) || null,
+                        subject: (block.input && block.input.subject) || null,
+                        run_path: runPath });
+}
+
+// Called when a run ends. Any tool_use id still pending was requested and never
+// captured — the exact silent-loss shape. Make it loud in three places at once:
+// the ledger (durable), the journal (operator), and the chat itself (David),
+// because the whole failure mode was that none of the three said anything.
+function reconcile(pendingDrafts, sessionId, project, runPath) {
+  if (!pendingDrafts || pendingDrafts.size === 0) return 0;
+  const lost = [...pendingDrafts];
+  pendingDrafts.clear();
+  for (const id of lost) {
+    ledger("lost", { session_id: sessionId, tool_use_id: id, run_path: runPath, project });
+    console.error(`[email_draft] LOST — draft requested (${id}) but no card was ` +
+                  `captured for session ${sessionId} on ${runPath}. See ${LEDGER}`);
+  }
+  try {
+    saveMessage(sessionId, {
+      role: "assistant",
+      text: `⚠ ${lost.length} email draft(s) were produced but did not reach you as an ` +
+            `action card. Nothing was sent. Re-prompt to regenerate. ` +
+            `(logged to draft-ledger.jsonl, run path: ${runPath})`,
+      ts: Date.now(),
+      synthetic: "email-draft-lost",
+    });
+  } catch (e) {
+    console.error("[email_draft] could not surface the loss in chat:", e.message);
+  }
+  return lost.length;
 }
 
 // Normalise a raw draft payload into the wire/DB shape. Returns null when the
@@ -81,6 +145,8 @@ function emitDraft(payload, sessionId, project) {
   } catch (e) {
     console.error("[email_draft] broadcast failed (draft IS saved, will replay on reconnect):", e.message);
   }
+  ledger("saved", { session_id: sessionId, to: draft.to, subject: draft.subject,
+                    project, ts: draft.ts });
   console.log(`[email_draft] captured for ${sessionId}: "${draft.subject.slice(0, 60)}" -> ${draft.to}`);
   return draft;
 }
@@ -127,8 +193,11 @@ function captureFences(text, sessionId, project) {
 
 module.exports = {
   DRAFT_TOOL,
+  LEDGER,
   defaultFromAccountForProject,
   isDraftToolUse,
+  noteRequested,
+  reconcile,
   emitDraft,
   captureToolResult,
   captureFences,
