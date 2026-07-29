@@ -21,6 +21,8 @@ const { logFileAttribution } = require("../attribution");
 const { saveUploadedImage } = require("../uploads");
 const governor = require("../governor");
 const attention = require("../attention");
+const emailDraft = require("../email-draft");
+const { defaultFromAccountForProject } = require("../email-draft");
 
 // Answered-ness guard, shared by every automated re-fire in onDone below: the
 // most-recent user message already has a real assistant response (stalled
@@ -36,15 +38,8 @@ function _lastPromptAnswered(msgs) {
   return msgs.slice(lui + 1).some(m => (m.role === "assistant" && !m.stalled) || m.role === "interrupted");
 }
 
-// Map session.project -> default camoHero sending account.
-// Every send still goes through camoHero/scripts/send_gmail_email.py — this
-// just picks the right identity ("From:") for the session context.
-function defaultFromAccountForProject(project) {
-  const p = String(project || "").toLowerCase();
-  if (p === "camohero") return "camofiles";
-  // crankHero, narrativeHero, orchestratorHero, langHero, etc. → David's primary identity
-  return "crankwheel";
-}
+// defaultFromAccountForProject now lives in ../email-draft (imported above) so
+// the WS-attached and headless draft paths share ONE definition.
 
 function registerWsHandlers() {
 getWss().on("connection", (ws, req) => {
@@ -168,6 +163,7 @@ getWss().on("connection", (ws, req) => {
     let lastToolUse = null;
     const pendingPreviews = {}; // tool_use_id -> {tool_name, input}
     const pendingDrafts = new Set(); // tool_use_id awaiting draft payload
+    let _draftCapturedThisTurn = false;
     let seenQuestionSig = null;
     // Track whether the run produced a final result (assistant reply) or an
     // explicit api_error. If neither happens before the process closes, the
@@ -230,42 +226,8 @@ getWss().on("connection", (ws, req) => {
                 // /draft-email skill. Parse → emit an email_draft action card
                 // → strip the raw fence so it doesn't render as code-block
                 // noise alongside the card (the "doubled" bug).
-                let _emittedText = block.text;
-                const _edRe = /```email-draft\n([\s\S]*?)\n```\s*/g;
-                const _edMatches = [..._emittedText.matchAll(_edRe)];
-                if (_edMatches.length) {
-                  for (const _m of _edMatches) {
-                    try {
-                      const payload = JSON.parse(_m[1]);
-                      if (payload.to && payload.subject && payload.body) {
-                        const draftMsg = { type: "email_draft",
-                          to: payload.to || "", cc: payload.cc || "",
-                          subject: payload.subject || "", body: payload.body || "",
-                          thread_id: payload.thread_id || "",
-                          reply_mode: payload.reply_mode || "",
-                          thread_participants: Array.isArray(payload.thread_participants) ? payload.thread_participants : [],
-                          attachments: Array.isArray(payload.attachments) ? payload.attachments : [],
-                          project: session.project,
-                          default_from_account: defaultFromAccountForProject(session.project),
-                          ts: Date.now() };
-                        wsSend(ws, draftMsg);
-                        saveMessage(session.id, { role: "email_draft",
-                          to: draftMsg.to, cc: draftMsg.cc,
-                          subject: draftMsg.subject, body: draftMsg.body,
-                          thread_id: draftMsg.thread_id,
-                          reply_mode: draftMsg.reply_mode,
-                          thread_participants: draftMsg.thread_participants,
-                          attachments: draftMsg.attachments,
-                          project: draftMsg.project,
-                          default_from_account: draftMsg.default_from_account,
-                          ts: draftMsg.ts });
-                      }
-                    } catch (e) {
-                      console.error("[email_draft] skill-block parse failed:", e.message);
-                    }
-                  }
-                  _emittedText = _emittedText.replace(_edRe, "").trim();
-                }
+                const _emittedText = emailDraft.captureFences(block.text, session.id, session.project);
+                if (_emittedText !== block.text) _draftCapturedThisTurn = true;
                 if (_emittedText) wsSend(ws, "text", { text: _emittedText });
               }
               if (block.type === "tool_use") {
@@ -284,7 +246,7 @@ getWss().on("connection", (ws, req) => {
                 // not mean it belongs to this chat — that just leaked cross-project
                 // files. Pinning on Read disabled intentionally.
                 // Track draft_email so we forward the result as a special message
-                if (block.name === "mcp__crankhero-draft__draft_email") {
+                if (emailDraft.isDraftToolUse(block)) {
                   pendingDrafts.add(block.id);
                 }
                 // Pin attribution for llmt_show_file so the file appears in the
@@ -362,41 +324,10 @@ getWss().on("connection", (ws, req) => {
               // Sentinel for the original if (don't re-process the close brace below)
               const _scanned = true;
             }
-            // Email draft: forward structured payload to client as a special message
-            if (block.type === "tool_result" && block.tool_use_id && pendingDrafts.has(block.tool_use_id)) {
-              pendingDrafts.delete(block.tool_use_id);
-              if (!block.is_error) {
-                let raw = block.content;
-                if (Array.isArray(raw)) raw = (raw[0] && raw[0].text) || "";
-                try {
-                  const payload = JSON.parse(raw);
-                  if (payload && payload.type === "email_draft") {
-                    const draftMsg = { type: "email_draft",
-                      to: payload.to || "", cc: payload.cc || "",
-                      subject: payload.subject || "", body: payload.body || "",
-                      thread_id: payload.thread_id || "",
-                      reply_mode: payload.reply_mode || "",
-                      thread_participants: Array.isArray(payload.thread_participants) ? payload.thread_participants : [],
-                      attachments: Array.isArray(payload.attachments) ? payload.attachments : [],
-                      project: session.project,
-                      default_from_account: defaultFromAccountForProject(session.project),
-                      ts: Date.now() };
-                    wsSend(ws, draftMsg);
-                    saveMessage(session.id, { role: "email_draft",
-                      to: draftMsg.to, cc: draftMsg.cc,
-                      subject: draftMsg.subject, body: draftMsg.body,
-                      thread_id: draftMsg.thread_id,
-                      reply_mode: draftMsg.reply_mode,
-                      thread_participants: draftMsg.thread_participants,
-                      attachments: draftMsg.attachments,
-                      project: draftMsg.project,
-                      default_from_account: draftMsg.default_from_account,
-                      ts: draftMsg.ts });
-                  }
-                } catch (e) {
-                  console.error("[email_draft] parse failed:", e.message);
-                }
-              }
+            // Email draft: persist + push the action card (shared with the
+            // headless runner in providers/claude.js).
+            if (emailDraft.captureToolResult(block, pendingDrafts, session.id, session.project)) {
+              _draftCapturedThisTurn = true;
             }
             if (block.type === "tool_result" && block.is_error &&
                 typeof block.content === "string" &&
@@ -490,7 +421,15 @@ getWss().on("connection", (ws, req) => {
             // Strip any ```email-draft fences from the final assistant text —
             // the card already rendered live; persisting the fence in the
             // assistant message would re-render it as raw code on reload.
-            let _resultClean = result.replace(/```email-draft\n[\s\S]*?\n```\s*/g, "").trim();
+            // But strip ONLY what we actually captured: if no draft landed this
+            // turn, `result` is the last surviving copy and deleting it loses
+            // the draft outright (the 2026-07-29 bug, headless variant).
+            let _resultClean;
+            if (result.indexOf("```email-draft") !== -1 && !_draftCapturedThisTurn) {
+              _resultClean = emailDraft.captureFences(result, session.id, session.project);
+            } else {
+              _resultClean = result.replace(/```email-draft\n[\s\S]*?\n```\s*/g, "").trim();
+            }
             if (_resultClean) {
               saveMessage(session.id, { role: "assistant", text: _resultClean, ts: Date.now(), cost: data.total_cost_usd, duration: data.duration_ms });
               // Title on the first exchange, then refresh every ~3 user turns so a

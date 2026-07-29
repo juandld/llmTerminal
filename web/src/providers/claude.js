@@ -21,6 +21,11 @@ const runReg = require("../run-registry");
 const governor = require("../governor");
 const runLedger = require("../run-ledger");
 const attention = require("../attention");
+// Draft capture lives in ONE module (src/email-draft.js) precisely because this
+// headless runner and ws/connection.js are parallel copies of the same stream
+// loop. This path had no draft handling at all until 2026-07-29, so every draft
+// written while no browser was attached was silently discarded.
+const emailDraft = require("../email-draft");
 
 // ---- Transient rate-limit auto-throttle + retry ----
 // On a *transient* server-side throttle we back off and re-run the same turn via
@@ -92,6 +97,8 @@ function fireQueueHeadless(sessionId) {
   let lastToolUse = null;
   let gotResult = false;
   const pendingPreviews = {};
+  const pendingDrafts = new Set(); // tool_use_id awaiting draft payload
+  let _draftCapturedThisTurn = false;
   const proc = _runFn(
     _runArgs,
     (data) => {
@@ -108,10 +115,16 @@ function fireQueueHeadless(sessionId) {
           for (const block of content) {
             if (block.type === "text" && block.text) {
               _assistantTextEmittedThisTurn = true;
-              broadcastToSession(sessionId, { type: "text", text: block.text, session_id: sessionId });
+              // Capture (and strip) any ```email-draft fences BEFORE emitting —
+              // the result path below strips them unconditionally, so skipping
+              // capture here means the draft is deleted with nothing saved.
+              const _txt = emailDraft.captureFences(block.text, sessionId, session.project);
+              if (_txt !== block.text) _draftCapturedThisTurn = true;
+              if (_txt) broadcastToSession(sessionId, { type: "text", text: _txt, session_id: sessionId });
             }
             if (block.type === "tool_use") {
               lastToolUse = { name: block.name, input: block.input, id: block.id };
+              if (emailDraft.isDraftToolUse(block)) pendingDrafts.add(block.id);
               if (["Write","Edit","MultiEdit","NotebookEdit"].includes(block.name))
                 pendingPreviews[block.id] = { tool_name: block.name, input: block.input };
               if (block.name === "Bash")
@@ -154,6 +167,11 @@ function fireQueueHeadless(sessionId) {
               if (txt && /\/home\/claude-user\/projects\//.test(txt)) autoDetectBashFiles(txt, sessionId, cwd);
             } catch {}
           }
+          // Email draft: persist + push the action card. Same call as the
+          // WS-attached path in ws/connection.js.
+          if (emailDraft.captureToolResult(block, pendingDrafts, sessionId, session.project)) {
+            _draftCapturedThisTurn = true;
+          }
         }
       }
       if (data.type === "result") {
@@ -177,7 +195,17 @@ function fireQueueHeadless(sessionId) {
           try { attention.handleTokenLimitError(sessionId, result); }
           catch (e) { console.warn("[token-limit] hook failed:", e.message); }
         } else {
-          let _resultClean = result.replace(/```email-draft\n[\s\S]*?\n```\s*/g, "").trim();
+          // Last-chance capture: `result` repeats the final assistant text, so
+          // normally the fence was already captured (and stripped) above and
+          // this is a plain strip. But if the text block never streamed, this
+          // is the only copy — capture rather than delete. Guarded on
+          // "did we already save one this turn" so it can't double-card.
+          let _resultClean;
+          if (result.indexOf("```email-draft") !== -1 && !_draftCapturedThisTurn) {
+            _resultClean = emailDraft.captureFences(result, sessionId, session.project);
+          } else {
+            _resultClean = result.replace(/```email-draft\n[\s\S]*?\n```\s*/g, "").trim();
+          }
           if (_resultClean) {
             saveMessage(sessionId, { role: "assistant", text: _resultClean, ts: Date.now(), cost: data.total_cost_usd, duration: data.duration_ms });
             try {
