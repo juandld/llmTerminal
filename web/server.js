@@ -68,6 +68,7 @@ const {
 // Send a JSON payload to a single WebSocket, swallowing errors (client may have disconnected).
 // ---- Image uploads ----
 const { activeProcs, activeProcBySession } = require("./src/proc-state");
+const deferredRestart = require("./src/deferred-restart");
 const { runOpenAI } = require("./src/providers/openai");
 const { runGoogle } = require("./src/providers/google");
 const { getProvider } = require("./src/providers/context");
@@ -519,6 +520,37 @@ app.get("/api/drawer-files", (req, res) => {
       }
     }
   } catch (e) { console.error("[drawer-files] voice-note scan failed:", e.message); }
+
+  // User-uploaded files: live in DATA_DIR/uploads/ (outside PROJECTS_DIR), so
+  // they're missed by _drawerWalkProjectFull. Attribution is always written by
+  // the /upload endpoint, so a strict JSONL lookup is enough — no filename-ts
+  // fallback needed.
+  try {
+    const upDir = path.join(DATA_DIR, "uploads");
+    if (fs.existsSync(upDir)) {
+      for (const fname of fs.readdirSync(upDir)) {
+        if (!fname.startsWith("up_")) continue; // ignore image uploads (img_*) — they're inlined into prompts, not drawer files
+        const full = path.join(upDir, fname);
+        const owner = attribution.get(full)?.sessionId || null;
+        if (!owner || !targetIds.has(owner)) continue;
+        try {
+          const stat = fs.statSync(full);
+          const sess = allSessionsById.get(owner);
+          fileMap.set(full, {
+            path: full,
+            ext: path.extname(fname).toLowerCase(),
+            mtime_ms: stat.mtimeMs,
+            size: stat.size,
+            title: fname.replace(/^up_\d+_[0-9a-f]+_/, ""),
+            source_session_id: owner,
+            source_session_title: sess?.title || "",
+            kind: "upload",
+            attributed_by: "jsonl",
+          });
+        } catch {}
+      }
+    }
+  } catch (e) { console.error("[drawer-files] upload scan failed:", e.message); }
 
   const arr = [...fileMap.values()].sort((a, b) => b.mtime_ms - a.mtime_ms).slice(0, DRAWER_RESULT_CAP);
   res.json({ files: arr });
@@ -1039,6 +1071,140 @@ app.post("/voice-note", express.raw({ type: ["audio/*", "application/octet-strea
 // Serve voice note audio files
 app.use("/voice-notes", express.static(VOICE_DIR));
 
+// ---- Arbitrary file upload (call recordings, PDFs, docs, anything) ----
+// Mirrors the voice-note flow: nonce-gated to the current WS session, saved
+// to disk, attributed to the chat, then queued as a synthetic user message
+// so Claude picks it up on the next drain. Audio is auto-transcribed via
+// Whisper (same key as voice-notes) when ≤25MB.
+const UPLOAD_DIR = path.join(DATA_DIR, "uploads");
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
+function _isAudioMime(mt) {
+  if (!mt) return false;
+  return mt.startsWith("audio/") || mt === "video/mp4" || mt === "video/webm";
+}
+function _humanSize(bytes) {
+  if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+  if (bytes >= 1024) return Math.round(bytes / 1024) + " KB";
+  return bytes + " B";
+}
+async function _transcribeAudioBuffer(buf, filenameForApi, mimeType) {
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) return { transcript: null, error: "OPENAI_API_KEY not set" };
+  const boundary = "----UpBoundary" + crypto.randomBytes(8).toString("hex");
+  const parts = [
+    `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${filenameForApi}"\r\nContent-Type: ${mimeType || "audio/mp4"}\r\n\r\n`,
+    buf,
+    `\r\n--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\nwhisper-1`,
+    `\r\n--${boundary}--\r\n`,
+  ];
+  const body = Buffer.concat(parts.map(p => typeof p === "string" ? Buffer.from(p) : p));
+  const t0 = Date.now();
+  const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    method: "POST",
+    headers: { "Authorization": "Bearer " + key, "Content-Type": "multipart/form-data; boundary=" + boundary },
+    body,
+  });
+  if (!r.ok) {
+    const errText = await r.text();
+    console.error("[upload] whisper error", r.status, errText.slice(0, 500));
+    return { transcript: null, error: "whisper HTTP " + r.status };
+  }
+  const result = await r.json();
+  console.log(`[upload] transcribed in ${Date.now()-t0}ms: "${(result.text||"").slice(0, 80)}..."`);
+  return { transcript: result.text || "", error: null };
+}
+
+app.post("/upload", express.raw({ type: "*/*", limit: "150mb" }), async (req, res) => {
+  try {
+    if (!req.body || req.body.length === 0) return res.status(400).json({ error: "no file data" });
+    // Same nonce/session routing as /voice-note.
+    const _nonce = (req.query && req.query.nonce) || "";
+    const _sidParam = (req.query && req.query.session) || "";
+    let _routedSid = "";
+    let _routingMode = "";
+    if (_nonce) {
+      const resolved = resolveVoiceNonce(_nonce);
+      if (!resolved) {
+        console.warn(`[upload] REJECTED — nonce=${_nonce.slice(0,8)}… expired or WS closed`);
+        return res.status(401).json({ error: "upload nonce invalid — the chat may have closed. Refresh and try again.", stale_nonce: true });
+      }
+      _routedSid = resolved.sessionId;
+      _routingMode = "nonce";
+    } else if (_sidParam) {
+      const allSessions = loadSessions();
+      if (!allSessions.some(s => s.id === _sidParam)) {
+        console.warn(`[upload] REJECTED — ghost session_id=${_sidParam.slice(0,8)}…`);
+        return res.status(404).json({ error: "session_id not found — upload not routed. Refresh the chat and try again.", ghost_session_id: _sidParam });
+      }
+      _routedSid = _sidParam;
+      _routingMode = "legacy-session";
+    }
+    if (!_routedSid) return res.status(400).json({ error: "no active chat session for upload" });
+
+    const origName = ((req.query && req.query.filename) || "upload.bin").toString();
+    const mimeType = ((req.headers["content-type"] || "application/octet-stream").split(";")[0] || "").trim().toLowerCase();
+    // Sanitize: strip path bits, restrict charset, cap length.
+    const baseName = path.basename(origName).replace(/[^a-zA-Z0-9._-]/g, "_").slice(-80) || "upload.bin";
+    const name = "up_" + Date.now() + "_" + crypto.randomBytes(3).toString("hex") + "_" + baseName;
+    const filePath = path.join(UPLOAD_DIR, name);
+    fs.writeFileSync(filePath, req.body);
+    const sizeBytes = req.body.length;
+    console.log(`[upload] saved ${sizeBytes}B (${mimeType}) -> ${name} for session=${_routedSid.slice(0,8)}… (mode=${_routingMode})`);
+    logFileAttribution(filePath, _routedSid, "upload");
+
+    const fileUrl = "/user-uploads/" + name;
+    let transcript = null;
+    let transcriptError = null;
+    const isAudio = _isAudioMime(mimeType);
+    if (isAudio) {
+      if (sizeBytes > 25 * 1024 * 1024) {
+        transcriptError = "file exceeds Whisper's 25MB direct-upload limit";
+      } else {
+        try {
+          const t = await _transcribeAudioBuffer(req.body, baseName, mimeType);
+          transcript = t.transcript; transcriptError = t.error;
+        } catch (e) {
+          console.error("[upload] transcription exception:", e);
+          transcriptError = String(e && e.message || e);
+        }
+      }
+    }
+
+    // Build the synthetic user-message text. Give Claude the absolute path + a
+    // clear "please process" cue; for audio, splice in the transcript.
+    const sizeStr = _humanSize(sizeBytes);
+    let messageText;
+    if (isAudio && transcript !== null) {
+      messageText = `[Uploaded audio file] ${baseName} (${mimeType}, ${sizeStr})\nPath on disk: ${filePath}\n\nWhisper transcript:\n${transcript}`;
+    } else if (isAudio) {
+      messageText = `[Uploaded audio file] ${baseName} (${mimeType}, ${sizeStr})\nPath on disk: ${filePath}\n\nAuto-transcription was not available (${transcriptError || "unknown reason"}). Please transcribe or otherwise process the file. For files >25MB you can chunk with ffmpeg then call Whisper per chunk.`;
+    } else {
+      messageText = `[Uploaded file] ${baseName} (${mimeType || "unknown type"}, ${sizeStr})\nPath on disk: ${filePath}\n\nPlease process this file appropriately — Read text/PDF/image content, extract archives, or whatever fits the task at hand.`;
+    }
+
+    queueAppend(_routedSid, {
+      text: messageText,
+      source: "upload",
+      audioUrl: isAudio ? fileUrl : undefined,
+      fileUrl,
+      fileName: baseName,
+      mimeType,
+      sizeBytes,
+    });
+    try { broadcastQueueState(_routedSid); } catch {}
+    try { tryDrainQueue(_routedSid); } catch (e) { console.error("[upload] drain attempt failed:", e.message); }
+
+    res.json({ ok: true, fileUrl, name: baseName, mimeType, sizeBytes, transcript, transcriptError });
+  } catch (err) {
+    console.error("[upload] error:", err);
+    res.status(500).json({ error: String(err && err.message || err) });
+  }
+});
+
+// Serve user-uploaded files (behind CF Access + nginx David-only guard).
+app.use("/user-uploads", express.static(UPLOAD_DIR));
+
 // ---- Orchestrator task board proxy (narrativeHero :8000) ----
 const ORCH_BASE = "http://localhost:8000/api/orchestrator";
 
@@ -1362,6 +1528,21 @@ app.post("/api/email-draft/send", express.json(), (req, res) => {
   });
 });
 
+// ---- /api/deferred-restart ----
+// The SAFE way for an agent to restart a service it is running inside. A direct
+// helper-socket restart mid-turn deadlocks: gracefulShutdown waits for active
+// subprocesses, the only active subprocess is the agent that asked, and 60s
+// later systemd SIGKILLs it before its reply reaches David (happened twice on
+// 2026-07-29 — the chat just went blank). This queues the restart and returns
+// immediately; deferredRestart.tick() fires it once no run is in flight.
+app.post("/api/deferred-restart", express.json(), (req, res) => {
+  const { unit, reason, sessionId } = req.body || {};
+  if (!unit) return res.status(400).json({ ok: false, error: "unit required" });
+  const out = deferredRestart.request({ unit, reason, sessionId });
+  return res.status(out.ok ? 200 : 400).json(out);
+});
+app.get("/api/deferred-restart", (req, res) => res.json(deferredRestart.status()));
+
 // ---- /api/outbox-capture ----
 // The NO-LOSS net (2026-07-07, after David's queued messages vanished): the
 // client posts every unacked outbox message here over plain HTTP (works when
@@ -1563,6 +1744,17 @@ app.get("/api/jobs", (_req, res) => res.json(jobsLedger.listJobs()));
 setInterval(() => { try { jobsLedger.sweepStalled(); } catch {} }, 30000).unref();
 
 server.listen(PORT, "127.0.0.1", () => console.log("llmTerminal on port", PORT, "(127.0.0.1 only; reached via nginx/tunnel)"));
+try { require("./src/leak-trace").start(); } catch (e) { console.log("[leak-trace] failed to start:", e.message); }
+
+// ---- Deferred restart drain-watcher ----
+// Cheap poll rather than a hook on every run-completion path: runs end in
+// several places (result event, proc close, kill, stall sweep) and a restart
+// that fires 3s late is fine, whereas one missed completion path would strand
+// the request forever.
+setInterval(() => {
+  try { deferredRestart.tick(activeProcs.size); }
+  catch (e) { console.error("[deferred-restart] tick failed:", e.message); }
+}, 3000).unref();
 
 // ---- Graceful shutdown ----
 let shuttingDown = false;
