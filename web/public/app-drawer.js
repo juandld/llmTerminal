@@ -506,10 +506,12 @@ function reviewPreview(id,action){
     inp.value="I approve the file \""+((sessionPreviews.find(p=>p.id===id)||{}).title||id)+"\". Proceed.";
   } else {
     inp.value="Please revise the file \""+((sessionPreviews.find(p=>p.id===id)||{}).title||id)+"\": ";
+    _updateClearBtn();
     inp.focus();
     return;
   }
   localStorage.setItem("llmt_draft",inp.value);
+  _updateClearBtn();
   send();
 }
 
@@ -1038,6 +1040,7 @@ function regenFlagged(stateKey,rowId,lang){
   const msg="Regenerate voiceover segments "+indices.map(i=>"#"+i).join(", ")+" for row "+rowId+" ("+lang+"). Only these segments — do NOT regenerate any others.";
   inp.value=msg;
   localStorage.setItem("llmt_draft",inp.value);
+  _updateClearBtn();
   inp.focus();
 }
 

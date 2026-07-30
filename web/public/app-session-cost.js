@@ -12,6 +12,7 @@
   let _last = null;
 
   function _fmt(n) {
+    if (n > 0 && n < 0.001) return "<$0.001"; // sub-milli spend must not render as $0.00
     if (n >= 100) return "$" + Math.round(n);
     if (n >= 1) return "$" + n.toFixed(2);
     return "$" + n.toFixed(3).replace(/0$/, "");
@@ -20,17 +21,21 @@
   function _label(d) {
     // Claude usage displays as % OF THE PLAN — the sub is flat $200/mo, so
     // dollar-slices read like fake charges (David 2026-07-11). API spend
-    // stays in dollars: that IS billed money.
+    // stays in dollars: that IS billed money. After a provider switch the
+    // chat has BOTH — show both, never let one hide the other (2026-07-13).
+    // "$?" = API turns happened but the model has no rate in pricing.js.
     const bits = [];
     if (d.api_usd > 0) bits.push(_fmt(d.api_usd) + " api");
-    bits.push((d.plan_usage_fraction || 0) + "% of plan");
+    else if (d.api_unpriced_calls > 0) bits.push("$? api");
+    if ((d.plan_usage_fraction || 0) > 0 || !bits.length) bits.push((d.plan_usage_fraction || 0) + "% of plan");
     return bits.join(" · ");
   }
 
   function _title(d) {
     const lines = [
       "This chat's ACTUAL cost:",
-      "API (billed, OpenAI/Gemini): " + _fmt(d.api_usd),
+      "API (billed, OpenAI/Gemini): " + _fmt(d.api_usd) +
+        (d.api_unpriced_calls > 0 ? " + " + d.api_unpriced_calls + " call(s) with no rate on file (dollars unknown)" : ""),
       "Claude: " + (d.plan_usage_fraction || 0) + "% of this month's Max-plan usage " +
         "(the plan is a flat $" + (d.plan_month_bill_usd || 200) + "/mo — that share ≈ " + _fmt(d.plan_share_usd || 0) + " of the bill)",
     ];
@@ -48,7 +53,12 @@
       if (anchor && anchor.parentElement) {
         top = document.createElement("span");
         top.id = "sessionCostChip";
-        top.className = "hide-mobile";
+        // No `hide-mobile` class here: that class is inverted in this CSS
+        // (base display:none + mobile override display:block = mobile-only),
+        // which crammed a 72px chip into the mobile topbar and hid it on
+        // desktop where it belongs. The mobile chip lives in the ⋮ menu
+        // (#omSessionCostVal); this span is desktop-only, hidden via
+        // @media(max-width:768px){#sessionCostChip{display:none}} in styles.css.
         top.style.cssText = "color:var(--dim);font-size:12px;margin-left:6px;white-space:nowrap;cursor:default";
         anchor.parentElement.insertBefore(top, anchor.nextSibling);
       }
@@ -105,16 +115,25 @@
     document.querySelectorAll("#sbList .sb-item[data-sid]").forEach((el) => {
       const c = _lookup(el.dataset.sid);
       let badge = el.querySelector(".sb-cost");
-      if (!c || (c.api_usd <= 0 && !(c.plan_pct > 0))) { if (badge) badge.remove(); return; }
+      const hasApi = !!c && (c.api_usd > 0 || c.api_unpriced_calls > 0);
+      if (!c || (!hasApi && !(c.plan_pct > 0))) { if (badge) badge.remove(); return; }
       if (!badge) {
         badge = document.createElement("div");
         badge.className = "sb-cost";
         el.appendChild(badge);
       }
+      // Provider-switched chats have BOTH billing kinds — show both numbers
+      // side by side (David 2026-07-13). "$?" = API turns exist but the model
+      // has no rate in pricing.js: dollars unknown, not zero.
       const pct = c.plan_pct || 0;
-      badge.textContent = (c.api_usd > 0 ? _fmt(c.api_usd) + " · " : "") + pct + "%";
+      const parts = [];
+      if (c.api_usd > 0) parts.push(_fmt(c.api_usd));
+      else if (c.api_unpriced_calls > 0) parts.push("$?");
+      if (pct > 0 || !parts.length) parts.push(pct + "%");
+      badge.textContent = parts.join(" · ");
       badge.title = pct + "% of the Max plan's " + (c.plan_pct_month || "monthly") + " usage" +
-        (c.api_usd > 0 ? " + " + _fmt(c.api_usd) + " API (billed)" : "");
+        (c.api_usd > 0 ? " + " + _fmt(c.api_usd) + " API (billed)" : "") +
+        (c.api_unpriced_calls > 0 ? " + " + c.api_unpriced_calls + " API call(s) with no rate on file (dollars unknown)" : "");
     });
     } finally {
       const _l = document.getElementById("sbList");

@@ -349,9 +349,21 @@ function loadRegistry() {
   _persist();
 }
 
+// Leak instrumentation (2026-07-24): cheap snapshot of retained per-run state so
+// leak-trace.js can see if openTools accumulates on long/looping runs.
+function _leakStats() {
+  let openTools = 0, maxOpen = 0, maxSid = null;
+  for (const [sid, e] of reg) {
+    const n = e && e.openTools ? Object.keys(e.openTools).length : 0;
+    openTools += n;
+    if (n > maxOpen) { maxOpen = n; maxSid = sid; }
+  }
+  return { sessions: reg.size, openTools, maxOpen, maxSid: maxSid ? maxSid.slice(0,8) : null };
+}
+
 module.exports = {
   runStarted, streamActivity, tap, runEnded, getEntry, clearWake, dueWakes,
   armWake, disarmWake,
   sessionRunState, sampleForWedge, loadRegistry, toolBudgetMs,
-  REGISTRY_PATH, PENDING_WAKEUPS_PATH,
+  REGISTRY_PATH, PENDING_WAKEUPS_PATH, _leakStats,
 };

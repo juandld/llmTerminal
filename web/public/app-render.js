@@ -453,6 +453,7 @@ function addQuestion(text, opts){
       }).join("\n");
       inp.value=answers;
       autoResizeInput(inp);
+      _updateClearBtn();
       // Clear saved drafts for this question set
       try{
         structured.forEach((q,qi)=>localStorage.removeItem(draftKeyBase+qi));

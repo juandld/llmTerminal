@@ -91,6 +91,7 @@ function loadTaskIntoChat(el){
   inp.value=text;
   autoResizeInput(inp);
   localStorage.setItem("llmt_draft",inp.value);
+  _updateClearBtn();
   // Link this session to the task
   if(ws&&ws.readyState===1) ws.send(JSON.stringify({type:"link_task",task_id:tid}));
   toggleTaskBoard();

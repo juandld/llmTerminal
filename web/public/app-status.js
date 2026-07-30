@@ -42,6 +42,7 @@ function setBusy(b){
       // Send it
       pendingImages=next.images?.map((img,i)=>({data:img.data,mimeType:img.mimeType,preview:next.previews?.[i]||""}))||[];
       inp.value=next.text;
+      _updateClearBtn();
       setTimeout(send,100);
     } else {
       renderQueueCount();

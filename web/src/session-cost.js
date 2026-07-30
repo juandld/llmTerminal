@@ -30,7 +30,7 @@ function _month(row) {
 
 function _scanLedger(sessionId) {
   const out = {
-    api_usd: 0, calls: 0, unpriced_calls: 0,
+    api_usd: 0, api_calls: 0, calls: 0, unpriced_calls: 0,
     tokens_in: 0, tokens_out: 0,
     plan_weight_by_month: {},   // this session's usage weight per YYYY-MM
     plan_total_by_month: {},    // ALL plan usage on the box per YYYY-MM
@@ -54,7 +54,7 @@ function _scanLedger(sessionId) {
     if (!matches) continue;
     out.calls += 1;
     if (row.unpriced) out.unpriced_calls += 1;
-    if (isApi) out.api_usd += Number(row.cost_usd) || 0;
+    if (isApi) { out.api_usd += Number(row.cost_usd) || 0; out.api_calls += 1; }
     else {
       const m = _month(row);
       out.plan_weight_by_month[m] = (out.plan_weight_by_month[m] || 0) + (Number(row.cost_usd) || 0);
@@ -127,6 +127,8 @@ async function sessionCost(sessionId) {
     session: sessionId,
     // ACTUAL dollars only:
     api_usd: r6(own.api_usd),                     // billed on the OpenAI/Google keys
+    api_calls: own.api_calls,
+    api_unpriced_calls: own.unpriced_calls,       // API turns with no rate in pricing.js — dollars unknown, not zero
     plan_share_usd: r2(plan.share),               // this chat's slice of the flat Max bill
     plan_month_bill_usd: MAX_PLAN_USD_MONTH,
     plan_usage_fraction: Math.round(plan.fractionLatest * 1000) / 10, // % of this month's plan usage
@@ -174,9 +176,12 @@ function allSessionCosts() {
     if (!isApi) totals[m] = (totals[m] || 0) + (Number(row.cost_usd) || 0);
     const key = row.session || (String(row.component || "").startsWith("llmterminal") ? row.meta : null);
     if (!key) continue;
-    const e = (perKey[key] = perKey[key] || { api: 0, w: {} });
-    if (isApi) e.api += Number(row.cost_usd) || 0;
-    else e.w[m] = (e.w[m] || 0) + (Number(row.cost_usd) || 0);
+    const e = (perKey[key] = perKey[key] || { api: 0, apiCalls: 0, apiUnpriced: 0, w: {} });
+    if (isApi) {
+      e.api += Number(row.cost_usd) || 0;
+      e.apiCalls += 1;
+      if (row.unpriced) e.apiUnpriced += 1;
+    } else e.w[m] = (e.w[m] || 0) + (Number(row.cost_usd) || 0);
   }
   const costs = {};
   for (const [key, e] of Object.entries(perKey)) {
@@ -194,7 +199,11 @@ function allSessionCosts() {
       if (t > 0) share += Math.min(1, w / t) * MAX_PLAN_USD_MONTH;
     }
     costs[key] = {
-      api_usd: Math.round(e.api * 100) / 100,
+      // 4 decimals, not cents: a couple of cheap API turns is real spend and
+      // must not round to $0 (which the badge reads as "no API usage").
+      api_usd: Math.round(e.api * 1e4) / 1e4,
+      api_calls: e.apiCalls,
+      api_unpriced_calls: e.apiUnpriced, // API turns with no rate on file — dollars unknown, not zero
       plan_share_usd: Math.round(share * 100) / 100,
       plan_pct: e._pct,
       plan_pct_month: e._pctMonth,

@@ -8,6 +8,7 @@ function makeSbItem(x, currentProject) {
   const stateClass = state ? "state-" + state : "";
   d.className = "sb-item " + stateClass + (session?.id === x.id ? " active" : "") + (x.archived ? " sb-archived" : "");
   d.dataset.state = state;
+  d.dataset.sid = x.id; // cost-badge decorator hook (app-session-cost.js)
   const ti = mk("div", "ti");
   const row1 = mk("div", "row1");
   if (state && STATE_ICONS[state]) {

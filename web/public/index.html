@@ -82,9 +82,12 @@
       <div class="chat" id="chat"></div>
       <div class="img-preview-bar" id="imgBar"></div>
       <div class="input-bar">
-        <textarea id="inp" rows="1" placeholder="Message Claude..."></textarea>
-        <input type="file" id="imgFileInput" accept="image/*" multiple style="display:none" onchange="handleImgFiles(event)">
-        <button class="btn-mic" id="attachBtn" onclick="document.getElementById('imgFileInput').click()" title="Attach image" aria-label="Attach image">📎</button>
+        <div class="ta-wrap">
+          <textarea id="inp" rows="1" placeholder="Message Claude..."></textarea>
+          <button id="clearInpBtn" class="clear-inp" type="button" onclick="clearInput()" aria-label="Clear message" title="Clear">&times;</button>
+        </div>
+        <input type="file" id="imgFileInput" accept="*/*" multiple style="display:none" onchange="handleImgFiles(event)">
+        <button class="btn-mic" id="attachBtn" onclick="document.getElementById('imgFileInput').click()" title="Attach file — images inline, other files uploaded to the chat" aria-label="Attach file">📎</button>
         <button class="btn-mic" id="micBtn" onclick="toggleVoiceInput()" title="Voice note (Space)" aria-label="Voice note">🎙</button>
         <button class="btn-send" id="sendBtn" onclick="send()">Send</button>
         <button class="btn-stop" id="stopBtn" onclick="interrupt()">Stop</button>

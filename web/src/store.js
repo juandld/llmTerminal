@@ -183,13 +183,17 @@ function deleteMessagesByTs(sessionId, tsList) {
   if (db) {
     try {
       const stmt = db.prepare("DELETE FROM messages WHERE session_id = ? AND ts = ?");
-      const tx = db.transaction((sid, list) => {
-        for (const t of list) {
-          const r = stmt.run(sid, t);
+      db.exec("BEGIN");
+      try {
+        for (const t of tsSet) {
+          const r = stmt.run(sessionId, t);
           removed += r.changes || 0;
         }
-      });
-      tx(sessionId, [...tsSet]);
+        db.exec("COMMIT");
+      } catch (inner) {
+        try { db.exec("ROLLBACK"); } catch {}
+        throw inner;
+      }
     } catch (e) { console.error("[deleteMessagesByTs] sqlite failed:", e.message); }
   }
   try {

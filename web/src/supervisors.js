@@ -386,13 +386,13 @@ function spawnContractCheck(sessionId, projectName) {
     // aren't persisted (only tool names), so end-state URL comparison isn't
     // possible here; browser_run_code_unsafe may open pages internally and is
     // deliberately not judged. Warn, don't block.
+    const lastUserIdxAll = all.map(m => m.role).lastIndexOf("user");
+    const runV = lastUserIdxAll >= 0 ? all.slice(lastUserIdxAll + 1) : all;
     try {
-      const lastUserIdx = all.map(m => m.role).lastIndexOf("user");
-      const run = lastUserIdx >= 0 ? all.slice(lastUserIdx + 1) : all;
-      const toolNames = run.filter(m => m.role === "tool_activity").map(m => String(m.tool_name || ""));
+      const toolNames = runV.filter(m => m.role === "tool_activity").map(m => String(m.tool_name || ""));
       const navigated = toolNames.includes("mcp__playwright__browser_navigate");
       const madeOwnTab = toolNames.includes("mcp__playwright__browser_tabs");
-      const alreadyWarned = run.some(m => m.source === "contract_check_tab_etiquette");
+      const alreadyWarned = runV.some(m => m.source === "contract_check_tab_etiquette");
       if (navigated && !madeOwnTab && !alreadyWarned) {
         saveMessage(sessionId, {
           role: "assistant",
@@ -405,13 +405,129 @@ function spawnContractCheck(sessionId, projectName) {
       }
     } catch (e) { console.error("[contract-check] tab-etiquette check failed:", e.message); }
 
-    // Quick prefilter: skip if the last message isn't from the assistant, or if
-    // the assistant is clearly mid-conversation (ends with a question mark, ends
-    // with a request for input). Saves Haiku calls on obvious not-done states.
+    // Quick prefilter: skip if the last message isn't from the assistant.
+    // Hoisted above the ship-claim gate + endsWithQuestion + Haiku judge so
+    // all three share the same last/lastText scope.
     const last = recent[recent.length - 1];
     if (!last || last.role !== "assistant") return;
     const lastText = String(last.text || "").trim();
     if (!lastText) return;
+
+    // ── Ship-claim verification gates (verification-gaps #2 + #3) ──────────
+    // The "verified the component, not the production path" failure class
+    // (handoff 2026-07-22, orchestratorHero/development/handoff_verification_
+    // gap_fix_20260722.md). Agent asserts "live / applied / wired into
+    // production / shipped / pushed" on the strength of a component that ran
+    // fine in isolation (bake-off, direct function call), having never hit
+    // the actual production entry point, and often having never committed
+    // the change. Both halves get caught here as pre-Haiku gates.
+    //
+    //   (a) UNVERIFIED CLAIM: assertion of live/applied/production state AND
+    //       the run has no tool-observed runtime evidence (no curl, git log/
+    //       show/diff/status, systemctl, journalctl, psql/sqlite, docker
+    //       exec|logs, WebFetch, browser_navigate|snapshot|evaluate).
+    //   (b) UNCOMMITTED: assertion of shipped/committed/pushed AND files
+    //       THIS session actually touched (per file_attribution.jsonl) are
+    //       still in git's working tree.
+    //
+    // Both post their warning at most once per run (idempotent on source
+    // scan), but the BLOCK persists on every tick where the underlying
+    // condition holds — so a later Haiku "done:true" verdict can't slip
+    // through just because we already warned. Explicit llmt_complete
+    // (doneSource="mcp") still wins, matching supervisors.js:622-628.
+    try {
+      const liveClaim = /\b(shipped|deployed|pushed|committed|landed|flipped|applied|wired into|live (in|now)|now live|is live|in production|verified live)\b/i.test(lastText);
+      if (liveClaim) {
+        // Gate (a): runtime corroboration THIS run
+        const bashCmds = runV
+          .filter(m => m.role === "tool_activity" && m.tool_name === "Bash")
+          .map(m => String(m.summary || ""));
+        const corroboratingBash = bashCmds.some(c =>
+          /\bcurl\b/i.test(c) ||
+          /\bwget\b/i.test(c) ||
+          /\bgit\s+(log|show|diff|status|commit|push|rev-parse|blame)\b/i.test(c) ||
+          /\bsystemctl\s+(status|is-active|show|list-units)\b/i.test(c) ||
+          /\bjournalctl\b/i.test(c) ||
+          /\bpsql\b/i.test(c) ||
+          /\bsqlite3?\b/i.test(c) ||
+          /\bdocker\s+(ps|logs|exec|inspect)\b/i.test(c) ||
+          /\bnc\s+-U\b/i.test(c)
+        );
+        const otherCorroboration = runV.some(m => m.role === "tool_activity" && (
+          m.tool_name === "WebFetch" ||
+          m.tool_name === "mcp__playwright__browser_navigate" ||
+          m.tool_name === "mcp__playwright__browser_snapshot" ||
+          m.tool_name === "mcp__playwright__browser_evaluate"
+        ));
+        const gateAFails = !corroboratingBash && !otherCorroboration;
+
+        // Gate (b): own dirty files still in the working tree
+        let dirtyOwn = [];
+        if (session.project) {
+          try {
+            const projectRoot = path.join(PROJECTS_DIR, session.project);
+            if (fs.existsSync(path.join(projectRoot, ".git"))) {
+              // NOTE: don't .trim() the raw output — porcelain lines are
+              // "XY path" with X or Y often a space, so trimming eats the
+              // leading space of the first line and offsets its slice(3).
+              const raw = require("child_process")
+                .execSync("git status --porcelain", { cwd: projectRoot, encoding: "utf8", timeout: 5000 });
+              const dirty = raw.split("\n")
+                .filter(l => l.length > 3)
+                .filter(l => !l.includes(" -> "))                         // skip renames (rare, hard to parse)
+                .map(l => path.resolve(projectRoot, l.slice(3).replace(/^"|"$/g, "")));
+              if (dirty.length) {
+                const map = buildAttributionMap();
+                const mine = new Set();
+                for (const [p, meta] of map) { if (meta.sessionId === sessionId) mine.add(p); }
+                dirtyOwn = dirty.filter(p => mine.has(p));
+              }
+            }
+          } catch (e) { /* git failure — silently skip */ }
+        }
+        const gateBFails = dirtyOwn.length > 0;
+
+        if (gateAFails) {
+          const already = runV.some(m => m.source === "contract_check_unverified_claim");
+          if (!already) {
+            saveMessage(sessionId, {
+              role: "assistant",
+              text: "⚠ UNVERIFIED CLAIM — this run asserted the change is live / applied / shipped / wired into production, but observed no runtime evidence (no curl, no git log/diff/show/status, no systemctl status, no journalctl, no psql/sqlite, no docker exec|logs, no WebFetch, no browser_navigate|snapshot|evaluate). Verify through the product's own entry point, not the component in isolation — handoff 2026-07-22 §3.3. This session will NOT auto-complete until a corroborating tool call is observed in the same turn (or the wording is softened).",
+              ts: Date.now(),
+              source: "contract_check_unverified_claim",
+            });
+            console.log("[contract-check]", sessionId.slice(0,8), "→ UNVERIFIED-CLAIM (live/applied claim without runtime corroboration)");
+          }
+        }
+        if (gateBFails) {
+          const already = runV.some(m => m.source === "contract_check_uncommitted");
+          if (!already) {
+            const list = dirtyOwn.slice(0, 8).map(p => "  " + p).join("\n");
+            const more = dirtyOwn.length > 8 ? "\n  ... and " + (dirtyOwn.length - 8) + " more" : "";
+            saveMessage(sessionId, {
+              role: "assistant",
+              text: "⚠ UNCOMMITTED — will be lost on checkout. This run claimed shipped/committed/pushed/live but " + dirtyOwn.length + " file(s) it touched are still in " + session.project + "'s working tree:\n" + list + more + "\n\nCommit before marking done, or reword the claim — handoff 2026-07-22 §3.4.",
+              ts: Date.now(),
+              source: "contract_check_uncommitted",
+            });
+            console.log("[contract-check]", sessionId.slice(0,8), "→ UNCOMMITTED ship-claim (" + dirtyOwn.length + " own dirty file(s))");
+          }
+        }
+
+        if (gateAFails || gateBFails) {
+          // Refuse auto-done this tick. Also clear a stale auto-set manualDone
+          // so the sidebar doesn't show green while the gate is warning; an
+          // explicit llmt_complete (doneSource="mcp") is preserved.
+          if (session.manualDone && session.doneSource !== "mcp") {
+            delete session.manualDone;
+            delete session.doneSource;
+            saveSessions(sessions);
+          }
+          try { broadcastToSession(sessionId, { type: "history", messages: loadMessages(sessionId) }); } catch {}
+          return;
+        }
+      }
+    } catch (e) { console.error("[contract-check] ship-claim gate failed:", e.message); }
     // If the assistant ends with a clarifying question, work is NOT done.
     // Short-circuit: when already marked done, force-clear immediately (user
     // typed a follow-up that yielded a question — definitely active again).

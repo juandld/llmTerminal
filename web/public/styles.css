@@ -614,6 +614,15 @@
 
   .img-preview-bar{display:flex;gap:6px;padding:4px 14px;background:var(--surface);border-top:1px solid var(--border);flex-wrap:wrap}
   .img-preview-bar:empty{display:none}
+
+  /* Upload progress toast — top-of-viewport stacked notices */
+  .upload-toast-host{position:fixed;top:calc(env(safe-area-inset-top,0px) + 8px);right:12px;left:12px;display:flex;flex-direction:column;gap:6px;pointer-events:none;z-index:10000}
+  @media(min-width:769px){.upload-toast-host{left:auto;max-width:420px}}
+  .upload-toast{background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:10px;padding:10px 14px;font-family:var(--mono);font-size:12px;box-shadow:0 6px 24px rgba(0,0,0,.4);pointer-events:auto;transition:opacity .3s ease}
+  .upload-toast.ut-active{border-color:var(--accent);color:var(--accent)}
+  .upload-toast.ut-ok{border-color:var(--green);color:var(--green)}
+  .upload-toast.ut-err{border-color:var(--accent2);color:var(--accent2)}
+  .upload-toast.ut-fade{opacity:0}
   .img-preview{position:relative;width:60px;height:60px;border-radius:8px;overflow:hidden;border:1px solid var(--border)}
   .img-preview img{width:100%;height:100%;object-fit:cover}
   .img-preview .x{position:absolute;top:2px;right:2px;background:rgba(0,0,0,.7);color:#fff;border:none;border-radius:50%;width:18px;height:18px;font-size:11px;cursor:pointer;display:flex;align-items:center;justify-content:center}
@@ -624,8 +633,24 @@
     flex:1;background:var(--bg);color:var(--text);border:1px solid var(--border);
     border-radius:12px;padding:10px 14px;font-family:var(--mono);font-size:13px;
     resize:none;min-height:44px;max-height:140px;outline:none;line-height:1.4;
+    width:100%;box-sizing:border-box;
   }
   .input-bar textarea:focus{border-color:var(--accent)}
+  .ta-wrap{flex:1;position:relative;display:flex}
+  /* Small × button pinned to the textarea's top-right. Only visible when the
+     textarea has content — a one-tap wipe so users don't have to fight mobile
+     text selection to delete large auto-populated blobs. */
+  .clear-inp{
+    position:absolute;top:6px;right:6px;
+    width:28px;height:28px;min-width:28px;
+    padding:0;border:none;border-radius:50%;
+    background:rgba(0,0,0,.35);color:#fff;
+    font-size:18px;line-height:1;cursor:pointer;
+    display:none;align-items:center;justify-content:center;
+    z-index:2;font-family:sans-serif;
+  }
+  .clear-inp:hover{background:rgba(0,0,0,.55)}
+  .ta-wrap.has-text .clear-inp{display:flex}
   .input-bar button{padding:10px 16px;border:none;border-radius:12px;font-family:var(--mono);font-size:12px;font-weight:600;cursor:pointer;flex-shrink:0}
   .btn-send{background:var(--accent);color:#000}
   .btn-send:disabled{opacity:.3;cursor:not-allowed}
@@ -1314,3 +1339,9 @@
   /* Per-chat actual-cost badge — top-right of each sidebar chat label
      (decorated by app-session-cost.js from /api/session-costs) */
   .sb-cost{position:absolute;top:4px;right:8px;font-size:10px;line-height:1;color:var(--dim);pointer-events:none;background:var(--surface);border-radius:4px;padding:1px 3px}
+  /* Desktop-only session cost chip in the topbar. On mobile the mobile
+     .topbar-nav has ~40px of horizontal budget after ☰/badge/title/files/bell/⋮
+     — a 72px "0% of plan" chip pushes ⋮ against the connected-dot pill and
+     turns the whole bar into a jammed strip (David 2026-07-15). Info still
+     available on mobile via the ⋮ menu → Cost row (#omSessionCostVal). */
+  @media(max-width:768px){#sessionCostChip{display:none}}

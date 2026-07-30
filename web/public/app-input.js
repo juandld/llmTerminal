@@ -3,6 +3,7 @@
 
 function _clearInput(){
   inp.value=""; inp.style.height="44px"; localStorage.removeItem("llmt_draft"); clearImages();
+  if(typeof _updateClearBtn==="function") _updateClearBtn();
 }
 
 // ── Phone wake / tab resume: force-reconnect so chat is always fresh ──
@@ -137,8 +138,71 @@ function handleImgFiles(e){
   const files=e.target.files||[];
   for(const f of files){
     if(f.type.startsWith("image/")) addImage(f);
+    else uploadArbitraryFile(f);
   }
   e.target.value="";
+}
+// Route: images go into the inline compose bar (existing addImage path).
+// Everything else — audio call recordings, PDFs, docs, archives — POSTs
+// immediately to /upload, becoming its own queued user message that the
+// agent handles on the next drain.
+function uploadArbitraryFile(file){
+  const nonce=currentVoiceNonce;
+  const sid=(session&&session.id)||"";
+  if(!nonce && !sid){ showUploadToast("Can't upload — no active chat","err"); return; }
+  const qs=(nonce?"?nonce="+encodeURIComponent(nonce):"?session="+encodeURIComponent(sid))
+    + "&filename="+encodeURIComponent(file.name||"upload.bin");
+  const sizeStr=file.size>1048576?(file.size/1048576).toFixed(1)+" MB":Math.round(file.size/1024)+" KB";
+  const toast=showUploadToast("Uploading "+file.name+" ("+sizeStr+")…","active");
+  const xhr=new XMLHttpRequest();
+  xhr.open("POST","./upload"+qs);
+  xhr.setRequestHeader("Content-Type",file.type||"application/octet-stream");
+  xhr.upload.onprogress=(e)=>{
+    if(e.lengthComputable){
+      const pct=Math.round(e.loaded/e.total*100);
+      updateUploadToast(toast,"Uploading "+file.name+" — "+pct+"%","active");
+      if(pct>=100) updateUploadToast(toast,"Processing "+file.name+"…","active");
+    }
+  };
+  xhr.upload.onload=()=>updateUploadToast(toast,"Processing "+file.name+"…","active");
+  xhr.onload=()=>{
+    if(xhr.status>=400){
+      let msg="Upload failed ("+xhr.status+")";
+      try{const j=JSON.parse(xhr.responseText);if(j.error)msg="Upload failed: "+j.error;}catch{}
+      updateUploadToast(toast,msg,"err",3500);
+      return;
+    }
+    let j={}; try{j=JSON.parse(xhr.responseText)}catch{}
+    const doneMsg=j.transcript?("Transcribed "+file.name):("Uploaded "+file.name);
+    updateUploadToast(toast,doneMsg+(j.transcriptError?" ("+j.transcriptError+")":""),"ok",2200);
+    // Session cost / queue state broadcast will render the actual bubble; no
+    // client-side placeholder needed.
+  };
+  xhr.onerror=()=>updateUploadToast(toast,"Upload failed — network error","err",3500);
+  xhr.send(file);
+}
+// Lightweight top-of-viewport toast for upload progress. One stacked column.
+function showUploadToast(text,cls){
+  let host=document.getElementById("uploadToastHost");
+  if(!host){
+    host=document.createElement("div");
+    host.id="uploadToastHost";
+    host.className="upload-toast-host";
+    document.body.appendChild(host);
+  }
+  const el=document.createElement("div");
+  el.className="upload-toast"+(cls?" ut-"+cls:"");
+  el.textContent=text;
+  host.appendChild(el);
+  return el;
+}
+function updateUploadToast(el,text,cls,autoDismissMs){
+  if(!el) return;
+  el.className="upload-toast"+(cls?" ut-"+cls:"");
+  el.textContent=text;
+  if(autoDismissMs){
+    setTimeout(()=>{ el.classList.add("ut-fade"); setTimeout(()=>el.remove(),300); }, autoDismissMs);
+  }
 }
 function clearImages(){pendingImages=[];renderImagePreviews()}
 function removeImage(i){pendingImages.splice(i,1);renderImagePreviews()}
@@ -152,22 +216,27 @@ function renderImagePreviews(){
   });
 }
 
-// Paste handler
+// Paste handler — images inline, other files uploaded to the chat.
 document.addEventListener("paste",(e)=>{
   const items=e.clipboardData?.items;
   if(!items)return;
+  let handled=false;
   for(const item of items){
-    if(item.type.startsWith("image/")){
-      e.preventDefault();
-      addImage(item.getAsFile());
-    }
+    if(item.kind!=="file") continue;
+    const f=item.getAsFile();
+    if(!f) continue;
+    handled=true;
+    if(item.type.startsWith("image/")) addImage(f);
+    else uploadArbitraryFile(f);
   }
+  if(handled) e.preventDefault();
 });
-// Drop handler
+// Drop handler — same routing.
 chat.addEventListener("dragover",(e)=>{e.preventDefault()});
 chat.addEventListener("drop",(e)=>{
   e.preventDefault();
   for(const file of (e.dataTransfer?.files||[])){
     if(file.type.startsWith("image/")) addImage(file);
+    else uploadArbitraryFile(file);
   }
 });

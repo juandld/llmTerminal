@@ -94,6 +94,7 @@ function setInputFromHistory(text){
   // Move cursor to end
   const len=inp.value.length;
   inp.setSelectionRange(len,len);
+  _updateClearBtn();
 }
 let thinkingEl=null;
 let pendingImages=[]; // {data: base64, mimeType: string, preview: dataUrl}
@@ -300,12 +301,23 @@ function updateSendButton(){
   if(sendBtn){sendBtn.disabled=!isSynced}
 }
 
+function _updateClearBtn(){
+  const wrap=inp.parentElement;
+  if(wrap&&wrap.classList) wrap.classList.toggle("has-text", inp.value.length>0);
+}
+function clearInput(){
+  _clearInput();
+  _updateClearBtn();
+  try{ inp.focus(); }catch{}
+}
 inp.addEventListener("input",()=>{
   autoResizeInput(inp);
   localStorage.setItem("llmt_draft",inp.value);
+  _updateClearBtn();
 });
 // Restore draft on load
 try{const d=localStorage.getItem("llmt_draft");if(d){inp.value=d;autoResizeInput(inp);}}catch{}
+_updateClearBtn();
 // Phase 1: restore selection, sidebar/drawer state, file filter, search query
 try{
   const sel=JSON.parse(localStorage.getItem("llmt_draft_sel")||"null");
@@ -421,6 +433,11 @@ let taskCache=[], taskFilter="actionable";
 // (task-board fns moved to app-tasks.js)
 // (long-press + contextmenu wiring moved to app-bubble-menu.js)
 
-init();
+// Defer bootstrap until ALL app-*.js modules have loaded. app.js is the first
+// script; app-sidebar.js (loadSessions) and others load AFTER it, so calling
+// init() at parse time raced loadSessions() -> 'loadSessions is not defined'.
+// DOMContentLoaded fires only after every parser-blocking script has executed.
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init, { once: true });
+else init();
 // (persisted file-attachment tray render moved to app-drawer.js — calling it here at parse
 //  time threw a swallowed ReferenceError because app-drawer.js loads after app.js)

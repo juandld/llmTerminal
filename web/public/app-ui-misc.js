@@ -69,6 +69,7 @@ function addApiErrorCard(msg){
     const lastText=msgs[msgs.length-1].textContent;
     if(!lastText)return;
     inp.value=lastText;
+    _updateClearBtn();
     retry.textContent="Resending...";retry.disabled=true;
     setTimeout(()=>send(),50);
   };
