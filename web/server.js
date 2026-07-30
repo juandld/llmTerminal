@@ -216,6 +216,20 @@ function sweepStalledSessions() {
 setTimeout(sweepStalledSessions, 60 * 1000); // first sweep 60s after boot (after startup-recovery has run)
 setInterval(sweepStalledSessions, STALLED_SWEEP_INTERVAL_MS).unref();
 
+// ---- Loose-ends bridge (session→queue) ----
+// Every closed (manualDone) session gets ONE goal-audit: was the opening goal
+// actually met, or did the chat close on a checkpoint (email sent, partial
+// edit)? Unmet goals are filed to the orchestrator queue with origin_session +
+// a done-criteria timeline stamp. Same 5-min cadence as the stalled sweeper;
+// the sid+manualDone audit marker makes already-judged sessions free, and
+// maxHaiku/maxFiles bound each tick (the backlog drains across ticks —
+// scripts/sweep-loose-ends.js is the explicit backfill). See src/loose-ends.js.
+const { sweepLooseEnds } = require("./src/loose-ends");
+const _looseEndsTick = () => sweepLooseEnds({ maxHaiku: 4, maxFiles: 2 })
+  .catch(e => console.error("[loose-ends] sweep error:", e.message));
+setTimeout(_looseEndsTick, 3 * 60 * 1000); // offset from the stalled sweep
+setInterval(_looseEndsTick, STALLED_SWEEP_INTERVAL_MS).unref();
+
 // ---- Scheduled-wake re-firing (LIVENESS plan Phase 2) ----
 // ScheduleWakeup ends the turn and the CLI process exits with it — without this
 // loop, every /loop iteration parked >5 min simply never continued (bc590843's
