@@ -64,7 +64,7 @@ function startVoiceUI(){
     }
     ri.style.display="flex";
   } else {
-    if(inp){inp.value="";inp.readOnly=true;inp.placeholder="⏺ Recording...";}
+    if(inp){inp.value="";inp.readOnly=true;inp.placeholder="⏺ Recording...";if(typeof _updateClearBtn==="function")_updateClearBtn();}
   }
   if(isMobile){
     // Mobile: also show full-screen overlay with big buttons
@@ -128,7 +128,7 @@ function endVoiceUI(){
   if(sendBtn){sendBtn.textContent=sendBtn._oldText||"Send";sendBtn.classList.remove("voice-cancel-mode");sendBtn.onclick=send;}
   const attachBtn=document.getElementById("attachBtn");
   if(attachBtn){attachBtn.style.visibility="";attachBtn.style.pointerEvents="";}
-  if(inp){inp.style.display="";inp.readOnly=false;inp.value=inp.dataset.prevValue||"";inp.placeholder="Message Claude...";}
+  if(inp){inp.style.display="";inp.readOnly=false;inp.value=inp.dataset.prevValue||"";inp.placeholder="Message Claude...";if(typeof _updateClearBtn==="function")_updateClearBtn();}
   const ri=document.getElementById("voiceInline");
   if(ri)ri.style.display="none";
   const timer=document.getElementById("voiceTimer");
@@ -159,11 +159,39 @@ async function sendVoiceNote(blob){
   // immediately so the recording device sees it move in the sidebar without
   // waiting for the 15s poll.
   promoteCurrentSessionToActive();
+  attemptVoiceUpload(blob, msgEl, vnImages, 0);
+}
+
+// Wait until we have a valid nonce on an open WS, or timeout.
+// Resolves true if a fresh nonce is available, false on timeout.
+function waitForFreshVoiceNonce(timeoutMs){
+  return new Promise(resolve=>{
+    if(currentVoiceNonce && ws && ws.readyState===1) return resolve(true);
+    const start=Date.now();
+    const iv=setInterval(()=>{
+      if(currentVoiceNonce && ws && ws.readyState===1){
+        clearInterval(iv); resolve(true);
+      } else if(Date.now()-start>timeoutMs){
+        clearInterval(iv); resolve(false);
+      }
+    },200);
+  });
+}
+
+async function attemptVoiceUpload(blob, msgEl, vnImages, attempts){
+  attempts = attempts || 0;
+  const MAX_AUTO_RETRIES = 1;
   const statusEl=msgEl.querySelector(".vn-status");
   const setVnStatus=(txt,cls)=>{
-    if(statusEl){statusEl.textContent=txt;statusEl.className="vn-status"+(cls?" "+cls:"");}
+    if(statusEl){statusEl.style.display="";statusEl.textContent=txt;statusEl.className="vn-status"+(cls?" "+cls:"");}
   };
   try{
+    // If WS is dead or we have no nonce, wait briefly for the reconnect to
+    // reissue one. Sending with a known-stale nonce guarantees a 401.
+    if(!currentVoiceNonce || !ws || ws.readyState!==1){
+      setVnStatus("Waiting for connection…","vn-s-active");
+      await waitForFreshVoiceNonce(15000);
+    }
     setVnStatus("Uploading…","vn-s-active");
     const sid=(session&&session.id)||"";
     // Prefer the WS-bound nonce — it proves this upload is from the currently-open
@@ -190,10 +218,19 @@ async function sendVoiceNote(blob){
       };
       xhr.upload.onload=()=>{ setVnStatus("Transcribing…","vn-s-active"); };
       xhr.onload=()=>{
-        if(xhr.status>=400) return reject(new Error("upload failed: "+xhr.status));
+        if(xhr.status>=400){
+          let body=null;
+          try{ body=JSON.parse(xhr.responseText); }catch{}
+          const err=new Error("upload failed: "+xhr.status);
+          err.status=xhr.status;
+          err.staleNonce=!!(body&&body.stale_nonce);
+          err.ghostSession=!!(body&&body.ghost_session_id);
+          err.serverMessage=(body&&body.error)||null;
+          return reject(err);
+        }
         try{resolve(JSON.parse(xhr.responseText))}catch(e){reject(e)}
       };
-      xhr.onerror=()=>reject(new Error("network error"));
+      xhr.onerror=()=>{const e=new Error("network error");e.network=true;reject(e);};
       xhr.send(blob);
     });
     if(data.error) console.error("[voice-note] error:", data.error);
@@ -230,6 +267,8 @@ async function sendVoiceNote(blob){
         setBusy(true);
       }
     }
+    // Success: clear any retry handler left by a prior failed attempt.
+    msgEl.onclick=null;
     // Status — upload succeeded, server handles the rest
     if(data.transcript){
       setVnStatus("Queued","vn-s-done");
@@ -241,10 +280,25 @@ async function sendVoiceNote(blob){
       setTimeout(()=>{if(statusEl)statusEl.style.display="none";},2000);
     }
   }catch(err){
+    // Auto-retry on stale/ghost nonce, once.
+    // Root cause: WS died server-side (heartbeat timeout) but the client didn't
+    // notice yet, so the local currentVoiceNonce is stale. Force a reconnect to
+    // reissue the nonce, then retry.
+    if((err.staleNonce||err.ghostSession) && attempts<MAX_AUTO_RETRIES){
+      console.warn("[voice-note] stale nonce/ghost session — forcing WS reconnect and retrying");
+      currentVoiceNonce=null;
+      try{ if(ws&&ws.readyState===1) ws.close(); }catch{}
+      setVnStatus("Reconnecting…","vn-s-active");
+      return attemptVoiceUpload(blob, msgEl, vnImages, attempts+1);
+    }
     console.error("[voice-note] upload failed:",err);
-    setVnStatus("⚠ Upload failed — tap to retry","vn-s-error");
-    // Tap to retry
-    msgEl.onclick=()=>{msgEl.onclick=null;sendVoiceNote(blob);};
+    const label = (err.staleNonce||err.ghostSession)
+      ? "⚠ Connection lost — tap to retry"
+      : "⚠ Upload failed — tap to retry";
+    setVnStatus(label,"vn-s-error");
+    // Tap to retry — reuse the SAME bubble (don't call sendVoiceNote which
+    // would create a duplicate bubble via addVoiceNoteUser).
+    msgEl.onclick=()=>{msgEl.onclick=null;attemptVoiceUpload(blob, msgEl, vnImages, 0);};
   }
 }
 
