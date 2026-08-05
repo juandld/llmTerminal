@@ -147,7 +147,10 @@ function notifyCrmCommEvent(body) {
         "Cf-Access-Authenticated-User-Email": "david@crankwheel.com",
       },
       timeout: 4000,
-    }, res => { res.resume(); });
+    }, res => {
+      res.on("error", e => console.error("[email_draft] comm-event response error (harmless):", e.message));
+      res.resume();
+    });
     req.on("error", e => console.error("[email_draft] comm-event notify failed (draft unaffected):", e.message));
     req.on("timeout", () => { req.destroy(new Error("timeout")); });
     req.write(data); req.end();
@@ -156,13 +159,67 @@ function notifyCrmCommEvent(body) {
   }
 }
 
+// Per-session content dedup: the same draft can legitimately reach us twice
+// (streamed text AND final result; MCP capture AND a quoted fence). Key on
+// (to, subject, body) with a 15-minute window so distinct drafts always
+// capture and identical re-appearances no-op. This replaces the turn-wide
+// _draftCapturedThisTurn boolean, which silently DROPPED a second distinct
+// fence-only draft in the same turn (QA finding 5, 2026-08-05).
+const _recentDrafts = new Map(); // sessionId -> Map(hash -> ts)
+const DEDUP_WINDOW_MS = 15 * 60 * 1000;
+
+function _draftHash(d) {
+  return require("crypto").createHash("sha1")
+    .update(d.to + "\u0000" + d.subject + "\u0000" + d.body).digest("hex");
+}
+
+function _seenRecently(sessionId, hash) {
+  const now = Date.now();
+  let m = _recentDrafts.get(sessionId);
+  if (!m) { m = new Map(); _recentDrafts.set(sessionId, m); }
+  for (const [h, ts] of m) if (now - ts > DEDUP_WINDOW_MS) m.delete(h);
+  if (m.has(hash)) return true;
+  m.set(hash, now);
+  return false;
+}
+
+// Resolve the session's project from the store — the single source of truth
+// for attribution, identity, and the CRM gate alike. Caller-supplied project
+// is a hint only (QA finding 3: trusting it misattributed a 2026-08-04 draft).
+function _storeProject(sessionId, callerProject) {
+  try {
+    const { loadSessions } = require("./store");
+    const s = loadSessions().find(x => x.id === sessionId);
+    if (s && s.project) {
+      if (callerProject && s.project !== callerProject) {
+        console.warn(`[email_draft] project mismatch: caller said '${callerProject}' but ` +
+                     `session ${sessionId} is '${s.project}' — using the store's value`);
+      }
+      return s.project;
+    }
+  } catch (e) { /* best-effort; fall through to caller value */ }
+  return callerProject;
+}
+
+function _allRecipientsInternal(draft) {
+  const rcpts = (draft.to + "," + (draft.cc || "")).split(",")
+    .map(a => a.trim().toLowerCase()).filter(Boolean);
+  return rcpts.length > 0 && rcpts.every(a => a.endsWith("@crankwheel.com"));
+}
+
 // Persist + push one draft. Persistence is what makes it survive; a throw from
 // the broadcast side must never lose the row, hence the ordering and the catch.
 function emitDraft(payload, sessionId, project) {
-  const draft = _normalise(payload, sessionId, project);
+  const storeProject = _storeProject(sessionId, project);
+  const draft = _normalise(payload, sessionId, storeProject);
   if (!draft) {
     console.warn("[email_draft] payload missing to/subject/body — not a draft, ignored");
     return null;
+  }
+  const hash = _draftHash(draft);
+  if (_seenRecently(sessionId, hash)) {
+    console.log(`[email_draft] duplicate within window, skipped: "${draft.subject.slice(0, 40)}"`);
+    return draft;
   }
   const { type, ...row } = draft;
   saveMessage(sessionId, Object.assign({ role: "email_draft" }, row));
@@ -171,25 +228,11 @@ function emitDraft(payload, sessionId, project) {
   } catch (e) {
     console.error("[email_draft] broadcast failed (draft IS saved, will replay on reconnect):", e.message);
   }
-  // Ledger attribution: derive project from the session store at write time
-  // rather than trusting the caller's parameter. A 2026-08-04 draft was
-  // ledgered with project=orchestratorHero for a crankHero session; the store
-  // is the single source of truth for a session's project.
-  let ledgerProject = project;
-  try {
-    const { loadSessions } = require("./store");
-    const s = loadSessions().find(x => x.id === sessionId);
-    if (s && s.project) {
-      if (s.project !== project) {
-        console.warn(`[email_draft] project mismatch: caller said '${project}' but ` +
-                     `session ${sessionId} is '${s.project}' — using the store's value`);
-      }
-      ledgerProject = s.project;
-    }
-  } catch (e) { /* ledger attribution best-effort; never block the draft */ }
   ledger("saved", { session_id: sessionId, to: draft.to, subject: draft.subject,
-                    project: ledgerProject, caller_project: project, ts: draft.ts });
-  if (draft.default_from_account === "crankwheel") {
+                    project: storeProject, caller_project: project, ts: draft.ts });
+  // CRM comm-event: crankwheel-identity drafts with at least one EXTERNAL
+  // recipient. Internal-only notes (Birta/Jói) are not deal state (QA 8).
+  if (draft.default_from_account === "crankwheel" && !_allRecipientsInternal(draft)) {
     notifyCrmCommEvent({
       action: "draft", to: draft.to, cc: draft.cc, subject: draft.subject,
       thread_id: draft.thread_id, attachments: draft.attachments,

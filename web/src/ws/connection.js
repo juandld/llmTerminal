@@ -428,7 +428,7 @@ getWss().on("connection", (ws, req) => {
             // turn, `result` is the last surviving copy and deleting it loses
             // the draft outright (the 2026-07-29 bug, headless variant).
             let _resultClean;
-            if (result.indexOf("```email-draft") !== -1 && !_draftCapturedThisTurn) {
+            if (result.indexOf("```email-draft") !== -1) {
               _resultClean = emailDraft.captureFences(result, session.id, session.project);
             } else {
               _resultClean = result.replace(/```email-draft\n[\s\S]*?\n```\s*/g, "").trim();

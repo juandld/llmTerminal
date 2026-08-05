@@ -206,7 +206,7 @@ function fireQueueHeadless(sessionId) {
           // is the only copy — capture rather than delete. Guarded on
           // "did we already save one this turn" so it can't double-card.
           let _resultClean;
-          if (result.indexOf("```email-draft") !== -1 && !_draftCapturedThisTurn) {
+          if (result.indexOf("```email-draft") !== -1) {
             _resultClean = emailDraft.captureFences(result, sessionId, session.project);
           } else {
             _resultClean = result.replace(/```email-draft\n[\s\S]*?\n```\s*/g, "").trim();

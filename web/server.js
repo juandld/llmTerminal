@@ -1502,12 +1502,12 @@ app.post("/api/email-draft/send", express.json(), (req, res) => {
       // This is THE send path — the one writer allowed to assert sent=true.
       // crankwheel-identity sends only (one DB per organization).
       if (account === "crankwheel") {
-        try {
-          require("./src/email-draft").notifyCrmCommEvent({
-            action: "sent", thread_id: (tm && tm[1]) || threadId || "", subject,
-            message_id: m ? m[1] : null,
-          });
-        } catch (e) { console.error("[email_sent] comm-event flip failed (send unaffected):", e.message); }
+        const safeReqThread = (threadId && /^[A-Za-z0-9_-]+$/.test(threadId)) ? threadId : "";
+        require("./src/email-draft").notifyCrmCommEvent({
+          action: "sent", thread_id: (tm && tm[1]) || safeReqThread, subject,
+          to, cc: cc || "",
+          message_id: m ? m[1] : null,
+        });
       }
       // Patch the original draft row with the values that were actually sent
       // (the user may have edited the agent's draft in place) plus a `sent`
