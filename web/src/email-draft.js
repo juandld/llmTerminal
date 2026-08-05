@@ -171,8 +171,24 @@ function emitDraft(payload, sessionId, project) {
   } catch (e) {
     console.error("[email_draft] broadcast failed (draft IS saved, will replay on reconnect):", e.message);
   }
+  // Ledger attribution: derive project from the session store at write time
+  // rather than trusting the caller's parameter. A 2026-08-04 draft was
+  // ledgered with project=orchestratorHero for a crankHero session; the store
+  // is the single source of truth for a session's project.
+  let ledgerProject = project;
+  try {
+    const { loadSessions } = require("./store");
+    const s = loadSessions().find(x => x.id === sessionId);
+    if (s && s.project) {
+      if (s.project !== project) {
+        console.warn(`[email_draft] project mismatch: caller said '${project}' but ` +
+                     `session ${sessionId} is '${s.project}' — using the store's value`);
+      }
+      ledgerProject = s.project;
+    }
+  } catch (e) { /* ledger attribution best-effort; never block the draft */ }
   ledger("saved", { session_id: sessionId, to: draft.to, subject: draft.subject,
-                    project, ts: draft.ts });
+                    project: ledgerProject, caller_project: project, ts: draft.ts });
   if (draft.default_from_account === "crankwheel") {
     notifyCrmCommEvent({
       action: "draft", to: draft.to, cc: draft.cc, subject: draft.subject,
