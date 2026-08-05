@@ -1427,11 +1427,7 @@ require("./src/auth")(app);
 // Map session.project -> default sending account (matches connection.js helper).
 // All sends still shell out to camoHero/scripts/send_gmail_email.py with all
 // safety checks; project just picks the From: identity.
-function _defaultFromAccountForProject(project) {
-  const p = String(project || "").toLowerCase();
-  if (p === "camohero") return "camofiles";
-  return "crankwheel";
-}
+const { defaultFromAccountForProject: _defaultFromAccountForProject } = require("./src/email-draft");
 
 app.post("/api/email-draft/send", express.json(), (req, res) => {
   const { sessionId, to, cc, subject, body, fromAccount, threadId, attachments, force, draftTs } = req.body || {};
