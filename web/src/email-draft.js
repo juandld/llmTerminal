@@ -130,6 +130,32 @@ function _normalise(payload, sessionId, project) {
   };
 }
 
+// Notify crankHero's authoritative comm-event store (data/crm.db) that a draft
+// exists. Fire-and-forget: the CRM record must never block or break the draft
+// flow. Localhost call with the CF-Access header the dashboard trusts (same
+// pattern as crankHero/scripts/verify_crm.sh). Only crankHero-identity drafts
+// belong in that DB (one store per organization — see crankHero
+// development/crm-single-source-plan.md).
+function notifyCrmCommEvent(body) {
+  try {
+    const data = JSON.stringify(body);
+    const req = require("http").request({
+      host: "127.0.0.1", port: 3001, path: "/crm/api/comm_events", method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(data),
+        "Cf-Access-Authenticated-User-Email": "david@crankwheel.com",
+      },
+      timeout: 4000,
+    }, res => { res.resume(); });
+    req.on("error", e => console.error("[email_draft] comm-event notify failed (draft unaffected):", e.message));
+    req.on("timeout", () => { req.destroy(new Error("timeout")); });
+    req.write(data); req.end();
+  } catch (e) {
+    console.error("[email_draft] comm-event notify failed (draft unaffected):", e.message);
+  }
+}
+
 // Persist + push one draft. Persistence is what makes it survive; a throw from
 // the broadcast side must never lose the row, hence the ordering and the catch.
 function emitDraft(payload, sessionId, project) {
@@ -147,6 +173,12 @@ function emitDraft(payload, sessionId, project) {
   }
   ledger("saved", { session_id: sessionId, to: draft.to, subject: draft.subject,
                     project, ts: draft.ts });
+  if (draft.default_from_account === "crankwheel") {
+    notifyCrmCommEvent({
+      action: "draft", to: draft.to, cc: draft.cc, subject: draft.subject,
+      thread_id: draft.thread_id, attachments: draft.attachments,
+    });
+  }
   console.log(`[email_draft] captured for ${sessionId}: "${draft.subject.slice(0, 60)}" -> ${draft.to}`);
   return draft;
 }
@@ -201,4 +233,5 @@ module.exports = {
   emitDraft,
   captureToolResult,
   captureFences,
+  notifyCrmCommEvent,
 };
