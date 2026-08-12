@@ -811,6 +811,12 @@
   .msg.email-draft .draft-hdr input.draft-input::placeholder{color:var(--dim);opacity:.7}
   .msg.email-draft .draft-hdr input.draft-input:focus{border-color:var(--accent);background:var(--surface2)}
   .msg.email-draft .draft-hdr input.draft-input:disabled{background:transparent;border-color:transparent;padding-left:0;color:var(--text);opacity:.85}
+  /* From: identity picker — same field styling as the inputs, green accent so
+     the sending identity stands out at a glance before tapping Send. */
+  .msg.email-draft .draft-hdr select.draft-from-select{background:var(--bg);border:1px solid var(--green);color:var(--green);font-family:var(--mono);font-size:12px;font-weight:600;padding:7px 9px;border-radius:6px;width:100%;box-sizing:border-box;min-height:34px;outline:none;appearance:none;-webkit-appearance:none}
+  .msg.email-draft .draft-hdr select.draft-from-select:focus{border-color:var(--accent)}
+  .msg.email-draft .draft-hdr select.draft-from-select:disabled{background:transparent;border-color:transparent;padding-left:0;opacity:.85}
+  .msg.email-draft .draft-hdr .draft-from-static{font-family:var(--mono);font-size:12px;font-weight:600;color:var(--green);word-break:break-all}
   .msg.email-draft .draft-participants{margin:0 0 10px;padding:8px 10px;background:var(--surface2);border:1px solid var(--border);border-radius:8px}
   .msg.email-draft .draft-participants-presets{display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap}
   .msg.email-draft .draft-mini-btn{padding:6px 10px;background:transparent;border:1px solid var(--border);color:var(--text);border-radius:6px;font-size:11px;font-family:var(--mono);cursor:pointer;min-height:28px}
