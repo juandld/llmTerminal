@@ -64,6 +64,49 @@ function addEmailDraft(msg){
   }
 
   const hdr = mk("div","draft-hdr");
+
+  // ── From: identity ──
+  // The send handler (POST /api/email-draft/send) passes `fromAccount` straight
+  // to camoHero/scripts/send_gmail_email.py --from <slug>; the slug resolves to
+  // a Gmail identity in camoHero/accounts.yaml. This map mirrors that file so
+  // the card can show the actual address about to be used — keep in sync if
+  // accounts are ever added there. Unknown slugs (e.g. future accounts on
+  // replayed cards) fall back to displaying the slug itself.
+  const FROM_IDENTITIES = {
+    crankwheel: "david@crankwheel.com",
+    camofiles: "david@camofiles.app",
+  };
+  const fromEmailFor = (slug) => FROM_IDENTITIES[slug] || slug;
+  // Same resolution the Send button used before this row existed: server-sent
+  // default_from_account, else derive from the draft's project. For sent
+  // replays prefer msg.account — the identity that ACTUALLY sent it (the
+  // server patches it onto the row on success).
+  const initialFromAccount = (wasSent && msg.account) ||
+    msg.default_from_account || (msg.project === "camoHero" ? "camofiles" : "crankwheel");
+  const fromKey = mk("span","k"); fromKey.textContent = "From:";
+  hdr.appendChild(fromKey);
+  // The server accepts any registered fromAccount from the client, so identity
+  // is user-choosable at send time — render a select, not a static line.
+  let fromSelect = null;
+  if (wasSent) {
+    const fv = mk("span","draft-from-static");
+    fv.textContent = fromEmailFor(initialFromAccount);
+    hdr.appendChild(fv);
+  } else {
+    fromSelect = mk("select","draft-input draft-from-select");
+    const slugs = Object.keys(FROM_IDENTITIES);
+    if (!slugs.includes(initialFromAccount)) slugs.unshift(initialFromAccount);
+    for (const slug of slugs) {
+      const o = document.createElement("option");
+      o.value = slug;
+      o.textContent = fromEmailFor(slug);
+      fromSelect.appendChild(o);
+    }
+    fromSelect.value = initialFromAccount;
+    hdr.appendChild(fromSelect);
+  }
+  const currentFromAccount = () => fromSelect ? fromSelect.value : initialFromAccount;
+
   const addEditableRow = (k, v, placeholder) => {
     const ek = mk("span","k"); ek.textContent = k;
     const ev = mk("input","v draft-input");
@@ -250,6 +293,7 @@ function addEmailDraft(msg){
   }
   function freezeEditing() {
     [toInput, ccInput, subjectInput, bodyEl].forEach(el => { el.disabled = true; });
+    if (fromSelect) fromSelect.disabled = true;
     if (participantsEl) {
       participantsEl.querySelectorAll("button").forEach(b => { b.disabled = true; });
     }
@@ -342,10 +386,16 @@ function addEmailDraft(msg){
   // session.project just picks the From: identity by default.
   // Two-tap confirm (mobile-fastest, mirrors how the rest of the cards behave).
   {
-    const fromAccount = msg.default_from_account || (msg.project === "camoHero" ? "camofiles" : "crankwheel");
     const sendBtn = mk("button","draft-btn primary send");
-    const SEND_LABEL = "\u{1F680} Send (" + fromAccount + ")";
-    sendBtn.textContent = SEND_LABEL;
+    // Label tracks the From: select so the button always names the identity
+    // that the tap will actually send as.
+    const sendLabel = () => "\u{1F680} Send as " + fromEmailFor(currentFromAccount());
+    sendBtn.textContent = sendLabel();
+    if (fromSelect) {
+      fromSelect.addEventListener("change", () => {
+        if (!sending && !armed) sendBtn.textContent = sendLabel();
+      });
+    }
     const forceBtn = mk("button", "draft-btn force");
     forceBtn.textContent = "⚠ Force send";
     forceBtn.style.display = "none";
@@ -361,7 +411,7 @@ function addEmailDraft(msg){
           if (armed && !sending) {
             armed = false;
             sendBtn.classList.remove("armed");
-            sendBtn.textContent = SEND_LABEL;
+            sendBtn.textContent = sendLabel();
           }
         }, 4000);
         return;
@@ -375,7 +425,7 @@ function addEmailDraft(msg){
         const r = await fetch(apiUrl("/api/email-draft/send"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ sessionId: (session && session.id) || "", ...c, threadId, attachments, fromAccount, draftTs }),
+          body: JSON.stringify({ sessionId: (session && session.id) || "", ...c, threadId, attachments, fromAccount: currentFromAccount(), draftTs }),
         });
         const data = await r.json();
         if (data.ok) {
@@ -394,7 +444,7 @@ function addEmailDraft(msg){
           setTimeout(() => {
             sending = false; armed = false;
             sendBtn.disabled = false;
-            sendBtn.textContent = SEND_LABEL;
+            sendBtn.textContent = sendLabel();
             sendBtn.classList.remove("failed");
           }, 3000);
         }
@@ -405,7 +455,7 @@ function addEmailDraft(msg){
         setTimeout(() => {
           sending = false; armed = false;
           sendBtn.disabled = false;
-          sendBtn.textContent = SEND_LABEL;
+          sendBtn.textContent = sendLabel();
           sendBtn.classList.remove("failed");
         }, 6000);
       }
@@ -435,7 +485,7 @@ function addEmailDraft(msg){
         const r = await fetch(apiUrl("/api/email-draft/send"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ sessionId: (session && session.id) || "", ...c, threadId, attachments, fromAccount, force: true, draftTs }),
+          body: JSON.stringify({ sessionId: (session && session.id) || "", ...c, threadId, attachments, fromAccount: currentFromAccount(), force: true, draftTs }),
         });
         const data = await r.json();
         if (data.ok) {
