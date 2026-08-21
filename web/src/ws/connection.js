@@ -19,6 +19,7 @@ const { queueAppend, queueLoad, queueSaveAll, broadcastQueueState } = require(".
 const { summarizeToolUse, autoCreatePreview, autoDetectBashFiles } = require("../tools");
 const { logFileAttribution } = require("../attribution");
 const { saveUploadedImage } = require("../uploads");
+const { noteClientConnection } = require("../geo-location");
 const governor = require("../governor");
 const attention = require("../attention");
 const emailDraft = require("../email-draft");
@@ -43,6 +44,9 @@ function _lastPromptAnswered(msgs) {
 
 function registerWsHandlers() {
 getWss().on("connection", (ws, req) => {
+  // Fire-and-forget: log client-IP headers + auto-detect operator location
+  // (geo-location.js). Sync part is header-parse only — never blocks connect.
+  try { noteClientConnection(req); } catch (e) { console.warn("[geo-ip] connect hook failed:", e.message); }
   const url = new URL(req.url, "http://localhost");
   const project = url.searchParams.get("project") || "narrativeHero";
   const resumeId = url.searchParams.get("session");
