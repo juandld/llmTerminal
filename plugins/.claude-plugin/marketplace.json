@@ -1,0 +1,16 @@
+{
+  "name": "llmterminal-plugins",
+  "owner": {
+    "name": "llmTerminal"
+  },
+  "metadata": {
+    "description": "Local marketplace for llmTerminal-authored plugins. Lives in-repo so plugins are committed, reviewable, and toggleable via `claude plugin enable/disable --scope project` instead of living under root-owned .claude/skills/. Mirrors the orchestratorHero/plugins/hero-plugins pattern (see that marketplace.json for the same convention)."
+  },
+  "plugins": [
+    {
+      "name": "orchestrate-tournament",
+      "source": "./orchestrate-tournament",
+      "description": "Two competing orchestration philosophies (full decompose-and-dispatch vs minimal direct-execution) wired as fork-and-select variants against HARNESS_PLAN slot #3/#6's experiments data pipe."
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+{
+  "enabledPlugins": {
+    "orchestrate-tournament@llmterminal-plugins": true
+  }
+}

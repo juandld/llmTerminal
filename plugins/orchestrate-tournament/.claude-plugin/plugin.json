@@ -1,0 +1,9 @@
+{
+  "name": "orchestrate-tournament",
+  "version": "1.0.0",
+  "description": "Two competing orchestration philosophies (full decompose-and-dispatch vs minimal direct-execution) wired as fork-and-select variants against HARNESS_PLAN slot #3/#6's experiments data pipe.",
+  "author": {
+    "name": "David",
+    "email": "david@crankwheel.com"
+  }
+}
