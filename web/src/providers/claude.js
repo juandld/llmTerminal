@@ -12,12 +12,13 @@ const { sessionPermissions, ensurePermissionsLoaded } = require("../permissions"
 const { getProvider, loadChatSystemPrompt } = require("./context");
 const { autoDetectBashFiles, autoCreatePreview, summarizeToolUse } = require("../tools");
 const { logFileAttribution } = require("../attribution");
-const { spawnDecisionExtractor, spawnContractCheck, reconcileFileAttribution } = require("../supervisors");
+const { spawnDecisionExtractor, spawnContractCheck, spawnLoopCheck, reconcileFileAttribution } = require("../supervisors");
 const { generateSessionTitle } = require("../session-title");
 const { _bwrapWrap } = require("../bwrap");
 const { queuePopNext, broadcastQueueState } = require("../queue");
 const throttle = require("../throttle");
 const runReg = require("../run-registry");
+const { autoloopPrompt } = require("../autoloop");
 const governor = require("../governor");
 const runLedger = require("../run-ledger");
 const attention = require("../attention");
@@ -73,8 +74,8 @@ function fireQueueHeadless(sessionId) {
   _persistSessionIfNew(session);
   updateSessionInStore(session);
   const firingTs = next.ts || Date.now();
-  saveMessage(sessionId, { role: "user", text: next.text, ts: firingTs, source: next.source, client_id: next.client_id, audioUrl: next.audioUrl, hasImages: !!next.hasImages });
-  broadcastToSession(sessionId, { type: "queued_prompt_firing", text: next.text, source: next.source, client_id: next.client_id, ts: firingTs, audioUrl: next.audioUrl });
+  saveMessage(sessionId, { role: "user", text: next.text, ts: firingTs, source: next.source, client_id: next.client_id, audioUrl: next.audioUrl, hasImages: !!next.hasImages, imageUrls: next.imageUrls || undefined });
+  broadcastToSession(sessionId, { type: "queued_prompt_firing", text: next.text, source: next.source, client_id: next.client_id, ts: firingTs, audioUrl: next.audioUrl, imageUrls: next.imageUrls || undefined });
   broadcastToSession(sessionId, { type: "thinking", session_id: sessionId });
   broadcastQueueState(sessionId);
   const cwd = path.join(PROJECTS_DIR, session.project);
@@ -230,6 +231,7 @@ function fireQueueHeadless(sessionId) {
         }
         setTimeout(() => { try { spawnDecisionExtractor(sessionId, session.project); } catch {} }, 800);
         setTimeout(() => { try { spawnContractCheck(sessionId, session.project); } catch {} }, 1100);
+        setTimeout(() => { try { spawnLoopCheck(sessionId, session.project); } catch {} }, 1400);
       }
     },
     (code, stderr) => {
@@ -293,8 +295,8 @@ function tryDrainQueue(sessionId) {
   _persistSessionIfNew(session);
   updateSessionInStore(session);
   const firingTs = next.ts || Date.now();
-  saveMessage(sessionId, { role: "user", text: next.text, ts: firingTs, source: next.source, client_id: next.client_id, audioUrl: next.audioUrl, hasImages: !!next.hasImages });
-  try { target.send(JSON.stringify({ type: "queued_prompt_firing", text: next.text, source: next.source, client_id: next.client_id, ts: firingTs, audioUrl: next.audioUrl })); } catch {}
+  saveMessage(sessionId, { role: "user", text: next.text, ts: firingTs, source: next.source, client_id: next.client_id, audioUrl: next.audioUrl, hasImages: !!next.hasImages, imageUrls: next.imageUrls || undefined });
+  try { target.send(JSON.stringify({ type: "queued_prompt_firing", text: next.text, source: next.source, client_id: next.client_id, ts: firingTs, audioUrl: next.audioUrl, imageUrls: next.imageUrls || undefined })); } catch {}
   try { target.send(JSON.stringify({ type: "thinking" })); } catch {}
   // Tell every client on this session that one item just left the queue, so the
   // pending-bubble list re-renders without the popped item.
@@ -334,6 +336,44 @@ function killExistingClaudeFor(claudeSessionId) {
 // handler), so a long voice-note session that drifts across topics keeps a sidebar
 // title reflecting what it's currently about. Fire-and-forget; ~5-15s. Tools
 // disabled so the model can't wander off researching before it answers.
+// Slot #6 (tournament wiring, 2026-08-23): the orchestrate A/B variant
+// stamped by experiments.js (assignVariants) had NO consumer anywhere in
+// the run pipeline — every session behaved identically regardless of which
+// arm it was assigned, so the A/B framework (slot #3, marked "shipped") was
+// measuring pure noise. This is the fix: "off" sessions get an explicit
+// system-prompt instruction suppressing the orchestrate skill's
+// classify/decompose/dispatch behavior; "on" (or unassigned, pre-experiment)
+// sessions get the skill's normal behavior — the actual manipulated
+// variable the experiment is supposed to be testing. Extracted as its own
+// function (not inlined) so it's testable without spawning a real claude
+// process — see web/scripts/test-orchestrate-variant-wiring.js.
+function _buildVariantPromptAdd(sessionId) {
+  try {
+    const sess = sessionId ? loadSessions().find(s => s.id === sessionId) : null;
+    const v = sess && sess.variants;
+    if (v && v.orchestrate === "off") {
+      // orchestrate:off wins outright — no orchestrate skill behavior at
+      // all, so orchestrate_style (full vs minimal) is moot for this
+      // session; don't layer a second instruction on top.
+      return "\n\nA/B experiment (orchestrate:off) — do NOT use the orchestrate skill's classify/decompose/Workflow-dispatch behavior for this session. Handle multi-step requests directly yourself, without spawning a Workflow fan-out, regardless of how complex the request seems.";
+    }
+    // Slot #6 tournament arm (orchestrate_style: full vs minimal). The
+    // plugin package (plugins/orchestrate-tournament/skills/{orchestrate-full,
+    // orchestrate-minimal}) exists on disk but isn't registered in the live
+    // harness yet (~/.claude.json's plugin registry is protected — see
+    // HARNESS_PLAN.md slot #6). Until it's registered, this system-prompt
+    // injection is what makes the variant assignment causally matter —
+    // same pattern as the orchestrate:off fix above. "full" is the baseline
+    // (matches the existing orchestrate skill's natural default, no nudge
+    // needed); "minimal" gets an explicit bias instruction mirroring the
+    // orchestrate-minimal plugin skill's stance.
+    if (v && v.orchestrate_style === "minimal") {
+      return "\n\nA/B experiment (orchestrate_style:minimal) — for this session, bias HARD toward direct execution over decomposition. Before reaching for the orchestrate skill's Workflow fan-out, ask \"can I just do this myself, directly, right now?\" — the answer is yes far more often than a decomposition-biased default assumes. Only decompose when the user explicitly asks for N independent attempts to compare, or the work is provably parallel AND large enough that sequential execution would meaningfully delay them.";
+    }
+  } catch (e) { console.warn("[claude] variant lookup failed (non-fatal):", e.message); }
+  return "";
+}
+
 function runClaude(opts, onData, onDone) {
   const { project, prompt, claudeSessionId, cwd, extraAllowedTools, model, sessionId, effort } = opts;
   const _attempt = opts._attempt || 0;
@@ -445,7 +485,7 @@ function runClaude(opts, onData, onDone) {
   // here, then appended (claude already has its own harness prompt). One Claude-only
   // note: AskUserQuestion is disabled via --disallowedTools and the chat prompt
   // tells the model to use mcp__llmterminal__llmt_ask instead.
-  const SYSTEM_PROMPT_ADD = loadChatSystemPrompt() + "\n\nDo NOT use the built-in AskUserQuestion tool — it is disabled in this harness and returns a misleading error.";
+  const SYSTEM_PROMPT_ADD = loadChatSystemPrompt() + "\n\nDo NOT use the built-in AskUserQuestion tool — it is disabled in this harness and returns a misleading error." + _buildVariantPromptAdd(sessionId);
   // Phase C: deny the hosted claude.ai Google MCPs project-wide. They
   // bypass the canonical data.* layer + use a different identity, leading
   // the agent to flail when answers don't match what data.* would give.
@@ -519,9 +559,23 @@ function runClaude(opts, onData, onDone) {
   activeProcs.add(proc);
   proc.on("close", () => activeProcs.delete(proc));
   // Registry: every signal-bearing event on this run flows through the taps
-  // below. runStarted also supersedes any prior wake for the session — a wake
-  // is only live if the CURRENT turn's ScheduleWakeup set it.
-  if (sessionId) runReg.runStarted(sessionId, proc.pid, "claude");
+  // below. runStarted also supersedes any prior ScheduleWakeup-set wake for
+  // the session — a wake is only live if the CURRENT turn's ScheduleWakeup
+  // set it. EXCEPTION: session.autoloopIntervalMs (server-native recurrence)
+  // is a standing setting, not a per-turn wake — pass it through so
+  // runStarted re-arms instead of killing it (fixed 2026-08-23; it used to
+  // die silently on any turn David started himself, e.g. a plain chat msg).
+  if (sessionId) {
+    let _autoloopMs = null;
+    try {
+      const _sess = loadSessions().find(s => s.id === sessionId);
+      _autoloopMs = (_sess && _sess.autoloopIntervalMs) || null;
+    } catch {}
+    runReg.runStarted(sessionId, proc.pid, "claude", _autoloopMs ? {
+      autoloopIntervalMs: _autoloopMs,
+      autoloopPrompt: autoloopPrompt(_autoloopMs),
+    } : undefined);
+  }
   // Run-ledger L4: spawn / first_output / 30s heartbeats / exit, all appended
   // to ~/.llm-terminal/run-ledger.jsonl. A spawn with a dead pid and no exit
   // entry = the previously-invisible wedge, now visible by construction.
@@ -607,4 +661,4 @@ function runClaude(opts, onData, onDone) {
 
 // ---- WebSocket ----
 
-module.exports = { runClaude, fireQueueHeadless, tryDrainQueue, killExistingClaudeFor };
+module.exports = { runClaude, fireQueueHeadless, tryDrainQueue, killExistingClaudeFor, _buildVariantPromptAdd };

@@ -71,6 +71,7 @@ const { activeProcs, activeProcBySession } = require("./src/proc-state");
 const deferredRestart = require("./src/deferred-restart");
 const { runOpenAI } = require("./src/providers/openai");
 const { runGoogle } = require("./src/providers/google");
+const { runDeepSeek } = require("./src/providers/deepseek");
 const { getProvider } = require("./src/providers/context");
 const { saveUploadedImage } = require("./src/uploads");
 // ---- Startup recovery: fix any sessions stuck from before restart ----
@@ -115,7 +116,10 @@ setTimeout(() => {
     // through the Claude CLI (which rejects non-Claude models with "you may not
     // have access to it"). Mirrors the routing in ws/connection.js.
     const _provider = getProvider(session.model);
-    const _runFn = _provider === "openai" ? runOpenAI : _provider === "google" ? runGoogle : runClaude;
+    const _runFn = _provider === "openai" ? runOpenAI :
+                   _provider === "google" ? runGoogle :
+                   _provider === "deepseek" ? runDeepSeek :
+                   runClaude;
     if (_provider === "claude") killExistingClaudeFor(session.claudeSessionId);
     const _runArgs = _provider === "claude"
       ? { project: session.project, prompt: lastUserMsg.text, claudeSessionId: session.claudeSessionId, cwd, extraAllowedTools: perms ? [...perms] : [], model: session.model, sessionId: session.id, effort: session.effort, governorComponent: "llmterminal-auto", spawnTrigger: "recovery" }
@@ -160,6 +164,7 @@ setTimeout(() => {
 // defaming healthy runs) are gone; see LIVENESS-AND-FRUITION-PLAN-2026-07-04.md.
 const runReg = require("./src/run-registry");
 const runLedger = require("./src/run-ledger");
+const experiments = require("./src/experiments");
 runReg.loadRegistry(); // adopt/bury persisted entries before any timer fires
 const STALLED_SWEEP_INTERVAL_MS = 5 * 60 * 1000;   // every 5 min
 const _STALLED_STUCK_ROLES = new Set(["tool_activity", "tool_result", "permission_granted"]);
@@ -191,6 +196,16 @@ function sweepStalledSessions() {
           const note = "⚠️ The agent process wedged (no CPU/io activity across two sweeps) and was terminated. Re-prompt to continue.";
           saveMessage(s.id, { role: "assistant", text: note, ts: now, recovered: true, stalled: true });
           try { broadcastToSession(s.id, { type: "history", messages: loadMessages(s.id) }); } catch {}
+          // Experiments session_end row (data-pipe #3): stalled variant.
+          try {
+            const _userMsgs = loadMessages(s.id).filter(m => m.role === "user").length;
+            experiments.recordSessionEnd(s, {
+              endedVia: "stalled",
+              totalTurns: _userMsgs,
+              totalUserMsgs: _userMsgs,
+              totalDurationMs: s.created ? now - s.created : 0,
+            });
+          } catch (expErr) { console.error("[experiments] stalled session_end failed:", expErr.message); }
           marked++;
         }
       } else if (v.state === "dead_mid_run") {
@@ -198,6 +213,16 @@ function sweepStalledSessions() {
         saveMessage(s.id, { role: "assistant", text: note, ts: now, recovered: true, stalled: true });
         try { broadcastToSession(s.id, { type: "history", messages: loadMessages(s.id) }); } catch {}
         console.log("[stalled-sweep] dead mid-run, marked:", s.id, v.legacy ? "(legacy-age fallback)" : "(pid " + v.pid + ", exit " + v.exitCode + ")", "—", runLedger.evidence(s.id));
+        // Experiments session_end row (data-pipe #3): stalled variant.
+        try {
+          const _userMsgs = loadMessages(s.id).filter(m => m.role === "user").length;
+          experiments.recordSessionEnd(s, {
+            endedVia: "stalled",
+            totalTurns: _userMsgs,
+            totalUserMsgs: _userMsgs,
+            totalDurationMs: s.created ? now - s.created : 0,
+          });
+        } catch (expErr) { console.error("[experiments] stalled session_end failed:", expErr.message); }
         // Dead-run auto-continuation (call-for-David B): same revive/cap logic
         // as the in-proc onClose hook, for deaths only the sweep can see
         // (procs SIGKILLed with the server, orphans with no close handler).
@@ -239,6 +264,21 @@ setInterval(_looseEndsTick, STALLED_SWEEP_INTERVAL_MS).unref();
 // fireQueueHeadless), which gives the full pipeline: user message with
 // source:"wake", tool activity rows, previews, supervisors, queue serialization.
 const WAKE_SWEEP_INTERVAL_MS = 30 * 1000;
+// Native autoloop recurrence (2026-08-23, fixed same day). Before this, "the
+// loop keeps running" only worked because the AGENT remembered to call
+// ScheduleWakeup again inside its own wake-prompt response — fragile, and it
+// kept silently dying between conversational turns (a new turn always
+// supersedes a pending wake by ScheduleWakeup's own contract) until David
+// noticed and manually re-prompted. session.autoloopIntervalMs is a
+// persisted per-session setting (set via the topbar autoloop menu / POST
+// /api/sessions/:id/autoloop). The re-arm itself now lives in ONE place —
+// run-registry.js's runStarted(), which fires for every turn start whether
+// triggered by a fired wake or by David sending a plain chat message — so
+// re-arming here too would race/duplicate it. First bug: re-arming only on
+// wake-fire meant a David-initiated turn killed the pending wake outright
+// (runStarted's unconditional supersede) while autoloopIntervalMs stayed set,
+// so the topbar showed "on" with a dead timer underneath. See HARNESS_PLAN.md.
+const { AUTOLOOP_MIN_INTERVAL_MS, AUTOLOOP_MAX_INTERVAL_MS, autoloopPrompt: _autoloopPrompt } = require("./src/autoloop");
 function sweepDueWakes() {
   try {
     const due = runReg.dueWakes(Date.now());
@@ -277,6 +317,8 @@ function sweepDueWakes() {
       console.log("[wake-sweep] firing wake for", e.sessionId.slice(0, 8), overdueMin > 1 ? "(" + overdueMin + "min overdue)" : "", "reason:", (e.wakeReason || "").slice(0, 60));
       queueAppend(e.sessionId, { text: prompt, source: "wake", ts: Date.now() });
       try { tryDrainQueue(e.sessionId); } catch (err) { console.error("[wake-sweep] drain failed:", err.message); }
+      // Re-arming the next wake happens inside run-registry's runStarted(),
+      // once the spawned turn actually starts — not here. See comment above.
     }
   } catch (e) {
     console.error("[wake-sweep] error:", e.message);
@@ -1572,8 +1614,12 @@ app.get("/api/deferred-restart", (req, res) => res.json(deferredRestart.status()
 // Exactly-once: skipped if the client_id was already delivered (saved message)
 // or is already queued (queueAppend dedupes). The client drops the item from
 // its outbox only after this returns ok:true.
-app.post("/api/outbox-capture", express.json(), (req, res) => {
-  const { sessionId, client_id, text, source } = req.body || {};
+// Images (2026-08-14, train-work hardening): accepts an optional images:[{data,mimeType}]
+// array so image-bearing prompts have the same no-loss guarantees as text. The
+// image processing mirrors the WS prompt handler at ws/connection.js:667-691 —
+// keep in sync. 20mb limit covers ~5 phone-camera JPEGs at 4MB each.
+app.post("/api/outbox-capture", express.json({ limit: "20mb" }), async (req, res) => {
+  const { sessionId, client_id, text, source, images } = req.body || {};
   if (!sessionId || !client_id || !text) {
     return res.status(400).json({ ok: false, error: "sessionId, client_id, text required" });
   }
@@ -1588,11 +1634,35 @@ app.post("/api/outbox-capture", express.json(), (req, res) => {
       return res.json({ ok: true, dup: "delivered" });
     }
   } catch {}
+  const imgList = Array.isArray(images) ? images : [];
+  const imagePaths = [];
+  for (const img of imgList) {
+    if (img && img.data) {
+      try {
+        const p = await saveUploadedImage(img.data, img.mimeType);
+        imagePaths.push(p);
+      } catch (e) {
+        console.error("[outbox-capture] saveUploadedImage failed:", e.message);
+      }
+    }
+  }
+  const imageUrls = imagePaths.map(p => "/user-uploads/" + path.basename(p));
+  let promptText = String(text);
+  if (imagePaths.length > 0) {
+    const imageRefs = imagePaths.map((p, i) => `[Image ${i + 1}: ${p}]`).join(" ");
+    promptText = `${text}\n\nThe user attached ${imagePaths.length} image(s). Read them with the Read tool to see them: ${imageRefs}`;
+  }
   const appended = queueAppend(sessionId, {
-    text: String(text), source: source || "outbox-capture", client_id, ts: Date.now(),
+    text: String(text),
+    promptText,
+    source: source || "outbox-capture",
+    client_id,
+    ts: Date.now(),
+    hasImages: imagePaths.length > 0,
+    imageUrls,
   });
   if (!appended) return res.status(500).json({ ok: false, error: "queue append failed" });
-  console.log("[outbox-capture] secured message for", sessionId, ":", String(text).slice(0, 60));
+  console.log("[outbox-capture] secured message for", sessionId, ":", String(text).slice(0, 60), imagePaths.length ? `(+${imagePaths.length} img)` : "");
   try { broadcastQueueState(sessionId); } catch {}
   // Fire it if the session is idle (drain no-ops when a run is active).
   setTimeout(() => { try { tryDrainQueue(sessionId); } catch (e) { console.error("[outbox-capture] drain failed:", e.message); } }, 100);
@@ -1763,6 +1833,156 @@ const PORT = process.env.PORT || 7683;
 const jobsLedger = require("./src/jobs");
 app.get("/api/jobs", (_req, res) => res.json(jobsLedger.listJobs()));
 setInterval(() => { try { jobsLedger.sweepStalled(); } catch {} }, 30000).unref();
+
+// ---- /api/harness-plan (slot #9) ----
+// Reads HARNESS_PLAN.md, extracts numbered slots + progress log. Cache 30s so
+// the poll on plan.html doesn't reparse on every hit.
+const { parseHarnessPlan } = require("./src/harness-plan-parser");
+const HARNESS_PLAN_PATH = path.join(__dirname, "..", "HARNESS_PLAN.md");
+let _harnessPlanCache = { at: 0, data: null };
+app.get("/api/harness-plan", (_req, res) => {
+  const now = Date.now();
+  if (_harnessPlanCache.data && (now - _harnessPlanCache.at) < 30000) {
+    return res.json({ ..._harnessPlanCache.data, cached: true });
+  }
+  try {
+    const data = parseHarnessPlan(HARNESS_PLAN_PATH);
+    _harnessPlanCache = { at: now, data };
+    res.json({ ...data, cached: false });
+  } catch (e) {
+    res.status(500).json({ error: "parse failed: " + e.message });
+  }
+});
+
+// ---- /api/autoloop-log (observability, added 2026-08-23) ----
+// Durable record of every autoloop iteration: what was attempted, HOW it was
+// verified (browser pass / curl / unit test / read-only), and what remains an
+// open question. See web/src/autoloop-log.js for the full rationale + the
+// browser-verification methodology this enforces by convention.
+const autoloopLog = require("./src/autoloop-log");
+app.get("/api/autoloop-log", (req, res) => {
+  try {
+    const n = Math.min(200, Math.max(1, parseInt(req.query.n, 10) || 30));
+    res.json({
+      entries: autoloopLog.readRecent(n),
+      openQuestions: autoloopLog.unresolvedQuestions(),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---- /api/experiments/summary (slot #3, data-pipe only) ----
+// Plain-text rollup of the experiments.jsonl log. Same pattern as
+// /api/harness-plan above: no caching (log is small, read is cheap, and
+// David wants live counts). See web/src/experiments.js for the N=1 caveat
+// this route explicitly surfaces at the top of the output when any
+// variant arm has fewer than N_THRESHOLD sessions.
+app.get("/api/experiments/summary", (_req, res) => {
+  try {
+    res.type("text/plain").send(experiments.summarize());
+  } catch (e) {
+    res.status(500).type("text/plain").send("[experiments] summarize failed: " + e.message + "\n");
+  }
+});
+
+// ---- /api/activity (slot #9) ----
+// Cheap in-memory read of activeProcBySession — powers the pulsing "someone's
+// working now" indicator on plan.html and (later) the orchestratorHero tile.
+app.get("/api/activity", (_req, res) => {
+  const sessions = loadSessions();
+  const byId = new Map(sessions.map(s => [s.id, s]));
+  const active = [...activeProcBySession.keys()].map(id => {
+    const s = byId.get(id) || {};
+    return {
+      id,
+      project: s.project || null,
+      project_dir: s.project_dir || null,
+      title: s.title || null,
+    };
+  });
+  res.json({
+    count: activeProcBySession.size,
+    sessions: active,
+    server_time: Date.now(),
+  });
+});
+
+// ---- /api/sessions/:id/wake (2026-08-23) ----
+// Powers the live countdown-on-Stop-button UI: David kept losing visibility
+// into whether the autoloop's next auto-resume was actually armed, since the
+// Stop button only ever showed while a run was BUSY — a session idling
+// between wakes had nothing visible at all. Cheap in-memory read of
+// run-registry's wake state; polled client-side every few seconds.
+app.get("/api/sessions/:id/wake", (req, res) => {
+  const entry = runReg.getEntry(req.params.id);
+  const s = loadSessions().find(x => x.id === req.params.id);
+  const autoloopIntervalMs = (s && s.autoloopIntervalMs) || null;
+  if (!entry || !entry.wakeAt) {
+    return res.json({ armed: false, wakeAt: null, reason: null, autoloopIntervalMs, server_time: Date.now() });
+  }
+  res.json({
+    armed: true,
+    wakeAt: entry.wakeAt,
+    reason: entry.wakeReason || null,
+    late: !!entry.wakeLate,
+    autoloopIntervalMs,
+    server_time: Date.now(),
+  });
+});
+
+// ---- POST /api/sessions/:id/autoloop (2026-08-23) ----
+// David: "I should have a trigger for the loop... click on the green
+// indicator, it opens a menu to select intervals." Sets the persisted
+// per-session autoloop setting. intervalMs=null/0 turns it off (disarms any
+// pending wake too — Stop-equivalent, not just "skip one cycle"). A
+// non-null value both saves the setting AND arms the first wake
+// immediately — sweepDueWakes takes over the recurrence from there.
+app.post("/api/sessions/:id/autoloop", (req, res) => {
+  const sessionId = req.params.id;
+  const sessions = loadSessions();
+  const session = sessions.find(s => s.id === sessionId);
+  if (!session) return res.status(404).json({ ok: false, error: "session not found" });
+  let intervalMs = req.body && req.body.intervalMs;
+  intervalMs = Number.isFinite(intervalMs) ? intervalMs : null;
+  if (intervalMs !== null) {
+    intervalMs = Math.min(AUTOLOOP_MAX_INTERVAL_MS, Math.max(AUTOLOOP_MIN_INTERVAL_MS, intervalMs));
+  }
+  session.autoloopIntervalMs = intervalMs || null;
+  saveSessions(sessions);
+  if (session.autoloopIntervalMs) {
+    runReg.armWake(sessionId, {
+      fireAt: Date.now() + session.autoloopIntervalMs,
+      prompt: _autoloopPrompt(session.autoloopIntervalMs),
+      reason: "autoloop turned on via topbar menu, every " + Math.round(session.autoloopIntervalMs / 60000) + "min",
+    }, "armed (autoloop turned on)");
+  } else {
+    runReg.disarmWake(sessionId, "cancelled (autoloop turned off via topbar menu)");
+  }
+  res.json({ ok: true, autoloopIntervalMs: session.autoloopIntervalMs });
+});
+
+// ---- POST /api/sessions/:id/wake/fire-now (2026-08-23) ----
+// Companion to the countdown bar's Stop (cancel) button — David: "I should
+// also see the button to resume now." Rather than duplicate sweepDueWakes'
+// firing logic, this just re-arms the SAME wake with fireAt=now (the exact
+// setter ScheduleWakeup itself uses) and immediately calls sweepDueWakes()
+// synchronously instead of waiting up to 30s for the next interval tick —
+// one code path, no duplicated firing logic to drift out of sync.
+app.post("/api/sessions/:id/wake/fire-now", (req, res) => {
+  const sessionId = req.params.id;
+  const entry = runReg.getEntry(sessionId);
+  if (!entry || !entry.wakeAt) {
+    return res.status(404).json({ ok: false, error: "no wake armed for this session" });
+  }
+  runReg.armWake(sessionId, {
+    fireAt: Date.now() - 1,
+    prompt: entry.wakePrompt,
+    reason: entry.wakeReason,
+  }, "armed (manual fire-now)");
+  try { sweepDueWakes(); } catch (e) { console.error("[wake] fire-now sweep failed:", e.message); }
+  res.json({ ok: true });
+});
 
 server.listen(PORT, "127.0.0.1", () => console.log("llmTerminal on port", PORT, "(127.0.0.1 only; reached via nginx/tunnel)"));
 try { require("./src/leak-trace").start(); } catch (e) { console.log("[leak-trace] failed to start:", e.message); }

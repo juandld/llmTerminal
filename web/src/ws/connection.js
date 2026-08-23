@@ -12,7 +12,7 @@ const { runOpenAI } = require("../providers/openai");
 const { runGoogle } = require("../providers/google");
 const { activeProcBySession } = require("../proc-state");
 const { sessionPermissions, ensurePermissionsLoaded, savePermissions } = require("../permissions");
-const { spawnDecisionExtractor, spawnContractCheck, reconcileFileAttribution } = require("../supervisors");
+const { spawnDecisionExtractor, spawnContractCheck, spawnLoopCheck, reconcileFileAttribution } = require("../supervisors");
 const { generateSessionTitle } = require("../session-title");
 const { issueVoiceNonce, revokeNoncesForWs } = require("../voice-nonce");
 const { queueAppend, queueLoad, queueSaveAll, broadcastQueueState } = require("../queue");
@@ -23,6 +23,7 @@ const { noteClientConnection } = require("../geo-location");
 const governor = require("../governor");
 const attention = require("../attention");
 const emailDraft = require("../email-draft");
+const runReg = require("../run-registry");
 const { defaultFromAccountForProject } = require("../email-draft");
 
 // Answered-ness guard, shared by every automated re-fire in onDone below: the
@@ -376,6 +377,7 @@ getWss().on("connection", (ws, req) => {
           // setTimeout(() => { try { spawnObserver(session.id, session.project); } catch (e) { console.error("[observer] hook failed:", e.message); } }, 500);
           setTimeout(() => { try { spawnDecisionExtractor(session.id, session.project); } catch (e) { console.error("[decision-extractor] hook failed:", e.message); } }, 800);
           setTimeout(() => { try { spawnContractCheck(session.id, session.project); } catch (e) { console.error("[contract-check] hook failed:", e.message); } }, 1100);
+          setTimeout(() => { try { spawnLoopCheck(session.id, session.project); } catch (e) { console.error("[loop-check] hook failed:", e.message); } }, 1400);
           // File-attribution reconcile — runs FAST (synchronous filesystem walk),
           // fires immediately so unattributed files from this run get linked before
           // the user opens the drawer.
@@ -614,7 +616,7 @@ getWss().on("connection", (ws, req) => {
     if (activeProc) activeProcBySession.set(session.id, activeProc);
   }
 
-  ws.on("message", (raw) => {
+  ws.on("message", async (raw) => {
     const msg = JSON.parse(raw.toString());
 
     switch (msg.type) {
@@ -675,10 +677,19 @@ getWss().on("connection", (ws, req) => {
         const imagePaths = [];
         for (const img of images) {
           if (img.data) {
-            const p = saveUploadedImage(img.data, img.mimeType);
-            imagePaths.push(p);
+            try {
+              const p = await saveUploadedImage(img.data, img.mimeType);
+              imagePaths.push(p);
+            } catch (e) {
+              console.error("[prompt] saveUploadedImage failed:", e.message);
+            }
           }
         }
+        // URL form the client can render via <img src>. Kept alongside the
+        // filesystem paths so the persisted user message can restore thumbnails
+        // on refresh / cross-device open (2026-08-12: pasted-image previews were
+        // vanishing after any reconnect because only hasImages was persisted).
+        const imageUrls = imagePaths.map(p => "/user-uploads/" + path.basename(p));
         let prompt = text;
         if (imagePaths.length > 0) {
           const imageRefs = imagePaths.map((p, i) => `[Image ${i + 1}: ${p}]`).join(" ");
@@ -699,6 +710,7 @@ getWss().on("connection", (ws, req) => {
             source: _source,
             audioUrl: _audioUrl,
             hasImages: imagePaths.length > 0,
+            imageUrls,
             client_id: msg.client_id
           });
           wsSend(ws, "queued", { client_id: msg.client_id, queueDepth: queueLoad(session.id).length });
@@ -728,7 +740,7 @@ getWss().on("connection", (ws, req) => {
         updateSessionInStore(session);
 
         // Save user message
-        saveMessage(session.id, { role: "user", text, ts: Date.now(), client_id: msg.client_id, hasImages: imagePaths.length > 0, source: _source, audioUrl: _audioUrl });
+        saveMessage(session.id, { role: "user", text, ts: Date.now(), client_id: msg.client_id, hasImages: imagePaths.length > 0, imageUrls, source: _source, audioUrl: _audioUrl });
 
         ws.send(JSON.stringify({ type: "thinking" }));
 
@@ -864,6 +876,24 @@ getWss().on("connection", (ws, req) => {
           setTimeout(() => { try { process.kill(-_p.pid, "SIGKILL"); } catch { try { _p.kill("SIGKILL"); } catch {} } }, 2000);
           saveMessage(session.id, { role: "interrupted", ts: Date.now() });
         }
+        // Disarm any pending wake — user pressing Stop should halt the auto-loop
+        // too, not just the current turn. Without this, a wake would re-fire
+        // in 30min and the loop would restart itself against the user's intent.
+        // Also clear the persisted autoloopIntervalMs setting (2026-08-23) —
+        // Stop means fully OFF, not "skip this one cycle." With native
+        // server-side recurrence (sweepDueWakes auto-re-arms per
+        // session.autoloopIntervalMs), leaving the setting on would mean
+        // disarming just this instance accomplishes nothing — the setting
+        // itself has to go off, matching what the topbar menu's "Off" does.
+        try {
+          const disarmed = runReg.disarmWake(session.id, "cancelled (user pressed Stop)");
+          if (disarmed) console.log("[interrupt] also disarmed pending wake for", session.id.slice(0, 8));
+          if (session.autoloopIntervalMs) {
+            session.autoloopIntervalMs = null;
+            updateSessionInStore(session);
+            console.log("[interrupt] also turned off autoloop for", session.id.slice(0, 8));
+          }
+        } catch (e) { console.warn("[interrupt] disarm-wake failed:", e.message); }
         wsSend(ws, "interrupted");
         break;
       }

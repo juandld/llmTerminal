@@ -159,14 +159,25 @@ function _procSample(pid) {
 
 // ---- lifecycle hooks (called from providers/claude.js) ----
 
-function runStarted(sessionId, pid, provider) {
+function runStarted(sessionId, pid, provider, opts = {}) {
   if (!sessionId) return;
-  // A new turn supersedes any prior wake: the model re-arms each iteration by
-  // calling ScheduleWakeup again (its contract), so a wake that isn't re-set
-  // this turn is dead — David intervened or the loop chose to end. Wake-fired
-  // turns are unaffected: the sweep disarms ("fired") before spawning.
+  // A new turn supersedes any prior ScheduleWakeup-set wake: the model re-arms
+  // each iteration by calling ScheduleWakeup again (its contract), so a wake
+  // that isn't re-set this turn is dead — David intervened or the loop chose
+  // to end. Wake-fired turns are unaffected: the sweep disarms ("fired")
+  // before spawning.
+  //
+  // EXCEPTION — autoloopIntervalMs (server-native recurrence, 2026-08-23):
+  // that wake isn't the model's to re-arm each turn, it's a standing session
+  // setting. Disarming it here unconditionally was a real bug: David sending
+  // a plain chat message (not the wake firing) also runs through this path,
+  // so the pending autoloop wake died silently on every message while the
+  // topbar setting stayed "on" — a resume that looked armed but wasn't. Fix:
+  // when the caller passes autoloopIntervalMs, re-arm fresh from THIS turn's
+  // start instead of just disarming, so the clock resets on any activity but
+  // the loop never goes dark.
   const prev = reg.get(sessionId);
-  if (prev && prev.wakeAt) disarmWake(sessionId, "superseded (new turn started before it fired)");
+  const hadPriorWake = !!(prev && prev.wakeAt);
   const e = {
     sessionId, pid: pid || null, provider: provider || "claude",
     spawnedAt: Date.now(), lastStreamAt: Date.now(),
@@ -176,6 +187,18 @@ function runStarted(sessionId, pid, provider) {
     procStat: null, flatSamples: 0, adopted: false,
   };
   reg.set(sessionId, e);
+  // Wake arm/disarm must happen AFTER reg.set above — both armWake/disarmWake
+  // mutate whatever entry is currently in the map, and this function always
+  // replaces it with a fresh one for the new run.
+  if (opts.autoloopIntervalMs) {
+    armWake(sessionId, {
+      fireAt: Date.now() + opts.autoloopIntervalMs,
+      prompt: opts.autoloopPrompt || null,
+      reason: "autoloop recurring every " + Math.round(opts.autoloopIntervalMs / 60000) + "min",
+    }, "armed (autoloop re-armed at turn start)");
+  } else if (hadPriorWake) {
+    disarmWake(sessionId, "superseded (new turn started before it fired)");
+  }
   _persist();
   return e;
 }

@@ -13,6 +13,8 @@ const { runCheapClaude } = require("./cheap-model");
 const { logFileAttribution, buildAttributionMap, DRAWER_EXT_WHITELIST, DRAWER_EXCLUDED_DIRS } = require("./attribution");
 const { autoDetectBashFiles, autoCreatePreview } = require("./tools");
 const { postSecretaryItem } = require("./attention");
+const runReg = require("./run-registry");
+const experiments = require("./experiments");
 
 // ── End-of-run observer (Tier 2 "supervisor pattern") — DISABLED ──
 // Disabled 2026-05-28 (snapshotted in commit 9285194): it enqueued duplicate
@@ -413,6 +415,33 @@ function spawnContractCheck(sessionId, projectName) {
     const lastText = String(last.text || "").trim();
     if (!lastText) return;
 
+    // ── Experiments per-turn row (HARNESS_PLAN #3, data-pipe only) ─────────
+    // Primary metric is TURN LATENCY (time from user submit → assistant done),
+    // NOT message count. Message count penalizes good orchestrators (fan-out
+    // is not bad; David's own "smarter=lazier" observation applies to raw
+    // reply counts). Every turn is a data point; the log is dedup'd on
+    // lastUser.ts inside experiments.recordTurn so re-fires within the same
+    // turn don't inflate the count. See web/src/experiments.js for the N=1
+    // caveat and forward-reference to slot #6.
+    try {
+      const lastUserIdx = all.map(m => m.role).lastIndexOf("user");
+      if (lastUserIdx >= 0) {
+        const lastUserTs = all[lastUserIdx].ts || 0;
+        const turnMsgs = all.slice(lastUserIdx + 1);
+        const toolCount = turnMsgs.filter(m => m.role === "tool_activity").length;
+        // Count user messages so far as the turnIndex — matches "which turn
+        // are we on" not "which agent-reply."
+        const turnIndex = all.filter(m => m.role === "user").length;
+        experiments.recordTurn(session, {
+          lastUserTs,
+          latencyMs: lastUserTs ? Date.now() - lastUserTs : 0,
+          toolCount,
+          turnIndex,
+          endedSession: wasDone,
+        });
+      }
+    } catch (e) { console.error("[experiments] turn record failed:", e.message); }
+
     // ── Ship-claim verification gates (verification-gaps #2 + #3) ──────────
     // The "verified the component, not the production path" failure class
     // (handoff 2026-07-22, orchestratorHero/development/handoff_verification_
@@ -528,6 +557,64 @@ function spawnContractCheck(sessionId, projectName) {
         }
       }
     } catch (e) { console.error("[contract-check] ship-claim gate failed:", e.message); }
+
+    // ── Gate (c): frontend claim without browser verification (2026-08-23) ──
+    // The failure class this catches: an agent edits web/public/*.js or
+    // styles.css THIS turn, then claims success — but the only "verification"
+    // it ran was curl (proves the backend API, NOT what the browser actually
+    // renders) or nothing at all. Concrete incident: the DeepSeek-provider
+    // picker bug (2026-08-23) — backend verified via curl and reported LIVE,
+    // but 4 hardcoded `["claude","openai","google"]` arrays in the frontend
+    // meant the picker never rendered the 4th provider. The gap shipped
+    // silently until David looked at the real app and asked "what the fuck
+    // is happening." His follow-up, verbatim: "We're not logging shit. We're
+    // not putting shit to memory. We are implementing steps — steps that if
+    // not followed means it is still not complete." This is that step,
+    // enforced as a block, not written down as a note. A frontend-editing
+    // turn cannot mark itself done without an OBSERVED Playwright
+    // browser_navigate + at least one observation call (console_messages /
+    // snapshot / take_screenshot / evaluate) in the SAME turn. curl/git/
+    // systemctl — sufficient for gate (a) above — do NOT satisfy this gate.
+    try {
+      const frontendEditedThisTurn = runV.some(m => m.role === "tool_activity" &&
+        (m.tool_name === "Edit" || m.tool_name === "Write" || m.tool_name === "MultiEdit") &&
+        /\/web\/public\/[^"]*\.(js|css|html)$/.test(String(m.summary || ""))
+      );
+      if (frontendEditedThisTurn) {
+        const claimsDone = /\b(shipped|deployed|pushed|committed|landed|flipped|applied|wired into|live (in|now)|now live|is live|in production|verified|confirmed|fixed|works?|working|renders?|visible)\b/i.test(lastText);
+        if (claimsDone) {
+          const toolNames = runV.filter(m => m.role === "tool_activity").map(m => String(m.tool_name || ""));
+          const navigated = toolNames.includes("mcp__playwright__browser_navigate");
+          const observed = toolNames.some(t => [
+            "mcp__playwright__browser_console_messages",
+            "mcp__playwright__browser_snapshot",
+            "mcp__playwright__browser_take_screenshot",
+            "mcp__playwright__browser_evaluate",
+          ].includes(t));
+          const gateCFails = !navigated || !observed;
+          if (gateCFails) {
+            const already = runV.some(m => m.source === "contract_check_frontend_unverified");
+            if (!already) {
+              saveMessage(sessionId, {
+                role: "assistant",
+                text: "⚠ FRONTEND CLAIM WITHOUT BROWSER VERIFICATION — this turn edited web/public/*.js or styles.css and claimed success, but no Playwright browser_navigate + observation (console_messages/snapshot/take_screenshot/evaluate) was observed in this turn. curl only proves the backend API — it cannot prove what the browser actually renders. This session will NOT auto-complete until a real browser pass (navigate + look) is observed in the same turn.",
+                ts: Date.now(),
+                source: "contract_check_frontend_unverified",
+              });
+              console.log("[contract-check]", sessionId.slice(0,8), "→ FRONTEND-UNVERIFIED (frontend edit + success claim without Playwright navigate+observe)");
+            }
+            if (session.manualDone && session.doneSource !== "mcp") {
+              delete session.manualDone;
+              delete session.doneSource;
+              saveSessions(sessions);
+            }
+            try { broadcastToSession(sessionId, { type: "history", messages: loadMessages(sessionId) }); } catch {}
+            return;
+          }
+        }
+      }
+    } catch (e) { console.error("[contract-check] frontend-verification gate failed:", e.message); }
+
     // If the assistant ends with a clarifying question, work is NOT done.
     // Short-circuit: when already marked done, force-clear immediately (user
     // typed a follow-up that yielded a question — definitely active again).
@@ -614,7 +701,21 @@ ${lines}`;
         }
         const summary = String(parsed.summary || "").trim().slice(0, 240);
         s2.manualDone = Date.now();
+        // Experiments session_end row (data-pipe #3). Guard on the persisted
+        // flag so we never write two 'complete' rows for the same session;
+        // stalled-sweep also honors this flag on its 'stalled' write.
+        s2._experimentSessionEndRecorded = true;
         saveSessions(sessions2);
+        try {
+          const _msgs = loadMessages(sessionId);
+          const _userMsgs = _msgs.filter(m => m.role === "user").length;
+          experiments.recordSessionEnd(s2, {
+            endedVia: "complete",
+            totalTurns: _userMsgs, // one turn per user message, mirrors the # semantics
+            totalUserMsgs: _userMsgs,
+            totalDurationMs: s2.created ? Date.now() - s2.created : 0,
+          });
+        } catch (e) { console.error("[experiments] session_end record failed:", e.message); }
         if (summary && !lastText.includes(summary.slice(0, 30))) {
           try { saveMessage(sessionId, { role: "assistant", text: "✓ " + summary, ts: Date.now(), source: "contract_check" }); }
           catch (e) { console.warn("[contract-check] append failed:", e.message); }
@@ -643,5 +744,130 @@ ${lines}`;
 // broadcasts to any clients that join mid-run. Mirrors sendToSession logic
 // without the WS-specific streaming layer.
 
+// ── Loop-check (Layer B of the orchestrator loop fix, 2026-08-23) ───────────
+// The anti-pattern this catches: agent spawns a subtask (queue task via curl,
+// background Agent, watcher, nohup, & disowned job) and then ends the turn
+// with language that hands follow-up back to the user ("ping me status", "I'll
+// surface it when it lands", "watcher up — let me know"). That reads as
+// abandonment to David because it IS — the whole point of an orchestrator is
+// that IT waits for the subtask and integrates the result, not that the user
+// has to poll. Layer A is the `orchestrate` skill (.claude/skills/orchestrate/
+// SKILL.md) which tells the agent not to do this. Layer B catches slip-ups:
+// after each turn, a Haiku call reads the recent transcript; if it detects
+// spawn+yield, we arm a wake-up ~90s later that resumes the agent with a
+// "you should have had time — check + integrate" prompt.
+const _loopCheckLastRun = {};
+const LOOP_CHECK_COOLDOWN_MS = 30 * 1000;
+const LOOP_CHECK_MIN_MESSAGES = 3;
+const LOOP_CHECK_WAKE_DELAY_MS = 90 * 1000;
+const LOOP_CHECK_RESUME_PROMPT = "The subtask you spawned earlier should have had time to complete. Check its status now (poll the result file, read the queue task result, run the follow-up curl, etc.), integrate the result, and continue the work you started. If it's still running, poll a few more times inside a single Bash call — do NOT end the turn with 'ping me' again. The whole point is that YOU own the wait, not the user.";
+
+function spawnLoopCheck(sessionId, projectName) {
+  try {
+    if (!sessionId) return;
+    const now = Date.now();
+    if (_loopCheckLastRun[sessionId] && (now - _loopCheckLastRun[sessionId]) < LOOP_CHECK_COOLDOWN_MS) return;
+    _loopCheckLastRun[sessionId] = now;
+
+    const all = loadMessages(sessionId);
+    if (all.length < LOOP_CHECK_MIN_MESSAGES) return;
+
+    // Isolate THIS turn (everything after the last user message).
+    const lastUserIdx = all.map(m => m.role).lastIndexOf("user");
+    const thisTurn = lastUserIdx >= 0 ? all.slice(lastUserIdx + 1) : all;
+    if (!thisTurn.length) return;
+    const lastAsst = thisTurn.filter(m => m.role === "assistant").slice(-1)[0];
+    if (!lastAsst || !lastAsst.text) return;
+    const lastText = String(lastAsst.text).trim();
+
+    // Cheap prefilter: skip Haiku entirely if none of the spawn/yield signals
+    // are present in this turn. Prefer false positives to false negatives —
+    // David would rather the agent resume too eagerly than abandon him — but
+    // we still avoid burning tokens on turns with no spawn evidence at all.
+    const toolActs = thisTurn.filter(m => m.role === "tool_activity");
+    const usedAgentTool = toolActs.some(m => m.tool_name === "Agent");
+    const bashSummaries = toolActs
+      .filter(m => m.tool_name === "Bash")
+      .map(m => String(m.summary || ""));
+    const spawnedViaCurl = bashSummaries.some(s =>
+      /queue\/(create|submit)|task_board\/create|orchestrator\/queue/.test(s) ||
+      /\bnohup\b/.test(s) ||
+      /\bdisown\b/.test(s) ||
+      /&\s*$/.test(s)
+    );
+    const yieldedLangInText = /(watcher\s+[`'"]?\w+|ping\s+(me|status|when|any)|when\s+(results?|it|the task)\s+(lands?|finish|complete)|let me know when|i'?ll (surface|update|report|check back|let you know|ping)|check back|status any time|will surface)/i.test(lastText);
+    if (!usedAgentTool && !spawnedViaCurl && !yieldedLangInText) return;
+
+    // Explicit llmt_complete wins — never override a task the agent marked done.
+    const sessions = loadSessions();
+    const session = sessions.find(s => s.id === sessionId);
+    if (session && session.manualDone && session.doneSource === "mcp") {
+      console.log("[loop-check]", sessionId.slice(0, 8), "→ skip (llmt_complete already fired)");
+      return;
+    }
+
+    // If a wake is already armed for this session (token-limit resume,
+    // user-scheduled, prior loop-check), leave it alone — don't stomp.
+    try {
+      const regE = runReg.getEntry(sessionId);
+      if (regE && regE.wakeAt && regE.wakeAt > Date.now()) {
+        console.log("[loop-check]", sessionId.slice(0, 8), "→ skip (wake already armed for", new Date(regE.wakeAt).toISOString() + ")");
+        return;
+      }
+    } catch { /* run-registry missing entry = fine, proceed */ }
+
+    // Compact transcript for Haiku. Keep last ~15 msgs; strip long tool bodies
+    // to just tool name + short summary; cap assistant text to 500 chars.
+    const recent = thisTurn.slice(-15);
+    const lines = recent.map(m => {
+      const r = (m.role || "").toUpperCase();
+      if (r === "TOOL_ACTIVITY") return "TOOL: " + (m.tool_name || "?") + " " + String(m.summary || "").slice(0, 140);
+      const t = m.text || m.summary || "";
+      if (!t) return null;
+      return r + ": " + String(t).slice(0, 500);
+    }).filter(Boolean).join("\n");
+
+    const prompt = `You are auditing a single agent turn for the "spawn + yield" anti-pattern.
+
+The anti-pattern to detect:
+- The agent SPAWNED a subtask this turn (background Agent, queue task via curl to localhost:8000/api/orchestrator/queue/create, watcher process, nohup, & disowned job, MCP tool that returns immediately with a task_id).
+- The agent then ENDED THE TURN with language that hands follow-up back to the user (e.g. "ping me status", "I'll surface it when it lands", "watcher up — let me know", "check back in a bit", "when results land I'll…"). This is abandonment — the orchestrator should have waited for the subtask itself and integrated the result.
+
+Legitimate yields (NOT the anti-pattern):
+- Agent asked the user a question via llmt_ask (waiting on real user input).
+- Agent completed the task and called llmt_complete.
+- Agent proposed named alternatives and is genuinely waiting on the user's pick.
+- The subtask ALREADY completed inside this same turn and its result was integrated.
+
+Output JSON only (no prose, no fences):
+{"yielded": true|false, "reason": "one short sentence"}
+
+- yielded=true → agent spawned a subtask this turn and ended without integrating its result, forcing the user to follow up.
+- yielded=false → any of: no spawn happened, the spawn was awaited, the yield is a legitimate wait on user input.
+
+Recent turn:
+${lines}`;
+
+    console.log("[loop-check] firing for", sessionId.slice(0, 8), "(", recent.length, "msgs )");
+    runCheapClaude(prompt, "loop-check", (parsed) => {
+      if (!parsed || parsed.yielded !== true) {
+        console.log("[loop-check]", sessionId.slice(0, 8), "→ no yield", parsed && parsed.reason ? "(" + String(parsed.reason).slice(0, 80) + ")" : "");
+        return;
+      }
+      const wakeAt = Date.now() + LOOP_CHECK_WAKE_DELAY_MS;
+      const promptText = LOOP_CHECK_RESUME_PROMPT +
+        "\n\n(Loop-check detected: " + String(parsed.reason || "spawn + yield").slice(0, 200) + ")";
+      runReg.armWake(sessionId, {
+        fireAt: wakeAt,
+        prompt: promptText,
+        reason: "loop-check: agent yielded on spawned subtask",
+      }, "armed (loop-check auto-resume)");
+      console.log("[loop-check]", sessionId.slice(0, 8), "→ SPAWN+YIELD detected, wake armed for", new Date(wakeAt).toISOString(), "reason:", String(parsed.reason || "").slice(0, 80));
+    }, projectName);
+  } catch (e) {
+    console.error("[loop-check] outer error:", e.message);
+  }
+}
+
 // spawnObserver deliberately not exported — disabled 2026-05-28, see its note.
-module.exports = { spawnDecisionExtractor, spawnContractCheck, reconcileFileAttribution };
+module.exports = { spawnDecisionExtractor, spawnContractCheck, spawnLoopCheck, reconcileFileAttribution };
