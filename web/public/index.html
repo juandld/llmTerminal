@@ -45,6 +45,21 @@
       <button class="topbar-star" id="starBtn" onclick="toggleSessionStar()" title="Star — keeps this chat at high priority in the sidebar" aria-label="Star this chat">☆</button>
       <a href="/" class="app-btn" id="appBtn">App</a>
       <button class="topbar-att hide-mobile" id="topbarAtt" onclick="nextAttentionSession()" title="Next chat needing attention"><span class="topbar-att-icon" id="topbarAttIcon"></span><span class="topbar-att-text" id="topbarAttText">All clear</span></button>
+      <div class="autoloop-wrap">
+        <button class="autoloop-btn" id="autoloopBtn" onclick="toggleAutoloopMenu(event)" title="Autoloop — click to set an interval" aria-haspopup="true" aria-expanded="false">
+          <span class="autoloop-dot" id="autoloopDot"></span>
+          <span class="autoloop-label" id="autoloopLabel">Loop</span>
+        </button>
+        <div class="autoloop-menu hidden" id="autoloopMenu">
+          <div class="autoloop-menu-title">Autoloop interval</div>
+          <button type="button" data-autoloop-ms="0">Off</button>
+          <button type="button" data-autoloop-ms="60000">1 min</button>
+          <button type="button" data-autoloop-ms="300000">5 min</button>
+          <button type="button" data-autoloop-ms="600000">10 min</button>
+          <button type="button" data-autoloop-ms="900000">15 min</button>
+          <button type="button" data-autoloop-ms="1800000">30 min</button>
+        </div>
+      </div>
       <a class="browser-btn off" id="browserBtn" title="No browser active" target="_blank" rel="noopener noreferrer" onclick="return handleBrowserClick(event)"><span class="browser-dot"></span><span class="btn-icon">🌐</span><span class="browser-url" id="browserUrl"></span></a>
       <button class="files-btn topbar-collapsible" id="filesBtn" onclick="toggleDrawer()"><span class="btn-icon">◳</span><span class="btn-label">Files</span><span class="badge-count" id="filesBadge" style="display:none">0</span></button>
       <button id="modelPickerBtn" class="win95-trigger model-pick-btn hide-mobile" type="button" onclick="toggleModelMenu(event)" title="Model for this session" aria-haspopup="true" aria-expanded="false">
@@ -71,7 +86,6 @@
         </div>
       </div>
     </div>
-    <div class="dot-status" id="ds"><div class="dot"></div><span id="dsText">ready</span></div>
   </div>
   <div style="flex:1;display:flex;overflow:hidden">
     <div style="flex:1;display:flex;flex-direction:column;min-width:0">
@@ -91,6 +105,12 @@
         <button class="btn-mic" id="micBtn" onclick="toggleVoiceInput()" title="Voice note (Space)" aria-label="Voice note">🎙</button>
         <button class="btn-send" id="sendBtn" onclick="send()">Send</button>
         <button class="btn-stop" id="stopBtn" onclick="interrupt()">Stop</button>
+      </div>
+      <div class="wake-countdown hidden" id="wakeCountdown">
+        <span class="wake-countdown-dot"></span>
+        <span id="wakeCountdownText">Auto-resume in --:--</span>
+        <button type="button" id="wakeCountdownFireNow" onclick="fireWakeNow()" title="Fire the scheduled auto-resume right now">Resume now</button>
+        <button type="button" id="wakeCountdownStop" onclick="interrupt()" title="Cancel the scheduled auto-resume">Stop</button>
       </div>
     </div>
     <div class="summary-panel hidden" id="summaryPanel">
@@ -123,6 +143,10 @@
           <button data-dv="tree" onclick="setDecisionsView('tree')">Tree</button>
           <button data-dv-scope="session" onclick="setDecisionsScope('session')" title="This chat">This chat</button>
           <button data-dv-scope="project" class="active" onclick="setDecisionsScope('project')" title="All chats in this project">Project</button>
+        </div>
+        <div class="dec-strip-wrap" id="decisionsStripWrap" style="display:none">
+          <div class="dec-strip-labels" aria-hidden="true"><span>Decisions</span></div>
+          <div class="dec-strip-track" id="decisionsStripTrack"></div>
         </div>
       </div>
       <div class="drawer-list" id="decisionsList"><div class="drawer-empty">No decisions recorded yet</div></div>

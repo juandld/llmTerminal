@@ -132,16 +132,15 @@
      where the title is the easiest re-entry into the chat list). */
   .topbar-title{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;color:var(--text);font-weight:500;cursor:pointer;padding:2px 0}
   .topbar-title:empty{display:none}
-  .dot-status{flex-shrink:0;display:flex;align-items:center;gap:6px;font-size:11px;color:var(--dim);padding:3px 14px 3px 10px;border-radius:20px;border:1px solid transparent;transition:all .3s}
-  .dot-status .dot{width:8px;height:8px;border-radius:50%;background:var(--dim);flex-shrink:0;transition:all .3s}
-  .dot-status.active{color:var(--green);border-color:rgba(78,204,163,.2)}
-  .dot-status.active .dot{background:var(--green);box-shadow:0 0 6px var(--green)}
-  .dot-status.thinking{color:var(--yellow);border-color:rgba(255,211,105,.25);background:rgba(255,211,105,.06)}
-  .dot-status.thinking .dot{background:var(--yellow);box-shadow:0 0 8px var(--yellow);animation:pulse 1s infinite}
-  .dot-status.error{color:var(--accent2);border-color:rgba(233,69,96,.25)}
-  .dot-status.error .dot{background:var(--accent2);box-shadow:0 0 6px var(--accent2)}
-  .queue-count{font-size:11px;color:var(--yellow);margin-left:auto;margin-right:8px}
-  .queue-count.has-queue{background:rgba(255,211,105,.12);border:1px solid rgba(255,211,105,.4);border-radius:10px;padding:2px 8px;font-weight:600;animation:pulse 1.6s infinite}
+  /* .dot-status (WS connection dot) removed 2026-08-24 — merged into
+     .autoloop-btn's dot/label (see app-status.js). */
+  /* Out of flow (position:absolute), not a .topbar flex child — appearing/
+     disappearing must never steal width from .topbar-nav, whose icon-collapse
+     math (app-topbar.js) only budgets its own children and doesn't know this
+     badge exists (David 2026-08-23: "ruins the whole layout"). */
+  .queue-count{position:absolute;top:100%;right:8px;margin-top:4px;z-index:29;font-size:11px;color:var(--yellow)}
+  .queue-count:empty{display:none}
+  .queue-count.has-queue{background:rgba(255,211,105,.12);border:1px solid rgba(255,211,105,.4);border-radius:10px;padding:2px 8px;font-weight:600;animation:pulse 1.6s infinite;backdrop-filter:blur(2px)}
   /* Queued user message — typed/sent but waiting for the current Claude turn to finish.
      Dashed border + badge tells David at a glance: "this is parked, not in flight." */
   .msg.user.queued{opacity:.75;border:1px dashed var(--yellow);position:relative}
@@ -162,10 +161,11 @@
     .files-btn.topbar-collapsible{display:inline-flex!important;min-height:36px;min-width:36px;padding:0;justify-content:center;align-items:center;border-radius:10px;order:3}
     .files-btn .btn-label{display:none!important}
     .files-btn .btn-icon{font-size:16px}
-    /* Dot-status: show dot only, no text, reorder between badge and files */
-    .dot-status{display:flex!important;width:36px;height:36px;padding:0;border:1px solid var(--border);border-radius:10px;margin:0;gap:0;justify-content:center;align-items:center;flex-shrink:0}
-    .dot-status #dsText{display:none}
-    .dot-status .dot{width:8px;height:8px}
+    /* Autoloop button (now also carrying WS-connection state, see
+       app-status.js) slots in right after the title — a deliberate, fixed
+       spot instead of the unset default order:0 it used to fall back to,
+       which put it wherever DOM order happened to land it. */
+    .autoloop-wrap{order:2}
     /* Panel buttons slot after Files (3), matching desktop's relative order;
        bell and overflow stay at the end */
     .topbar-collapsible{order:4}
@@ -241,7 +241,35 @@
 
   .chat{flex:1;overflow-y:auto;overflow-x:hidden;padding:16px;display:flex;flex-direction:column;gap:14px;-webkit-overflow-scrolling:touch;overscroll-behavior:contain}
   .msg{max-width:92%;line-height:1.6;font-size:13px;word-break:break-word}
-  .msg.user{align-self:flex-end;background:var(--border);padding:10px 14px;border-radius:14px 14px 4px 14px}
+  .msg.user{align-self:flex-end;background:var(--border);padding:10px 14px;border-radius:14px 14px 4px 14px;position:relative}
+  /* Send-state chip: tiny dot in bubble bottom-right. See setUserMsgState in app.js. */
+  .msg-state{position:absolute;bottom:4px;right:-14px;width:10px;height:10px;border-radius:50%;font-size:9px;line-height:10px;text-align:center;color:#fff;transition:opacity .3s;z-index:2;user-select:none}
+  .msg-state.hidden{opacity:0;pointer-events:none}
+  .msg-state.st-sending{background:#8ca4b3;animation:msg-state-pulse 1.2s ease-in-out infinite}
+  .msg-state.st-queued{background:var(--yellow, #e2a233)}
+  .msg-state.st-failed{background:#d64545;cursor:pointer;font-weight:700;font-size:10px}
+  .msg-state.st-sent{background:#3e9757}
+  @keyframes msg-state-pulse{0%,100%{opacity:.55}50%{opacity:1}}
+  .vn-recovered{font-size:10px;opacity:.75;margin-bottom:4px;color:var(--yellow,#e2a233);letter-spacing:.02em}
+  /* Jump-to-bottom FAB — visible when the chat is scrolled up from newest.
+     Positioned above the input bar; count badge appears when there is unread
+     activity since last_seen_ts. `right:76px` clears the pre-existing yellow
+     notifications FAB at right:16px. See _updateFabVisibility in app.js. */
+  .chat-fab{position:fixed;right:76px;bottom:96px;z-index:40;background:var(--surface2,#2a3138);color:var(--text,#e6ebef);border:1px solid var(--border,#3a4148);border-radius:22px;min-width:44px;height:44px;padding:0 12px;display:inline-flex;align-items:center;justify-content:center;gap:6px;font-size:15px;font-weight:600;box-shadow:0 4px 14px rgba(0,0,0,.35);cursor:pointer;transition:opacity .2s,transform .2s}
+  .chat-fab.hidden{opacity:0;pointer-events:none;transform:translateY(8px)}
+  .chat-fab:hover{background:var(--border,#3a4148)}
+  .chat-fab .fab-count:empty{display:none}
+  .chat-fab .fab-count{background:var(--yellow,#e2a233);color:#111;border-radius:10px;padding:1px 7px;font-size:11px;line-height:14px;min-width:14px;text-align:center}
+  /* Unread chip: "N new since last visit — Show what you missed". Fixed
+     near the top of the chat area so it can't be missed on session-open. */
+  .unread-chip{position:fixed;left:50%;top:64px;transform:translateX(-50%);z-index:40;background:var(--yellow,#e2a233);color:#111;border:0;border-radius:16px;padding:6px 14px;font-size:13px;font-weight:600;box-shadow:0 4px 12px rgba(0,0,0,.3);cursor:pointer;transition:opacity .25s,transform .25s;max-width:calc(100vw - 32px);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .unread-chip.hidden{opacity:0;pointer-events:none;transform:translateX(-50%) translateY(-8px)}
+  /* Divider inserted before the first unread message when the user taps the chip. */
+  .unread-divider{align-self:stretch;text-align:center;margin:10px 0 6px;font-size:11px;letter-spacing:.15em;color:var(--yellow,#e2a233);opacity:.85;text-transform:uppercase;font-weight:600}
+  @media (max-width:768px){
+    .chat-fab{right:64px;bottom:84px;height:40px;min-width:40px;font-size:14px}
+    .unread-chip{top:56px;font-size:12px;padding:5px 12px}
+  }
   .msg.assistant{align-self:flex-start;max-width:95%}
   .msg.assistant .bubble{background:var(--surface);border:1px solid var(--border);padding:12px 16px;border-radius:14px 14px 14px 4px;white-space:pre-wrap;overflow-x:hidden}
   .msg.system{align-self:center;font-size:11px;color:var(--dim);padding:4px 12px;background:var(--surface);border-radius:10px}
@@ -656,6 +684,42 @@
   .btn-send:disabled{opacity:.3;cursor:not-allowed}
   .btn-stop{background:var(--accent2);color:#fff;display:none}
 
+  /* Live wake countdown (2026-08-23) — David: "if it's not working I need
+     to see a countdown on the stop button." Before this, the Stop button
+     only ever appeared while a run was actively BUSY — a session sitting
+     idle between autoloop wakes showed nothing at all, so there was no way
+     to SEE that a resume was actually scheduled short of asking. This bar
+     sits below the input row, independent of busy state, ticking down
+     live (see pollWakeCountdown() in app-status.js) whenever this session
+     has an armed wake. Tapping its Stop button calls the same interrupt()
+     as the main Stop button, which already disarms the wake. */
+  .wake-countdown{
+    display:flex;align-items:center;gap:8px;
+    padding:6px 14px;background:var(--surface);border-top:1px solid var(--border);
+    font-family:var(--mono);font-size:11px;color:var(--dim);
+    flex-shrink:0;
+  }
+  .wake-countdown.hidden{display:none}
+  .wake-countdown-dot{
+    width:7px;height:7px;border-radius:50%;flex-shrink:0;
+    background:var(--accent2);
+    animation:wakeCountdownPulse 1.4s ease-in-out infinite;
+  }
+  @keyframes wakeCountdownPulse{0%,100%{opacity:1}50%{opacity:.35}}
+  #wakeCountdownText{flex:1}
+  #wakeCountdown button{
+    background:transparent;border:1px solid var(--accent2);color:var(--accent2);
+    border-radius:6px;padding:2px 10px;cursor:pointer;
+    font-family:var(--mono);font-size:10px;font-weight:600;
+  }
+  #wakeCountdown button:hover{background:var(--accent2);color:#fff}
+  #wakeCountdown button:disabled{opacity:.5;cursor:default;background:transparent;color:var(--accent2)}
+  /* "Resume now" gets the positive accent (distinct from Stop's red) so the
+     two actions read as opposites at a glance, not two flavors of the same button. */
+  #wakeCountdownFireNow{border-color:var(--accent);color:var(--accent)}
+  #wakeCountdownFireNow:hover{background:var(--accent);color:#000}
+  #wakeCountdownFireNow:disabled{background:transparent;color:var(--accent)}
+
   .hide-mobile{display:none}
   /* Sidebar overlay + backdrop active on phone AND iPad portrait (834px).
      Before 2026-06-27 this lived inside the 768px block, so iPad portrait
@@ -896,6 +960,61 @@
 .topbar-att.has-attention{border-color:var(--border);color:var(--text)}
 .topbar-att.has-attention .topbar-att-text{color:var(--accent)}
 
+/* Autoloop trigger (2026-08-23) — David: "trigger for the loop on top...
+   if it's green and I click it, it opens a menu to select intervals."
+   Green dot = session.autoloopIntervalMs is set (native server-recurring,
+   see server.js sweepDueWakes); gray = off. Click opens a small dropdown of
+   interval choices; selecting one POSTs /api/sessions/:id/autoloop. */
+.autoloop-wrap{position:relative;flex-shrink:0}
+.autoloop-btn{
+  display:flex;align-items:center;gap:6px;
+  background:var(--surface2);border:1px solid var(--border);border-radius:8px;
+  padding:5px 10px;cursor:pointer;font-family:var(--mono);font-size:13px;
+  color:var(--dim);
+}
+.autoloop-btn:hover,.autoloop-btn:active{border-color:var(--accent);color:var(--text)}
+.autoloop-dot{
+  width:8px;height:8px;border-radius:50%;flex-shrink:0;
+  background:var(--dim);opacity:.5;
+}
+.autoloop-btn.active .autoloop-dot{
+  background:#2ecc71;opacity:1;
+  animation:autoloopPulse 1.6s ease-in-out infinite;
+}
+.autoloop-btn.active{border-color:#2ecc71;color:var(--text)}
+@keyframes autoloopPulse{0%,100%{opacity:1}50%{opacity:.4}}
+/* WS connection state, merged into this same dot/button 2026-08-24 — see
+   app-status.js setStatus()/_renderAutoloopBtn(). Takes priority over the
+   loop's green when set (checked via class order in _renderAutoloopBtn). */
+.autoloop-btn.ws-thinking .autoloop-dot{background:var(--yellow);opacity:1;animation:pulse 1s infinite}
+.autoloop-btn.ws-thinking{border-color:var(--yellow);color:var(--yellow)}
+.autoloop-btn.ws-error .autoloop-dot{background:var(--accent2);opacity:1}
+.autoloop-btn.ws-error{border-color:var(--accent2);color:var(--accent2)}
+.autoloop-menu{
+  /* position:fixed (not absolute) — .topbar-nav has overflow:hidden for its
+     icon-collapse mechanism, which clips absolutely-positioned children
+     even when THEIR own computed style says visible/correctly-placed. Top/
+     left are set inline by toggleAutoloopMenu() from the button's real
+     viewport position instead of relying on a CSS-relative ancestor. */
+  position:fixed;z-index:200;
+  background:var(--surface);border:1px solid var(--border);border-radius:8px;
+  padding:6px;min-width:130px;
+  box-shadow:0 4px 16px rgba(0,0,0,.4);
+  display:flex;flex-direction:column;gap:2px;
+}
+.autoloop-menu.hidden{display:none}
+.autoloop-menu-title{
+  font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);
+  padding:4px 8px 2px;font-family:var(--mono);
+}
+.autoloop-menu button{
+  background:transparent;border:none;color:var(--text);
+  text-align:left;padding:7px 8px;border-radius:5px;cursor:pointer;
+  font-family:var(--mono);font-size:12px;
+}
+.autoloop-menu button:hover{background:var(--surface2);color:var(--accent)}
+.autoloop-menu button.active{color:#2ecc71;font-weight:600}
+
 /* Floating action button — round-robin */
 .fab{
   position:fixed;bottom:90px;right:20px;z-index:200;
@@ -1071,6 +1190,86 @@
 .btn-send.voice-cancel-mode:hover,.btn-send.voice-cancel-mode:active{color:#e74c3c;border-color:#e74c3c}
 .voice-hint{font-size:11px;color:var(--dim);opacity:.5;flex-shrink:0;margin-left:auto}
 
+/* Wake-prompt chip — collapsed rendering for auto-loop synthetic user messages.
+   Full machine prompt is preserved in the DOM (<pre.wake-full>) — click the chip
+   to expand. Data stays machine-readable, view stays human-readable. */
+.msg.user.wake-prompt{
+  background:transparent !important;
+  border:none !important;
+  padding:0 !important;
+  max-width:none !important;
+  align-self:flex-start;
+  margin:4px 0;
+}
+.msg.user.wake-prompt .wake-chip{
+  display:inline-flex;align-items:center;gap:6px;
+  padding:4px 10px;
+  background:var(--surface2);border:1px dashed var(--border);
+  border-radius:14px;
+  color:var(--dim);font-family:var(--mono);font-size:11px;
+  cursor:pointer;user-select:none;
+  max-width:100%;
+}
+.msg.user.wake-prompt .wake-chip:hover{border-color:var(--accent);color:var(--text)}
+.msg.user.wake-prompt .wake-icon{font-size:12px;opacity:.8;flex-shrink:0}
+.msg.user.wake-prompt .wake-label{flex-shrink:0;opacity:.7}
+.msg.user.wake-prompt .wake-summary{
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  max-width:260px;
+}
+.msg.user.wake-prompt .wake-toggle{flex-shrink:0;opacity:.5;font-size:10px}
+.msg.user.wake-prompt .wake-full{
+  display:block;margin-top:6px;padding:10px 12px;
+  background:var(--surface);border:1px solid var(--border);border-radius:8px;
+  font-family:var(--mono);font-size:11px;line-height:1.5;
+  color:var(--dim);
+  white-space:pre-wrap;word-break:break-word;
+  max-width:min(680px,100%);
+  max-height:400px;overflow:auto;
+}
+.msg.user.wake-prompt.collapsed .wake-full{display:none}
+
+/* Voice+text attach chip — shows what compose text will ride along with the voice note.
+   Host is a full-width row inside .input-bar (desktop) or inside #voiceTimer between
+   .voice-info and .voice-actions (mobile). Chip itself is a pill with 📎 + label +
+   truncated text + × to detach (send voice solo, keep text in compose). */
+.voice-attach-chip-host{
+  display:flex;justify-content:center;padding:0 0 6px 0;
+  width:100%;
+}
+#voiceTimer .voice-attach-chip-host{padding:2px 0 4px 0}
+.voice-attach-chip{
+  display:inline-flex;align-items:center;gap:8px;
+  padding:6px 6px 6px 10px;
+  background:var(--surface2);
+  border:1px solid var(--accent);
+  border-left-width:3px;
+  border-radius:10px;
+  font-family:var(--mono);font-size:12px;color:var(--text);
+  max-width:100%;
+}
+.voice-attach-chip .vac-icon{flex-shrink:0;font-size:13px;line-height:1}
+.voice-attach-chip .vac-label{color:var(--dim);flex-shrink:0}
+.voice-attach-chip .vac-text{
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  max-width:220px;
+}
+.voice-attach-chip .vac-detach{
+  background:transparent;border:none;color:var(--dim);
+  cursor:pointer;font-size:16px;line-height:1;
+  width:22px;height:22px;border-radius:50%;padding:0;
+  display:flex;align-items:center;justify-content:center;
+  flex-shrink:0;
+}
+.voice-attach-chip .vac-detach:hover,.voice-attach-chip .vac-detach:active{
+  background:var(--bg);color:#e74c3c;
+}
+@media (max-width:768px){
+  .voice-attach-chip{font-size:13px;padding:8px 8px 8px 12px}
+  .voice-attach-chip .vac-text{max-width:180px}
+  .voice-attach-chip .vac-detach{width:28px;height:28px;font-size:18px}
+}
+
 /* Voice note bubble in chat */
 .vn-bubble{
   background:var(--surface2);border-radius:14px;padding:10px 14px;
@@ -1198,6 +1397,118 @@
 .dec-status-reversed{background:#c2453d;color:#fff;text-decoration:line-through}
 .dec-status-mined   {background:#666;color:#ddd}
 .dec-status-answered{background:var(--accent);color:#000}
+
+/* ── Decisions timeline STRIP — compact horizontal overview above the list.
+   Full port (2026-08-23) of DeepSeek Harness's TrajectoryTimeline component
+   (packages/client/ui-trajectory/src/client/TrajectoryTimeline.tsx) after
+   David asked to visualize decisions the way dsh does — complete surface
+   area, not a partial pass: real proportional-time span positioning,
+   drag-to-select a range (with spotlight dimming outside it), wheel-zoom
+   anchored at the cursor, edge-pan while dragging near the track edges,
+   right-click-drag to pan, hover line + tooltip, Escape/double-click to
+   reset, and a lazy-loaded earlier-history boundary. State + math live in
+   app-decisions.js (_strip* functions) — this file only has the visual
+   layer, styled with the SAME technique dsh uses: the .dec-strip-lanes
+   container is transformed via CSS custom properties (domain-left/width)
+   so pan/zoom never touches individual span DOM nodes — only the parent's
+   style, which is what keeps dragging smooth. */
+.dec-strip-wrap{
+  display:grid;grid-template-columns:52px minmax(0,1fr);
+  height:34px;margin-top:8px;overflow:hidden;
+  background:var(--bg);border:1px solid var(--border);border-radius:6px;
+  position:relative;isolation:isolate;
+}
+.dec-strip-labels{
+  position:relative;border-right:1px solid var(--border);
+  color:var(--dim);font-family:var(--mono);font-size:9px;
+  display:flex;align-items:center;justify-content:flex-end;padding-right:6px;
+  text-transform:uppercase;letter-spacing:.04em;
+}
+.dec-strip-track{
+  position:relative;overflow:hidden;cursor:crosshair;
+  touch-action:none;user-select:none;
+}
+.dec-strip-track[data-panning="true"]{cursor:grabbing}
+.dec-strip-track:focus-visible{outline:1px solid var(--accent);outline-offset:-1px}
+.dec-strip-empty{
+  position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+  color:var(--dim);font-family:var(--mono);font-size:11px;
+}
+/* Transformed container — pan/zoom moves THIS, not individual spans. */
+.dec-strip-lanes{
+  position:absolute;z-index:2;top:8px;bottom:8px;
+  left:var(--dsl,0%);width:var(--dsw,100%);
+}
+.dec-strip-lanes[data-animate="true"]{transition:left 160ms ease-out}
+.dec-strip-span{
+  position:absolute;top:0;width:8px;height:18px;min-width:2px;
+  border-radius:2px;opacity:.82;cursor:pointer;
+  left:var(--dss-left);width:var(--dss-width);
+  transition:opacity .1s,box-shadow .1s;
+}
+.dec-strip-span[data-status="pending"] {background:#caa84b}
+.dec-strip-span[data-status="verified"]{background:#2c9c4d}
+.dec-strip-span[data-status="reversed"]{background:#c2453d}
+.dec-strip-span[data-status="mined"]   {background:#666}
+.dec-strip-span[data-status="answered"]{background:var(--accent)}
+.dec-strip-span[data-hovered="true"]{
+  opacity:1;z-index:1;
+  box-shadow:0 0 0 1px var(--bg),0 0 0 2px var(--accent);
+}
+.dec-strip-span[data-current="true"]{
+  opacity:1;z-index:2;
+  box-shadow:0 0 0 1px var(--bg),0 0 0 2px #fff;
+}
+/* Selected-range spotlight: dim everything OUTSIDE the selection via a
+   giant box-shadow that extends past the viewport on both sides — the
+   same trick dsh uses (cheaper than clip-path, no repaint on resize). */
+.dec-strip-selection{
+  position:absolute;z-index:1;top:0;bottom:0;
+  left:var(--dss-sel-left,0%);width:var(--dss-sel-width,0%);
+  min-width:1px;pointer-events:none;
+  background:rgba(0,212,255,.10);
+  box-shadow:
+    -100vw 0 0 100vw rgba(10,10,14,.55),
+    100vw 0 0 100vw rgba(10,10,14,.55);
+}
+.dec-strip-selection[hidden]{display:none}
+.dec-strip-hover-line{
+  position:absolute;z-index:3;top:0;bottom:0;width:1px;
+  left:var(--dss-hover-left,0%);
+  background:var(--dim);opacity:.5;pointer-events:none;
+}
+.dec-strip-hover-line[hidden]{display:none}
+.dec-strip-earlier{
+  position:absolute;z-index:5;top:0;bottom:0;left:0;width:22px;
+  display:flex;align-items:center;justify-content:flex-start;
+  appearance:none;box-sizing:border-box;padding-left:2px;border:0;outline:none;
+  background:linear-gradient(to right,var(--bg) 0,var(--bg) 38%,transparent 100%);
+  color:var(--dim);font-family:var(--mono);font-size:11px;line-height:1;
+  opacity:.72;cursor:pointer;
+}
+.dec-strip-earlier:hover{opacity:1}
+.dec-strip-earlier[data-loading="true"]{cursor:default;opacity:.4}
+.dec-strip-earlier[hidden]{display:none}
+/* Flash highlight on the vertical list row when jumped-to from the strip */
+.dec-row.dec-row-flash{animation:decRowFlash 900ms ease-out}
+@keyframes decRowFlash{
+  0%{background:rgba(0,212,255,.18)}
+  100%{background:transparent}
+}
+/* Rows filtered out by an active strip range selection — collapsed, not just
+   dimmed, so the list reads as "N of M shown" rather than a wall of gray. */
+.dec-row.dec-row-range-hidden{display:none}
+.dec-strip-range-banner{
+  display:flex;align-items:center;gap:8px;justify-content:space-between;
+  padding:6px 8px;margin:6px 0 2px;
+  background:rgba(0,212,255,.08);border:1px solid var(--accent);border-radius:6px;
+  font-family:var(--mono);font-size:11px;color:var(--text);
+}
+.dec-strip-range-banner button{
+  background:transparent;border:1px solid var(--border);color:var(--dim);
+  border-radius:4px;padding:2px 8px;cursor:pointer;font-family:var(--mono);font-size:10px;
+}
+.dec-strip-range-banner button:hover{color:var(--text);border-color:var(--accent)}
 
 /* Answerable pending decisions: tap an option (or type) to answer from the drawer */
 .dec-answer-chip{

@@ -34,40 +34,113 @@ function flushOutbox(){
     try{ws.send(JSON.stringify({type:"prompt",client_id:item.id,text:item.text,images:item.images||[],resend:true}))}catch{}
   }
 }
-// ---- NO-LOSS net (2026-07-07) ----
+// ---- NO-LOSS net (2026-07-07, images added 2026-08-14) ----
 // Any outbox item still unacked after a few seconds gets POSTed to
 // /api/outbox-capture, which makes it durable in the session's server-side
 // queue immediately (plain HTTP works when the WS is dead or a zombie).
 // On ok:true the server owns delivery, so we drop the item locally.
-// Image-bearing prompts are skipped (data too large for the net; the WS
-// resend path still covers them) — text is what must never be lost.
+// Images: sent as base64 in the JSON body. Server route has a 20mb limit and
+// runs the same saveUploadedImage flow the WS handler does. `keepalive` is
+// only enabled for small bodies — browsers cap keepalive at ~64KB.
 function captureOutbox(){
   const now=Date.now();
   for(const item of outbox.slice()){
-    if(item.images&&item.images.length) continue;
     if(now-(item.ts||0)<4000) continue;             // give the WS path first shot
     const sid=item.sid||localStorage.getItem("llmt_session");
     if(!sid||!item.text) continue;
+    // Stuck > 30s = network genuinely down. Flip the chip to "failed" so the
+    // user can see + tap to retry. Retries also happen automatically each poll.
+    if(now-(item.ts||0)>30000) setUserMsgState(item.id,"failed");
+    const body={sessionId:sid,client_id:item.id,text:item.text};
+    if(item.images&&item.images.length) body.images=item.images;
+    const bodyStr=JSON.stringify(body);
     fetch(apiUrl("/api/outbox-capture"),{
-      method:"POST",headers:{"Content-Type":"application/json"},keepalive:true,
-      body:JSON.stringify({sessionId:sid,client_id:item.id,text:item.text})
+      method:"POST",headers:{"Content-Type":"application/json"},
+      keepalive: bodyStr.length<60000,
+      body: bodyStr
     }).then(r=>r.ok?r.json():null).then(d=>{
-      if(d&&d.ok){outbox=outbox.filter(x=>x.id!==item.id);saveOutbox();}
+      if(d&&d.ok){
+        outbox=outbox.filter(x=>x.id!==item.id);saveOutbox();
+        setUserMsgState(item.id,"sent");
+      }
     }).catch(()=>{});
   }
 }
 setInterval(captureOutbox,6000);
-function saveInputSelection(){try{localStorage.setItem("llmt_draft_sel",JSON.stringify({s:inp.selectionStart,e:inp.selectionEnd}))}catch{}}
-let scrollSaveT=null;
-function saveChatScroll(){
-  clearTimeout(scrollSaveT);
-  scrollSaveT=setTimeout(()=>{
-    try{
-      const atBottom=(chat.scrollHeight-chat.scrollTop-chat.clientHeight)<30;
-      localStorage.setItem("llmt_chat_scroll",JSON.stringify({top:chat.scrollTop,atBottom}));
-    }catch{}
-  },120);
+// Immediate capture on load: pick up items stranded from a prior tab-death
+// without waiting for the first 6s tick.
+setTimeout(captureOutbox,500);
+// ---- Send-state chip helpers ----
+// Managed states for the small dot in the corner of user bubbles:
+//   "sending" — WS send fired, awaiting ack (gray, pulsing)
+//   "queued"  — WS dead; sits in local outbox waiting to ship (amber)
+//   "failed"  — stuck > 30s; tap-to-retry (red !)
+//   "sent"    — server has it; auto-fades in 1.2s (green)
+// No-op if the bubble isn't in the DOM (history re-renders skip it).
+function setUserMsgState(clientId, state){
+  if(!clientId) return;
+  const el=chat.querySelector('.msg.user[data-client-id="'+CSS.escape(clientId)+'"] .msg-state');
+  if(!el) return;
+  el.dataset.state=state;
+  el.classList.remove("hidden","st-sending","st-queued","st-failed","st-sent");
+  el.textContent=""; el.onclick=null; el.title="";
+  if(state==="sending"){el.classList.add("st-sending"); el.title="Sending…";}
+  else if(state==="queued"){el.classList.add("st-queued"); el.title="Queued — waiting for connection";}
+  else if(state==="failed"){
+    el.classList.add("st-failed"); el.textContent="!"; el.title="Send failed — tap to retry";
+    el.onclick=(e)=>{e.stopPropagation();retryOutboxItem(clientId);};
+  }
+  else if(state==="sent"){
+    el.classList.add("st-sent"); el.title="Sent";
+    setTimeout(()=>{try{el.classList.add("hidden");}catch{}},1200);
+  }
+  else el.classList.add("hidden");
 }
+// User tapped a failed chip. Force an immediate retry: WS if live, else HTTP.
+function retryOutboxItem(clientId){
+  const it=outbox.find(x=>x.id===clientId);
+  if(!it) return;
+  setUserMsgState(clientId,"sending");
+  if(ws&&ws.readyState===1){
+    try{ws.send(JSON.stringify({type:"prompt",client_id:it.id,text:it.text,images:it.images||[],resend:true}));}catch{}
+  } else {
+    it.ts=0; // force stale so captureOutbox picks it up this tick
+    captureOutbox();
+  }
+}
+// ---- Pagehide / beforeunload beacon flush ----
+// Last-ditch flush before the tab dies. sendBeacon guarantees delivery even
+// during page destruction. Text-only items only — beacon body cap is small
+// and images can't reliably fit. Image items persist in localStorage and get
+// captured on next page load (immediate captureOutbox above).
+function flushOutboxToBeacon(){
+  try{
+    const sid=(session&&session.id)||localStorage.getItem("llmt_session");
+    if(!sid) return;
+    for(const item of outbox){
+      if(!item.text) continue;
+      if(item.images&&item.images.length) continue;
+      const body=JSON.stringify({
+        sessionId:sid,client_id:item.id,text:item.text,source:"pagehide-beacon"
+      });
+      try{navigator.sendBeacon(apiUrl("/api/outbox-capture"),new Blob([body],{type:"application/json"}));}catch{}
+    }
+  }catch{}
+}
+window.addEventListener("pagehide",flushOutboxToBeacon);
+window.addEventListener("beforeunload",flushOutboxToBeacon);
+function saveInputSelection(){try{localStorage.setItem("llmt_draft_sel",JSON.stringify({s:inp.selectionStart,e:inp.selectionEnd}))}catch{}}
+// ── Scroll UX (2026-08-14 redesign) ──
+// The old code persisted a raw pixel `top` and re-applied it after every
+// re-render — a race that landed the chat mid-transcript whenever reflow
+// changed geometry (image loads, address-bar collapse, new messages).
+// Replaced with:
+//   • last_seen_ts persisted PER-SESSION, updated when a bubble sits in
+//     view via IntersectionObserver (meaning survives reflow; pixels don't)
+//   • Default landing = newest (bottom) — that's what a chat opener wants
+//   • Unread chip surfaces "N new since last visit — Show what you missed"
+//     when the newest server ts exceeds the persisted last_seen_ts
+//   • Jump-to-bottom FAB is always available when scrolled up
 let stickToBottom=true;
 function updateStickyFromScroll(){
   stickToBottom=(chat.scrollHeight-chat.scrollTop-chat.clientHeight)<60;
@@ -79,12 +152,159 @@ function scrollToBottomForce(){
   chat.scrollTop=chat.scrollHeight;
   stickToBottom=true;
 }
-function restoreChatScroll(){
-  try{
-    const s=JSON.parse(localStorage.getItem("llmt_chat_scroll")||"null");
-    if(!s||s.atBottom){chat.scrollTop=chat.scrollHeight}
-    else{chat.scrollTop=s.top}
-  }catch{chat.scrollTop=chat.scrollHeight}
+let _lastSeenTs=0;
+function _lastSeenKey(){return"llmt_last_seen:"+((session&&session.id)||"_")}
+function _loadLastSeen(){
+  try{_lastSeenTs=parseInt(localStorage.getItem(_lastSeenKey())||"0",10)||0}catch{_lastSeenTs=0}
+}
+function _saveLastSeen(ts){
+  if(!ts||ts<=_lastSeenTs) return;
+  _lastSeenTs=ts;
+  try{localStorage.setItem(_lastSeenKey(),String(ts))}catch{}
+  _updateFabVisibility();
+}
+let _msgObserver=null;
+function _setupMsgObserver(){
+  if(_msgObserver||!("IntersectionObserver" in window)) return;
+  _msgObserver=new IntersectionObserver((entries)=>{
+    for(const e of entries){
+      if(!e.isIntersecting) continue;
+      const ts=parseInt(e.target.dataset.ts||"0",10);
+      if(ts>_lastSeenTs) _saveLastSeen(ts);
+    }
+  },{root:chat,threshold:0.5});
+}
+function _observeMessage(el){
+  if(!_msgObserver||!el||!el.dataset||!el.dataset.ts) return;
+  try{_msgObserver.observe(el)}catch{}
+}
+let _chatMO=null;
+function _startChatMutationObserver(){
+  if(_chatMO||!chat) return;
+  _chatMO=new MutationObserver((mutations)=>{
+    for(const m of mutations){
+      if(m.type==="attributes"&&m.target.dataset&&m.target.dataset.ts){
+        _observeMessage(m.target);
+      } else if(m.type==="childList"){
+        for(const node of m.addedNodes){
+          if(node.nodeType!==1) continue;
+          if(node.classList&&node.classList.contains("msg")&&node.dataset&&node.dataset.ts){
+            _observeMessage(node);
+          }
+          if(node.querySelectorAll) node.querySelectorAll(".msg[data-ts]").forEach(_observeMessage);
+        }
+      }
+    }
+  });
+  _chatMO.observe(chat,{childList:true,subtree:true,attributes:true,attributeFilter:['data-ts']});
+}
+function _maxRenderedTs(){
+  let max=0;
+  chat.querySelectorAll(".msg[data-ts]").forEach(el=>{
+    const ts=parseInt(el.dataset.ts||"0",10);
+    if(ts>max) max=ts;
+  });
+  return max;
+}
+function _countUnreadSince(){
+  if(!_lastSeenTs) return 0;
+  let n=0;
+  chat.querySelectorAll(".msg[data-ts]").forEach(el=>{
+    const ts=parseInt(el.dataset.ts||"0",10);
+    if(ts>_lastSeenTs) n++;
+  });
+  return n;
+}
+// The intentional replacement for the old `setTimeout(restoreChatScroll,0)`.
+// Called after history renders (from the WS "history" handler). Rules:
+//   1) Default landing = newest (bottom). Race-free — one rAF, deterministic scroll.
+//   2) Surface the "Show what you missed" chip ONLY when there is unread
+//      activity that would require scrolling UP to see (i.e., the first
+//      unread message is off-screen above the viewport). A chip that says
+//      "3 new" while those 3 are already visible reads as noise.
+function resolveInitialScroll(){
+  _loadLastSeen();
+  requestAnimationFrame(()=>{
+    scrollToBottomForce();
+    _hideUnreadChip();
+    if(_lastSeenTs){
+      const firstUnread=Array.from(chat.querySelectorAll(".msg[data-ts]")).find(el=>{
+        const ts=parseInt(el.dataset.ts||"0",10);
+        return ts>_lastSeenTs;
+      });
+      if(firstUnread){
+        const chatRect=chat.getBoundingClientRect();
+        const firstRect=firstUnread.getBoundingClientRect();
+        if(firstRect.top<chatRect.top){
+          const n=_countUnreadSince();
+          if(n>0) _showUnreadChip(n, firstUnread);
+        }
+      }
+    }
+    _updateFabVisibility();
+  });
+}
+// ── Unread chip + jump-to-bottom FAB ──
+let _unreadChipEl=null, _fabEl=null, _unreadAnchor=null;
+function _ensureFab(){
+  if(_fabEl) return _fabEl;
+  _fabEl=document.createElement("button");
+  _fabEl.className="chat-fab hidden";
+  _fabEl.setAttribute("aria-label","Jump to newest");
+  _fabEl.innerHTML='<span class="fab-arrow">↓</span><span class="fab-count"></span>';
+  _fabEl.onclick=()=>{
+    scrollToBottomForce();
+    _saveLastSeen(_maxRenderedTs());
+    _hideUnreadChip();
+    _updateFabVisibility();
+  };
+  document.body.appendChild(_fabEl);
+  return _fabEl;
+}
+function _ensureUnreadChip(){
+  if(_unreadChipEl) return _unreadChipEl;
+  _unreadChipEl=document.createElement("button");
+  _unreadChipEl.className="unread-chip hidden";
+  _unreadChipEl.onclick=()=>_jumpToFirstUnread();
+  document.body.appendChild(_unreadChipEl);
+  return _unreadChipEl;
+}
+// Bind the first-unread anchor at chip-show time. If we recomputed at click
+// time, the IntersectionObserver would have already updated _lastSeenTs to
+// the newest (because bottom messages became visible on open) — no anchor
+// would be found, the jump would silently no-op.
+function _showUnreadChip(n, anchor){
+  const el=_ensureUnreadChip();
+  el.textContent="↑ "+n+" new since last visit — Show what you missed";
+  el.classList.remove("hidden");
+  _unreadAnchor = anchor || null;
+}
+function _hideUnreadChip(){
+  if(_unreadChipEl) _unreadChipEl.classList.add("hidden");
+  _unreadAnchor = null;
+}
+function _jumpToFirstUnread(){
+  const anchor = _unreadAnchor;
+  if(!anchor || !anchor.parentNode){_hideUnreadChip();return;}
+  let divider = chat.querySelector(".unread-divider");
+  if(!divider){
+    divider = mk("div","unread-divider");
+    divider.textContent="── New ──";
+    anchor.parentNode.insertBefore(divider, anchor);
+  }
+  // Scroll the DIVIDER into view (not the anchor). With block:"start" the
+  // anchor sits just under the divider — you land on "New" as your header
+  // and the first unread message is the next thing you see.
+  try{divider.scrollIntoView({behavior:"smooth",block:"start"});}catch{divider.scrollIntoView();}
+  _hideUnreadChip();
+}
+function _updateFabVisibility(){
+  const fab=_ensureFab();
+  const nearBottom=(chat.scrollHeight-chat.scrollTop-chat.clientHeight)<100;
+  if(nearBottom) fab.classList.add("hidden"); else fab.classList.remove("hidden");
+  const cnt=_countUnreadSince();
+  const c=fab.querySelector(".fab-count");
+  if(c) c.textContent=cnt>0?String(cnt):"";
 }
 
 function setInputFromHistory(text){
@@ -114,7 +334,7 @@ const omModelPickLabel = () => document.getElementById("omModelPickLabel");
 let _allModelsData = null;
 // Default all collapsed — the menu's whole point is to be compact, click to drill in.
 // On open() we auto-expand the section that contains the currently-selected model.
-const _provExpanded = { claude: false, openai: false, google: false };
+const _provExpanded = { claude: false, openai: false, google: false, deepseek: false };
 
 // (model-picker fns moved to app-modelpicker.js)
 let _allSessions = [];
@@ -157,7 +377,7 @@ function _updateNewSessionLabel() {
   btn.textContent = proj ? ("+ New in " + proj) : "+ New Session";
   btn.title = "Tap: new chat in " + proj + ". Long-press / right-click: pick a different project.";
 }
-const badge=document.getElementById("badge"), ds=document.getElementById("ds"), dsText=document.getElementById("dsText");
+const badge=document.getElementById("badge");
 const starBtn=document.getElementById("starBtn");
 
 // Reflect the current session's starred state in the topbar star icon.
@@ -229,6 +449,9 @@ async function init(){
     newBtn.addEventListener("contextmenu", (e) => { e.preventDefault(); openNewSessionPicker(); });
   }
 
+  // Start the intersection + mutation observers that keep last_seen_ts current.
+  // Idempotent — safe to call before any chat content exists.
+  try { _setupMsgObserver(); _startChatMutationObserver(); } catch (e) { console.warn("[scroll-obs] init failed:", e.message); }
   // Restore last session from URL hash or localStorage
   const hashSession = location.hash.replace(/^#/,"").trim();
   const savedSession = hashSession || localStorage.getItem("llmt_session");
@@ -289,6 +512,10 @@ function loadMore(){
 }
 function interrupt(){
   if(ws&&ws.readyState===1) ws.send(JSON.stringify({type:"interrupt"}));
+  // Server-side interrupt also disarms any pending wake (2026-08-23 fix) —
+  // re-poll immediately instead of waiting up to 5s for the countdown to
+  // catch up, so tapping Stop visibly clears the countdown right away.
+  if(typeof _pollWakeStatus === "function") setTimeout(_pollWakeStatus, 300);
 }
 
 // ── DOM helpers ──
@@ -343,8 +570,10 @@ try{
 document.addEventListener("selectionchange",()=>{if(document.activeElement===inp)saveInputSelection()});
 inp.addEventListener("click",saveInputSelection);
 inp.addEventListener("keyup",saveInputSelection);
-// Save chat scroll position
-chat.addEventListener("scroll",()=>{updateStickyFromScroll();saveChatScroll();});
+// Chat scroll: keep sticky detection + FAB visibility in sync. The old
+// pixel-position persistence is gone (last_seen_ts is what we persist now,
+// via IntersectionObserver — see resolveInitialScroll above).
+chat.addEventListener("scroll",()=>{updateStickyFromScroll();_updateFabVisibility();});
 // Save drawer search query
 const dsEl=document.getElementById("drawerSearch");
 if(dsEl)dsEl.addEventListener("input",()=>{try{localStorage.setItem("llmt_drawer_search",dsEl.value)}catch{}});

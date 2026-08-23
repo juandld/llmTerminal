@@ -1,12 +1,54 @@
 // Chat message rendering for llmTerminal — classic script, shares global
 // scope with app.js. Extracted (refactor 2026-06-10, app.js phase 6).
 
+// Wake-prompt bubbles are synthetic user messages fired by the auto-loop
+// (ScheduleWakeup / spawnLoopCheck). The full machine prompt is what the
+// agent needs — but if we render it as a normal user bubble it dominates
+// the chat and pushes the human's messages out of view. Render collapsed
+// (one-line chip) with a click to expand and see the full text.
+function addWakePrompt(msg){
+  const text = String((msg && msg.text) || "");
+  const d = mk("div","msg user wake-prompt collapsed");
+  if(msg && msg.client_id) d.dataset.clientId = msg.client_id;
+  d.dataset.source = "wake";
+  // One-line summary — first meaningful line, truncated.
+  const firstLine = text.split(/\n+/).find(l => l.trim().length > 0) || "(auto-loop tick)";
+  const summary = firstLine.length > 80 ? firstLine.slice(0, 77) + "…" : firstLine;
+  const chip = mk("div","wake-chip");
+  const icon = mk("span","wake-icon"); icon.textContent = "🔄";
+  const label = mk("span","wake-label"); label.textContent = "Auto-loop: ";
+  const summaryEl = mk("span","wake-summary"); summaryEl.textContent = summary;
+  const toggle = mk("span","wake-toggle"); toggle.textContent = "▸";
+  toggle.title = "Tap to expand full machine prompt";
+  chip.appendChild(icon); chip.appendChild(label); chip.appendChild(summaryEl); chip.appendChild(toggle);
+  const full = mk("pre","wake-full");
+  full.textContent = text;
+  d.appendChild(chip);
+  d.appendChild(full);
+  chip.onclick = () => {
+    const now = d.classList.toggle("collapsed");
+    toggle.textContent = d.classList.contains("collapsed") ? "▸" : "▾";
+  };
+  chat.appendChild(d);
+  scrollToBottomForce();
+  return d;
+}
+
 function addUser(text,imagePreviews,clientId){
   const d=mk("div","msg user");
   if(clientId) d.dataset.clientId=clientId;
   if(text) d.appendChild(document.createTextNode(text));
   if(imagePreviews){
     imagePreviews.forEach(src=>{const img=document.createElement("img");img.src=src;d.appendChild(img)});
+  }
+  // Send-state chip: tiny dot in bubble corner reflecting whether the message
+  // has actually shipped. Hidden by default; setUserMsgState(clientId, state)
+  // flips it to sending/queued/failed/sent. Sent auto-fades. Only present when
+  // we have a client_id to key against (history-replay bubbles skip it).
+  if(clientId){
+    const chip=mk("span","msg-state hidden");
+    chip.dataset.state="none";
+    d.appendChild(chip);
   }
   chat.appendChild(d);scrollToBottomForce();
   return d;
