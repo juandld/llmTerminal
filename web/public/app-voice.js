@@ -1,6 +1,125 @@
 // Voice-note recording UI for llmTerminal — classic script, shares global
 // scope with app.js. Extracted (refactor 2026-06-10, app.js phase 9).
 
+// ── Voice-note recovery via IndexedDB (2026-08-14 train-work hardening) ──
+// Recorded blobs are persisted to IDB BEFORE upload starts so a tab-death,
+// signal drop, or backgrounded browser can't lose the recording. On page
+// load / connect we sweep for un-uploaded records for the current session
+// and re-attempt upload automatically.
+const VN_DB_NAME="llmt_voice"; const VN_STORE="recordings";
+
+// Voice+text compose-attach state. When compose has text at record-start we
+// show a chip letting the user know the text will ride along; tapping ×
+// detaches so the voice sends solo and text stays in compose.
+let voiceAttachDetached=false;
+
+function _voiceAttachActiveText(){
+  if(voiceAttachDetached) return "";
+  const t=(inp&&(inp.dataset.prevValue||inp.value)||"").trim();
+  return t;
+}
+function _renderVoiceAttachChip(container){
+  if(!container) return;
+  container.querySelectorAll(".voice-attach-chip").forEach(c=>c.remove());
+  const text=_voiceAttachActiveText();
+  if(!text) return;
+  const chip=mk("div","voice-attach-chip");
+  const truncated=text.length>60?text.slice(0,57)+"…":text;
+  const icon=mk("span","vac-icon");icon.textContent="📎";
+  const label=mk("span","vac-label");label.textContent="will send with: ";
+  const txt=mk("span","vac-text");txt.textContent="“"+truncated+"”";
+  const btn=mk("button","vac-detach");btn.type="button";btn.textContent="×";
+  btn.title="Detach — send voice alone, keep text in compose";
+  btn.onclick=(e)=>{
+    e.stopPropagation();
+    voiceAttachDetached=true;
+    document.querySelectorAll(".voice-attach-chip").forEach(c=>c.remove());
+    _refreshVoiceSendLabels();
+  };
+  chip.appendChild(icon);chip.appendChild(label);chip.appendChild(txt);chip.appendChild(btn);
+  container.appendChild(chip);
+}
+function _refreshVoiceSendLabels(){
+  const hasAttach=_voiceAttachActiveText().length>0;
+  const mobileSend=document.querySelector("#voiceTimer .voice-send");
+  if(mobileSend) mobileSend.textContent=hasAttach?"Send voice + text ↑":"Send ↑";
+}
+function _vnOpenDB(){
+  return new Promise((resolve,reject)=>{
+    if(!self.indexedDB){reject(new Error("no indexedDB"));return;}
+    const req=indexedDB.open(VN_DB_NAME,1);
+    req.onupgradeneeded=()=>{
+      const db=req.result;
+      if(!db.objectStoreNames.contains(VN_STORE)) db.createObjectStore(VN_STORE,{keyPath:"id"});
+    };
+    req.onsuccess=()=>resolve(req.result);
+    req.onerror=()=>reject(req.error);
+  });
+}
+async function vnPersist(rec){
+  try{
+    const db=await _vnOpenDB();
+    await new Promise((res,rej)=>{
+      const tx=db.transaction(VN_STORE,"readwrite");
+      tx.objectStore(VN_STORE).put(rec);
+      tx.oncomplete=()=>res(); tx.onerror=()=>rej(tx.error);
+    });
+    db.close();
+  }catch(e){ console.warn("[vn-idb] persist failed:",e.message); }
+}
+async function vnDelete(id){
+  if(!id) return;
+  try{
+    const db=await _vnOpenDB();
+    await new Promise((res)=>{
+      const tx=db.transaction(VN_STORE,"readwrite");
+      tx.objectStore(VN_STORE).delete(id);
+      tx.oncomplete=()=>res(); tx.onerror=()=>res();
+    });
+    db.close();
+  }catch{}
+}
+async function vnListPending(){
+  try{
+    const db=await _vnOpenDB();
+    const items=await new Promise((res,rej)=>{
+      const tx=db.transaction(VN_STORE,"readonly");
+      const req=tx.objectStore(VN_STORE).getAll();
+      req.onsuccess=()=>res(req.result||[]);
+      req.onerror=()=>rej(req.error);
+    });
+    db.close();
+    return items;
+  }catch{ return []; }
+}
+// Sweep on session-open: re-upload any recordings still pending for THIS
+// session. Cross-session recordings are left alone until you switch to that
+// chat; abandoned ones (>7 days) are garbage-collected.
+async function vnSweepPendingForCurrentSession(){
+  const currentSid=(session&&session.id)||null;
+  if(!currentSid) return;
+  const items=await vnListPending();
+  for(const rec of items){
+    if(rec.sessionId!==currentSid){
+      if(Date.now()-(rec.createdAt||0) > 7*86400000) vnDelete(rec.id);
+      continue;
+    }
+    // Skip if the local bubble is already in the DOM (double-sweep guard).
+    if(rec.id && chat.querySelector('.msg.user.voice-note-msg[data-vn-id="'+CSS.escape(rec.id)+'"]')) continue;
+    const duration=rec.duration||0;
+    const msgEl=addVoiceNoteUser(rec.blob,duration,[]);
+    msgEl.dataset.vnId=rec.id;
+    msgEl.dataset.recovered="1";
+    const vn=msgEl.querySelector(".vn-bubble");
+    if(vn){
+      const banner=mk("div","vn-recovered");
+      banner.textContent="↺ Recovered from previous session — re-uploading";
+      vn.prepend(banner);
+    }
+    attemptVoiceUpload(rec.blob,msgEl,[],0,rec.id,rec.vnText||"");
+  }
+}
+
 function toggleVoiceInput(){
   if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){
     alert("Voice recording not supported in this browser.");return;
@@ -47,6 +166,12 @@ function startVoiceUI(){
   if(btn){btn.classList.add("recording");btn.textContent="↑";}
   if(sendBtn){sendBtn._oldText=sendBtn.textContent;sendBtn.textContent="✕";sendBtn.classList.add("voice-cancel-mode");sendBtn.onclick=cancelVoiceRecording;}
   if(attachBtn){attachBtn.style.visibility="hidden";attachBtn.style.pointerEvents="none";}
+  // Hide the "next chat needing attention" fab — it sits at z:200 above the
+  // recording overlay's z:100 and steals taps meant for the × detach chip / Send.
+  const fab=document.getElementById("fab");
+  if(fab){fab.dataset.prevDisplay=fab.style.display||"";fab.style.display="none";}
+  // Fresh recording — text-attach starts un-detached.
+  voiceAttachDetached=false;
   // Desktop: replace textarea with inline recording strip + cancel
   if(inp)inp.dataset.prevValue=inp.value;
   if(!isMobile){
@@ -63,6 +188,11 @@ function startVoiceUI(){
       bar.insertBefore(ri,bar.firstChild);
     }
     ri.style.display="flex";
+    // Desktop attach chip: sibling ABOVE the recording strip, inside .input-bar
+    let dc=document.getElementById("voiceAttachChipDesktop");
+    if(!dc){dc=mk("div","voice-attach-chip-host");dc.id="voiceAttachChipDesktop";const bar=document.querySelector(".input-bar");bar.insertBefore(dc,ri);}
+    dc.style.display="";
+    _renderVoiceAttachChip(dc);
   } else {
     if(inp){inp.value="";inp.readOnly=true;inp.placeholder="⏺ Recording...";if(typeof _updateClearBtn==="function")_updateClearBtn();}
   }
@@ -83,10 +213,14 @@ function startVoiceUI(){
       const send=mk("button","voice-send");send.textContent="Send ↑";
       send.onclick=(e)=>{e.stopPropagation();stopVoiceRecording();};
       actions.appendChild(cancel);actions.appendChild(send);
-      timer.appendChild(info);timer.appendChild(actions);
+      const chipHost=mk("div","voice-attach-chip-host");chipHost.id="voiceAttachChipMobile";
+      timer.appendChild(info);timer.appendChild(chipHost);timer.appendChild(actions);
       document.body.appendChild(timer);
     }
     timer.style.display="flex";
+    const mobileChipHost=document.getElementById("voiceAttachChipMobile");
+    if(mobileChipHost){mobileChipHost.style.display="";_renderVoiceAttachChip(mobileChipHost);}
+    _refreshVoiceSendLabels();
     try{if(document.documentElement.requestFullscreen)document.documentElement.requestFullscreen().catch(()=>{});}catch{}
   }
 
@@ -133,6 +267,12 @@ function endVoiceUI(){
   if(ri)ri.style.display="none";
   const timer=document.getElementById("voiceTimer");
   if(timer)timer.style.display="none";
+  // Tear down attach chips — sendVoiceNote() has already captured the text
+  // (it reads inp.value/prevValue at send time before this frame's clear).
+  document.querySelectorAll(".voice-attach-chip-host").forEach(h=>{h.style.display="none";h.querySelectorAll(".voice-attach-chip").forEach(c=>c.remove());});
+  // Restore attention-nav fab that startVoiceUI hid.
+  const fab=document.getElementById("fab");
+  if(fab && fab.dataset.prevDisplay!==undefined){fab.style.display=fab.dataset.prevDisplay;delete fab.dataset.prevDisplay;}
   if(voiceTimerInterval){clearInterval(voiceTimerInterval);voiceTimerInterval=null;}
   if(voiceMeterRAF){cancelAnimationFrame(voiceMeterRAF);voiceMeterRAF=null;}
   if(voiceMeterCtx){try{voiceMeterCtx.close();}catch{}; voiceMeterCtx=null; voiceMeterAnalyser=null;}
@@ -153,13 +293,34 @@ async function sendVoiceNote(blob){
   // Capture any pending images to send with this voice note
   const vnImages=pendingImages.map(i=>({data:i.data,mimeType:i.mimeType}));
   const vnPreviews=pendingImages.map(i=>i.preview);
+  // Capture compose text riding along, unless user tapped × on the chip to detach.
+  // endVoiceUI() has already restored inp.value from prevValue by now.
+  const vnText=voiceAttachDetached?"":((inp&&inp.value)||"").trim();
+  voiceAttachDetached=false;
+  // If we're attaching text, clear it from compose immediately so it can't be
+  // sent twice by a rapid follow-up tap on Send.
+  if(vnText && inp){ inp.value=""; inp.style.height="44px"; localStorage.removeItem("llmt_draft"); if(typeof _updateClearBtn==="function")_updateClearBtn(); }
   const msgEl=addVoiceNoteUser(blob,duration,vnPreviews);
   if(vnImages.length) clearImages();
   // Voice note is an engagement signal — promote the chat out of done/archived
   // immediately so the recording device sees it move in the sidebar without
   // waiting for the 15s poll.
   promoteCurrentSessionToActive();
-  attemptVoiceUpload(blob, msgEl, vnImages, 0);
+  // Persist the blob to IDB BEFORE upload so a tab-death mid-upload doesn't
+  // vaporize the recording. Cleared inside attemptVoiceUpload on success.
+  const recId=(self.crypto&&crypto.randomUUID)?crypto.randomUUID():("vn_"+Date.now()+"_"+Math.random().toString(36).slice(2,8));
+  msgEl.dataset.vnId=recId;
+  await vnPersist({
+    id: recId,
+    sessionId: (session&&session.id)||null,
+    project: (session&&session.project)||null,
+    blob,
+    mimeType: blob.type||"audio/mp4",
+    duration,
+    vnText,
+    createdAt: Date.now(),
+  });
+  attemptVoiceUpload(blob, msgEl, vnImages, 0, recId, vnText);
 }
 
 // Wait until we have a valid nonce on an open WS, or timeout.
@@ -178,8 +339,9 @@ function waitForFreshVoiceNonce(timeoutMs){
   });
 }
 
-async function attemptVoiceUpload(blob, msgEl, vnImages, attempts){
+async function attemptVoiceUpload(blob, msgEl, vnImages, attempts, recId, vnText){
   attempts = attempts || 0;
+  vnText = vnText || "";
   const MAX_AUTO_RETRIES = 1;
   const statusEl=msgEl.querySelector(".vn-status");
   const setVnStatus=(txt,cls)=>{
@@ -197,13 +359,14 @@ async function attemptVoiceUpload(blob, msgEl, vnImages, attempts){
     // Prefer the WS-bound nonce — it proves this upload is from the currently-open
     // socket. Falls back to bare session= only if nonce hasn't arrived yet (server
     // logs that path as deprecated).
-    // noQueue=1 when images are attached: we want ONE message (the WS prompt below,
-    // which carries both transcript + images), not two (server-queued transcript +
-    // client-WS image prompt) firing as separate Claude turns.
+    // noQueue=1 when images OR compose text are attached: we want ONE message
+    // (the WS prompt below, which carries transcript + images + text), not
+    // two (server-queued transcript + client-WS composite prompt) firing as
+    // separate Claude turns.
     let qs = currentVoiceNonce
       ? "?nonce="+encodeURIComponent(currentVoiceNonce)
       : (sid?"?session="+encodeURIComponent(sid):"");
-    if(vnImages.length){ qs += (qs?"&":"?") + "noQueue=1"; }
+    if(vnImages.length || vnText){ qs += (qs?"&":"?") + "noQueue=1"; }
     // Track upload progress via XMLHttpRequest for real upload %
     const data=await new Promise((resolve,reject)=>{
       const xhr=new XMLHttpRequest();
@@ -251,24 +414,31 @@ async function attemptVoiceUpload(blob, msgEl, vnImages, attempts){
     // Update audio src to server URL
     const audioEl=msgEl.querySelector("audio");
     if(audioEl&&data.audioUrl) audioEl.src=data.audioUrl;
-    // Server already queued the transcript — only send from client if images attached.
-    // When images attached we passed noQueue=1 above, so server did NOT queue. Send
-    // text + images as ONE WS prompt, tagged with voice-note metadata so it persists
-    // as a proper voice-note bubble on reload.
-    if(data.transcript&&vnImages.length){
+    // Server already queued the transcript — only send from client if images OR
+    // compose text attached. When either is present we passed noQueue=1 above, so
+    // server did NOT queue. Send composite (attached text + transcript + images) as
+    // ONE WS prompt, tagged with voice-note metadata so it persists as a proper
+    // voice-note bubble on reload.
+    if(data.transcript && (vnImages.length || vnText)){
+      const combinedText = vnText
+        ? (vnText + "\n\n" + data.transcript)
+        : data.transcript;
       const clientId=genMsgId();
       // Tag the local bubble with this client_id so a server-side queue_state
       // (busy session → queueAppend with client_id) finds it via data-client-id
       // and just marks it queued instead of rendering a second voice-note bubble.
       msgEl.dataset.clientId=clientId;
-      outbox.push({id:clientId,text:data.transcript,images:vnImages,ts:Date.now(),sid:(session&&session.id)||localStorage.getItem("llmt_session")||null});saveOutbox();
+      outbox.push({id:clientId,text:combinedText,images:vnImages,ts:Date.now(),sid:(session&&session.id)||localStorage.getItem("llmt_session")||null});saveOutbox();
       if(ws&&ws.readyState===1){
-        ws.send(JSON.stringify({type:"prompt",client_id:clientId,text:data.transcript,images:vnImages,source:"voice-note",audioUrl:data.audioUrl}));
+        ws.send(JSON.stringify({type:"prompt",client_id:clientId,text:combinedText,images:vnImages,source:"voice-note",audioUrl:data.audioUrl}));
         setBusy(true);
       }
     }
     // Success: clear any retry handler left by a prior failed attempt.
     msgEl.onclick=null;
+    // Server has it — drop the IDB copy. Failed uploads keep the IDB entry so
+    // the next page-load sweep can retry it.
+    if(recId) vnDelete(recId);
     // Status — upload succeeded, server handles the rest
     if(data.transcript){
       setVnStatus("Queued","vn-s-done");
@@ -289,7 +459,7 @@ async function attemptVoiceUpload(blob, msgEl, vnImages, attempts){
       currentVoiceNonce=null;
       try{ if(ws&&ws.readyState===1) ws.close(); }catch{}
       setVnStatus("Reconnecting…","vn-s-active");
-      return attemptVoiceUpload(blob, msgEl, vnImages, attempts+1);
+      return attemptVoiceUpload(blob, msgEl, vnImages, attempts+1, recId, vnText);
     }
     console.error("[voice-note] upload failed:",err);
     const label = (err.staleNonce||err.ghostSession)
@@ -298,7 +468,7 @@ async function attemptVoiceUpload(blob, msgEl, vnImages, attempts){
     setVnStatus(label,"vn-s-error");
     // Tap to retry — reuse the SAME bubble (don't call sendVoiceNote which
     // would create a duplicate bubble via addVoiceNoteUser).
-    msgEl.onclick=()=>{msgEl.onclick=null;attemptVoiceUpload(blob, msgEl, vnImages, 0);};
+    msgEl.onclick=()=>{msgEl.onclick=null;attemptVoiceUpload(blob, msgEl, vnImages, 0, recId, vnText);};
   }
 }
 

@@ -131,6 +131,16 @@ const CLAUDE_TOP = [
   "claude-sonnet-4-6",
   "claude-haiku-4-5-20251001",
 ];
+// DeepSeek's V4 family (added 2026-08-23). Legacy names (deepseek-chat / -reasoner)
+// were deprecated 2026-07-24 — kept in the picker so David can pick them if they
+// still work at the API layer, but ranked below V4.
+const DEEPSEEK_TOP = [
+  "deepseek-v4-pro",
+  "deepseek-v4-flash",
+  "deepseek-v4-flash-vision-exp",
+  "deepseek-reasoner",
+  "deepseek-chat",
+];
 
 let _modelsCache = null;
 let _modelsCacheTs = 0;
@@ -165,6 +175,7 @@ async function fetchProviderModels() {
     claude: [],
     openai: [],
     google: [],
+    deepseek: [],
   };
 
   // Fetch Claude models from Anthropic API (same pattern as OpenAI/Google).
@@ -241,6 +252,27 @@ async function fetchProviderModels() {
         result.google = _rankSort(models, GOOGLE_TOP);
       }
     } catch (e) { console.warn("[models] Google fetch failed:", e.message); }
+  }
+
+  const dsKey = process.env.DEEPSEEK_API_KEY;
+  if (dsKey) {
+    try {
+      // DeepSeek /v1/models is OpenAI-compatible.
+      const r = await fetch("https://api.deepseek.com/v1/models", {
+        headers: { Authorization: "Bearer " + dsKey },
+      });
+      if (r.ok) {
+        const data = await r.json();
+        const models = (data.data || []).map(m => ({ id: m.id, name: m.id, created: m.created || 0 }));
+        result.deepseek = _rankSort(models, DEEPSEEK_TOP);
+      }
+    } catch (e) { console.warn("[models] DeepSeek fetch failed:", e.message); }
+  }
+  // Fallback: if no key or fetch failed, use the curated TOP list so the picker
+  // still shows DeepSeek models — David can pick one and see the "DEEPSEEK_API_KEY
+  // not set" error explaining what to configure.
+  if (!result.deepseek.length) {
+    result.deepseek = DEEPSEEK_TOP.map(id => ({ id, name: id, featured: true }));
   }
 
   _modelsCache = result;

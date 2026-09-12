@@ -42,6 +42,18 @@ const GOOGLE_MTOK = {
   "gemini-3-pro": null,
 };
 
+// DeepSeek pricing (added 2026-08-23). V4 family rates pending David's
+// confirmation from the account dashboard — null → unpriced (tokens still
+// tracked, cost recorded as unknown). Legacy V3.2 names kept for graceful
+// downgrade only; those were deprecated 2026-07-24.
+const DEEPSEEK_MTOK = {
+  "deepseek-v4-flash": null,
+  "deepseek-v4-pro": null,
+  "deepseek-v4-flash-vision-exp": null,
+  "deepseek-chat": null,
+  "deepseek-reasoner": null,
+};
+
 function _lookup(table, modelId) {
   const id = String(modelId || "").toLowerCase();
   let best = null;
@@ -57,7 +69,9 @@ function _lookup(table, modelId) {
 
 // → { cost_usd, unpriced } — cost_usd is null when the rate is unknown.
 function priceTokens(provider, modelId, tokensIn, tokensOut) {
-  const table = provider === "openai" ? OPENAI_MTOK : provider === "google" ? GOOGLE_MTOK : null;
+  const table = provider === "openai" ? OPENAI_MTOK :
+                provider === "google" ? GOOGLE_MTOK :
+                provider === "deepseek" ? DEEPSEEK_MTOK : null;
   const rate = table ? _lookup(table, modelId) : null;
   if (!rate) return { cost_usd: null, unpriced: true };
   const cost = (Number(tokensIn) || 0) * rate.in / 1e6 + (Number(tokensOut) || 0) * rate.out / 1e6;

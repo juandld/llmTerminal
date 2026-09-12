@@ -119,12 +119,12 @@ async function _fileLooseEnd(session, verdict, reason) {
     "",
     `Origin session: ${session.id} ("${session.title || "untitled"}", project ${session.project}, closed ${closedAt})`,
     "",
-    "Filed by sweepLooseEnds (llmTerminal session→queue bridge). Intended priority tier: standing (filed as normal until the tier exists).",
+    "Filed by sweepLooseEnds (llmTerminal session→queue bridge) at priority=standing — drained only when nothing at normal is queued/in_progress; survives token walls via BUDGET_PARK auto-resume.",
   ].join("\n");
   const r = await fetch(ORCH_BASE + "/queue/create", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ title, description, priority: "normal", project_id: session.project, origin_session: session.id }),
+    body: JSON.stringify({ title, description, priority: "standing", project_id: session.project, origin_session: session.id }),
   });
   if (!r.ok) throw new Error("queue/create " + r.status);
   const taskId = ((await r.json()).item || {}).task_id;

@@ -72,8 +72,11 @@ function record(component, model, costUsd, meta, extra) {
 
 // (spend_usd, call_count) within the trailing window. Never throws.
 // lane "autonomous" (the gate's view) excludes INTERACTIVE_COMPONENTS;
-// "interactive" counts only them; "all" counts everything.
-function _window(hours, lane = "autonomous") {
+// "interactive" counts only them; "all" counts everything. `billing`
+// optionally restricts rows to "api" (real billed dollars) or "plan"
+// (list-price equivalent included in the Claude Max subscription) — mirrors
+// usage_governor.py's _window(..., billing=...).
+function _window(hours, lane = "autonomous", billing = null) {
   const cutoff = Date.now() / 1000 - hours * 3600;
   let spend = 0, calls = 0;
   try {
@@ -86,6 +89,7 @@ function _window(hours, lane = "autonomous") {
       const isInteractive = INTERACTIVE_COMPONENTS.has(String(row.component || ""));
       if (lane === "autonomous" && isInteractive) continue;
       if (lane === "interactive" && !isInteractive) continue;
+      if (billing != null && String(row.billing || "") !== billing) continue;
       spend += Number(row.cost_usd) || 0;
       calls += 1;
     }
@@ -104,21 +108,30 @@ function _cooldownRemaining() {
 
 // Gate: call BEFORE any machine-initiated claude spawn. {ok, reason}.
 // Interactive paths must NOT call this — they record() only.
+//
+// Dollar caps draw from billing="api" rows only (2026-08-23, invariant 81's
+// documented js-side port): billing="plan" cost_usd is a list-price estimate
+// for a Claude Max call, marginal cost $0 — treating it as cash previously
+// false-parked llmterminal-auto/cheap (this lane) on days with heavy
+// queue-supervisor plan-billed activity while the account had zero real API
+// spend. Call-count and cooldown gates stay billing-agnostic — they bound
+// request RATE, not dollars. Mirrors usage_governor.py check() exactly.
 function check(component) {
   const remaining = _cooldownRemaining();
   if (remaining > 0) {
     return { ok: false, reason: "provider-limit cooldown active for " + Math.round(remaining / 60) + " more min (see limit_state.json)" };
   }
   const hour = _window(1);
-  if (hour.spend >= HOURLY_USD) {
-    return { ok: false, reason: "hourly spend cap: $" + hour.spend.toFixed(2) + " >= $" + HOURLY_USD.toFixed(2) + " (resumes as window rolls)" };
+  const hourApi = _window(1, "autonomous", "api");
+  if (hourApi.spend >= HOURLY_USD) {
+    return { ok: false, reason: "hourly API spend cap: $" + hourApi.spend.toFixed(2) + " >= $" + HOURLY_USD.toFixed(2) + " (resumes as window rolls)" };
   }
   if (hour.calls >= CALLS_PER_HOUR) {
     return { ok: false, reason: "hourly call cap: " + hour.calls + " >= " + CALLS_PER_HOUR };
   }
-  const day = _window(24);
-  if (day.spend >= DAILY_USD) {
-    return { ok: false, reason: "daily spend cap: $" + day.spend.toFixed(2) + " >= $" + DAILY_USD.toFixed(2) };
+  const dayApi = _window(24, "autonomous", "api");
+  if (dayApi.spend >= DAILY_USD) {
+    return { ok: false, reason: "daily API spend cap: $" + dayApi.spend.toFixed(2) + " >= $" + DAILY_USD.toFixed(2) };
   }
   // Claude-pace smoothing (pace.js, 2026-07-19): the auto lane ALSO defers
   // while the box burns Claude's own session/weekly limits faster than the
@@ -140,12 +153,17 @@ function check(component) {
 function status() {
   const hour = _window(1);
   const day = _window(24);
+  const hourApi = _window(1, "autonomous", "api");
+  const dayApi = _window(24, "autonomous", "api");
   const iHour = _window(1, "interactive");
   const iDay = _window(24, "interactive");
   return {
-    // hour/day = the AUTONOMOUS lane (what check() gates on)
-    hour: { spend_usd: Math.round(hour.spend * 100) / 100, calls: hour.calls, caps: { usd: HOURLY_USD, calls: CALLS_PER_HOUR } },
-    day: { spend_usd: Math.round(day.spend * 100) / 100, calls: day.calls, caps: { usd: DAILY_USD } },
+    // hour/day = the AUTONOMOUS lane. spend_usd is the estimated plan-equivalent
+    // total (visibility only); api_spend_usd is what check() actually gates on.
+    hour: { spend_usd: Math.round(hour.spend * 100) / 100, calls: hour.calls,
+            api_spend_usd: Math.round(hourApi.spend * 100) / 100, caps: { usd: HOURLY_USD, calls: CALLS_PER_HOUR } },
+    day: { spend_usd: Math.round(day.spend * 100) / 100, calls: day.calls,
+           api_spend_usd: Math.round(dayApi.spend * 100) / 100, caps: { usd: DAILY_USD } },
     // visibility-only lane; never gates (see INTERACTIVE_COMPONENTS)
     interactive: {
       hour: { spend_usd: Math.round(iHour.spend * 100) / 100, calls: iHour.calls },

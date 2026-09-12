@@ -3,6 +3,7 @@
 // abort wrapper. Extracted from server.js (refactor 2026-06-10, phase 2).
 const fs = require("fs");
 const path = require("path");
+const { execFileSync } = require("child_process");
 const { PROJECTS_DIR } = require("../paths");
 const { loadMessages } = require("../store");
 
@@ -12,7 +13,33 @@ const { loadMessages } = require("../store");
 // "save the file + send a new message" loop — no service restart needed.
 const CHAT_SYSTEM_PROMPT_PATH = path.resolve(__dirname, "../../config/chat-system-prompt.md");
 let _promptCache = { key: "", body: "" };
+
+// Live "where and when it is for David" block, sourced from orchestratorHero's
+// context tool (GET /api/context/now). UTC alone misleads once David hops tz;
+// this prepends a one-line local-time-and-place summary so every new chat starts
+// grounded. 60s cache + 1s timeout + silent fallback — the chat never blocks or
+// fails on this being unavailable.
+const LOCATION_ENDPOINT = "http://127.0.0.1:8000/api/context/now";
+const LOCATION_TTL_MS = 60_000;
+let _locationCache = { fetchedAt: 0, block: "" };
+function loadLocationContextBlock() {
+  const now = Date.now();
+  if (now - _locationCache.fetchedAt < LOCATION_TTL_MS) return _locationCache.block;
+  let block = _locationCache.block; // preserve last-known on failure
+  try {
+    const raw = execFileSync("curl", ["-sS", "--max-time", "1", LOCATION_ENDPOINT], { encoding: "utf8" });
+    const payload = JSON.parse(raw);
+    const summary = String((payload && payload.summary) || "").trim();
+    if (summary) block = "# whereAndWhen\n" + summary;
+  } catch {
+    // Backend down or malformed — keep whatever we had cached.
+  }
+  _locationCache = { fetchedAt: now, block };
+  return block;
+}
+
 function loadChatSystemPrompt() {
+  let body = "";
   try {
     const st = fs.statSync(CHAT_SYSTEM_PROMPT_PATH);
     // mtime+size key — guards against same-second writes that don't tick mtimeMs.
@@ -20,23 +47,29 @@ function loadChatSystemPrompt() {
     if (key !== _promptCache.key) {
       _promptCache = { key, body: fs.readFileSync(CHAT_SYSTEM_PROMPT_PATH, "utf-8").trim() };
     }
-    return _promptCache.body;
+    body = _promptCache.body;
   } catch (e) {
     console.warn("[chat-system-prompt] failed to read", CHAT_SYSTEM_PROMPT_PATH, "-", e.message);
-    return "";
   }
+  const location = loadLocationContextBlock();
+  if (!location) return body;
+  return body ? location + "\n\n" + body : location;
 }
 
 const PROVIDER_MAP = {
   "": "claude", opus: "claude", sonnet: "claude", haiku: "claude",
   "gpt-4.1": "openai", "gpt-4.1-mini": "openai", "gpt-4.1-nano": "openai", "o3": "openai", "o4-mini": "openai",
   "gemini-2.5-pro": "google", "gemini-2.5-flash": "google",
+  "deepseek-v4-flash": "deepseek", "deepseek-v4-pro": "deepseek",
+  "deepseek-v4-flash-vision-exp": "deepseek",
+  "deepseek-chat": "deepseek", "deepseek-reasoner": "deepseek",
 };
 function getProvider(model) {
   if (!model) return "claude";
   if (PROVIDER_MAP[model]) return PROVIDER_MAP[model];
   if (/^(gpt-|o\d)/.test(model)) return "openai";
   if (/^gemini-/.test(model)) return "google";
+  if (/^deepseek-/.test(model)) return "deepseek";
   if (/^claude-/.test(model)) return "claude";
   return "claude";
 }

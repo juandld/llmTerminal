@@ -15,6 +15,7 @@ const { autoDetectBashFiles, autoCreatePreview } = require("./tools");
 const { postSecretaryItem } = require("./attention");
 const runReg = require("./run-registry");
 const experiments = require("./experiments");
+const corrections = require("./corrections");
 
 // ── End-of-run observer (Tier 2 "supervisor pattern") — DISABLED ──
 // Disabled 2026-05-28 (snapshotted in commit 9285194): it enqueued duplicate
@@ -870,4 +871,126 @@ ${lines}`;
 }
 
 // spawnObserver deliberately not exported — disabled 2026-05-28, see its note.
-module.exports = { spawnDecisionExtractor, spawnContractCheck, spawnLoopCheck, reconcileFileAttribution };
+
+// ── Correction extractor (H9 correction reflex — SENSE half) ─────────────
+// Fires after every run, looks at the LAST user message and asks a cheap
+// model one question: was that David redirecting/negating/stopping/repeating
+// because the agent went the wrong way? If yes → one row in the corrections
+// ledger with a class + the rule David was actually stating ("user_meant").
+// corrections.buildPromptAdd feeds those rules back into the next turn's
+// system prompt. The profanity regex in orchestratorHero's chat_quality_audit
+// catches only the loud ones; this catches the quiet "no, the one in this
+// chat" redirects that never swear. opts.userIdx = backfill a specific
+// historical user message instead of the latest.
+const _correctionExtractorLastRun = {};
+const CORRECTION_EXTRACTOR_COOLDOWN_MS = 8000;
+
+function _renderTurn(msgs, capChars) {
+  const parts = [];
+  for (const m of msgs) {
+    if (m.role === "assistant") {
+      const t = String(m.text || "").trim();
+      if (t && !m.recovered) parts.push("ASSISTANT: " + t.slice(0, 500));
+    } else if (m.role === "tool_activity") {
+      parts.push("(" + (m.tool_name || "tool") + ") " + String(m.summary || "").slice(0, 120));
+    } else if (m.role === "interrupted") {
+      parts.push("[David hit STOP here]");
+    } else if (m.role === "email_draft") {
+      parts.push("[email_draft card to " + (m.to || "?") + (m.sent ? " — SENT]" : " — unsent]"));
+    } else if (m.role === "email_reply") {
+      parts.push("[email_reply card from " + (m.fromEmail || "?") + "]");
+    }
+  }
+  const out = parts.join("\n");
+  return out.length > capChars ? out.slice(0, capChars) + "\n…(truncated)" : out;
+}
+
+function spawnCorrectionExtractor(sessionId, projectName, opts = {}) {
+  try {
+    if (!sessionId || !db) return;
+    const now = Date.now();
+    const userIdxOverride = Number.isInteger(opts.userIdx) ? opts.userIdx : null;
+    if (userIdxOverride === null) {
+      if (_correctionExtractorLastRun[sessionId] && (now - _correctionExtractorLastRun[sessionId]) < CORRECTION_EXTRACTOR_COOLDOWN_MS) return;
+      _correctionExtractorLastRun[sessionId] = now;
+    }
+    const sid8 = String(sessionId).slice(0, 8);
+    const all = loadMessages(sessionId);
+    const userIdxs = [];
+    all.forEach((m, i) => { if (m.role === "user") userIdxs.push(i); });
+    if (userIdxs.length < 2) return; // the first message of a chat cannot be a correction
+    const uIdx = userIdxOverride !== null ? userIdxOverride : userIdxs[userIdxs.length - 1];
+    const pos = userIdxs.indexOf(uIdx);
+    if (pos < 1) return;
+    const u = all[uIdx];
+    if (!u || u.source === "wake") return;
+    const uText = String(u.text || "").trim();
+    if (!uText) return;
+    if (corrections.hasCorrectionFor(sessionId, u.ts)) return;
+
+    const prevUIdx = userIdxs[pos - 1];
+    const nextUIdx = pos + 1 < userIdxs.length ? userIdxs[pos + 1] : all.length;
+    const prevTurn = all.slice(prevUIdx + 1, uIdx);
+    const thisTurn = all.slice(uIdx + 1, nextUIdx);
+    const wasInterrupted = prevTurn.some(m => m.role === "interrupted") || (thisTurn[0] && thisTurn[0].role === "interrupted");
+    const prevUserText = String(all[prevUIdx].text || "").trim().slice(0, 400);
+    const prevBlock = _renderTurn(prevTurn, 1800) || "(no agent activity recorded before this message)";
+    const thisBlock = _renderTurn(thisTurn, 700);
+
+    const prompt = `You are a supervisor reviewing ONE user message in a chat between David (the operator) and a worker agent. Decide whether that message is a CORRECTION of the agent's previous behavior, and if so classify it.
+
+A correction is David redirecting, negating, stopping, or repeating an instruction because the agent went the wrong way, guessed, asked something it should have known, ignored context already in the chat, or a harness/UI feature misbehaved. NOT a correction: a new task or a new phase of work (even if it changes project or topic), a normal follow-up, an answer to the agent's question, supplying requested info, approval, thanks. A correction requires that the agent's PREVIOUS turn actually did something wrong or unwanted; if the previous turn was fine and David is simply moving on, is_correction is false.
+
+Classes (pick ONE):
+- wrong-referent — David pointed at something ("this card", "the one here", "that button") and the agent resolved it to the wrong object or surface.
+- wrong-project — the request belonged to a different project/codebase than the one the agent searched or edited.
+- guessed-fact — the agent asserted or cited something (URL, number, name, path, status) without verifying, and it was wrong.
+- ignored-context — the needed information was already in the chat (a card, an earlier message, data it had just retrieved) and the agent re-fetched it or asked for it.
+- unnecessary-ask — the agent asked permission/clarification for something in-scope, reversible and obvious instead of doing it.
+- wrong-intent — the agent built or did the wrong thing relative to the intent David had stated (optimized the wrong axis, hacked around instead of the real fix).
+- didnt-stop — David stopped/interrupted and the agent continued or resumed.
+- harness-bug — the complaint is about the tool/UI itself (card disappeared, button missing, stalled run), not the agent's judgment.
+- repeat — David had to say the same thing again because the agent did not act on it the first time.
+- other
+
+Severity: high if David interrupted, used profanity/caps, or is repeating himself; medium for a clear redirect; low for a mild nudge.
+
+Output JSON ONLY:
+{"is_correction": true|false, "class": "<one class>", "severity": "low|medium|high", "user_said": "<verbatim excerpt of the correction, <=200 chars>", "agent_did": "<what the agent had just done that triggered it, <=200 chars>", "user_meant": "<the rule, phrased so a future agent in this project can apply it directly, <=220 chars>", "missing_context": "<what the agent lacked or should have assumed, <=160 chars>", "guard_candidate": "<a mechanical check that would have prevented it, or null>", "recovered": true|false}
+
+Rules: if is_correction is false the other fields may be null. user_meant must be a standing rule ("When David says X he means Y", "Verify Z before citing it"), never a narrative. recovered=true only if the agent's response acknowledged the correction AND acted on it.
+
+=== David's PREVIOUS message ===
+${prevUserText || "(none)"}
+
+=== What the agent did after it (assistant text + tools, oldest first) ===
+${prevBlock}
+${wasInterrupted ? "\n(David hit STOP / interrupted the agent during this.)\n" : ""}
+=== The message under review (David) ===
+${uText.slice(0, 900)}
+
+=== The agent's response to it ===
+${thisBlock || "(no response yet)"}`;
+
+    console.log("[correction-extractor] firing for", sid8, "userIdx=" + uIdx + (userIdxOverride !== null ? " (backfill)" : ""));
+    runCheapClaude(prompt, "correction-extractor", async (parsed) => {
+      if (!parsed || typeof parsed !== "object") return;
+      if (!parsed.is_correction) { console.log("[correction-extractor]", sid8, "userIdx=" + uIdx, "→ not a correction"); return; }
+      const cls = corrections.CLASSES.includes(parsed.class) ? parsed.class : "other";
+      const sev = ["low", "medium", "high"].includes(parsed.severity) ? parsed.severity : "medium";
+      const id = corrections.insertCorrection({
+        session_id: sessionId, project: projectName || null, ts: u.ts || now, user_ts: u.ts || now,
+        class: cls, severity: sev,
+        user_said: corrections.clip(parsed.user_said || uText, 300),
+        agent_did: corrections.clip(parsed.agent_did, 300),
+        user_meant: corrections.clip(parsed.user_meant, 300),
+        missing_context: corrections.clip(parsed.missing_context, 240),
+        guard_candidate: corrections.clip(parsed.guard_candidate, 240),
+        recovered: !!parsed.recovered, interrupted: wasInterrupted,
+      });
+      console.log("[correction-extractor]", sid8, "→ #" + id, cls, sev, "—", String(parsed.user_meant || "").slice(0, 80));
+    });
+  } catch (e) { console.error("[correction-extractor] failed:", e.message); }
+}
+
+module.exports = { spawnDecisionExtractor, spawnContractCheck, spawnLoopCheck, spawnCorrectionExtractor, reconcileFileAttribution };

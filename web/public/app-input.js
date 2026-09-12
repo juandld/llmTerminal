@@ -76,6 +76,7 @@ function send(){
     // which would race the flush and double-send the prompt)
     connect(session?.project||_defaultProject(),session?.id);
     addUser(text,previews,clientId); _clearInput();
+    setUserMsgState(clientId,"queued");
     setBusy(true);
     return;
   }
@@ -83,6 +84,7 @@ function send(){
   outbox.push({id:clientId,text,images,ts:Date.now(),sid:_sid});saveOutbox();
   ws.send(JSON.stringify({type:"prompt",client_id:clientId,text:prompt,images}));
   addUser(text,previews,clientId);
+  setUserMsgState(clientId,"sending");
   // Tag live-rendered message so history replay doesn't duplicate
   const liveTs=Date.now();
   const last=chat.lastElementChild;

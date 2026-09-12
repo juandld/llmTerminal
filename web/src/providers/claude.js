@@ -12,13 +12,15 @@ const { sessionPermissions, ensurePermissionsLoaded } = require("../permissions"
 const { getProvider, loadChatSystemPrompt } = require("./context");
 const { autoDetectBashFiles, autoCreatePreview, summarizeToolUse } = require("../tools");
 const { logFileAttribution } = require("../attribution");
-const { spawnDecisionExtractor, spawnContractCheck, spawnLoopCheck, reconcileFileAttribution } = require("../supervisors");
+const { spawnDecisionExtractor, spawnContractCheck, spawnLoopCheck, spawnCorrectionExtractor, reconcileFileAttribution } = require("../supervisors");
+const corrections = require("../corrections");
 const { generateSessionTitle } = require("../session-title");
 const { _bwrapWrap } = require("../bwrap");
 const { queuePopNext, broadcastQueueState } = require("../queue");
 const throttle = require("../throttle");
 const runReg = require("../run-registry");
 const { autoloopPrompt } = require("../autoloop");
+const subtaskTracker = require("../subtask-tracker");
 const governor = require("../governor");
 const runLedger = require("../run-ledger");
 const attention = require("../attention");
@@ -145,7 +147,8 @@ function fireQueueHeadless(sessionId) {
                 const summary = summarizeToolUse(block.name, block.input);
                 saveMessage(sessionId, { role: "tool_activity", tool_name: block.name, summary, ts: Date.now() });
               }
-              broadcastToSession(sessionId, { type: "tool_use", name: block.name, input: block.input, session_id: sessionId });
+              subtaskTracker.registerStart(sessionId, block.id, block.name, session.project, session.claudeSessionId, broadcastToSession);
+              broadcastToSession(sessionId, { type: "tool_use", id: block.id, name: block.name, input: block.input, session_id: sessionId });
             }
           }
         }
@@ -232,6 +235,7 @@ function fireQueueHeadless(sessionId) {
         setTimeout(() => { try { spawnDecisionExtractor(sessionId, session.project); } catch {} }, 800);
         setTimeout(() => { try { spawnContractCheck(sessionId, session.project); } catch {} }, 1100);
         setTimeout(() => { try { spawnLoopCheck(sessionId, session.project); } catch {} }, 1400);
+        setTimeout(() => { try { spawnCorrectionExtractor(sessionId, session.project); } catch {} }, 1700);
       }
     },
     (code, stderr) => {
@@ -485,7 +489,7 @@ function runClaude(opts, onData, onDone) {
   // here, then appended (claude already has its own harness prompt). One Claude-only
   // note: AskUserQuestion is disabled via --disallowedTools and the chat prompt
   // tells the model to use mcp__llmterminal__llmt_ask instead.
-  const SYSTEM_PROMPT_ADD = loadChatSystemPrompt() + "\n\nDo NOT use the built-in AskUserQuestion tool — it is disabled in this harness and returns a misleading error." + _buildVariantPromptAdd(sessionId);
+  const SYSTEM_PROMPT_ADD = loadChatSystemPrompt() + "\n\nDo NOT use the built-in AskUserQuestion tool — it is disabled in this harness and returns a misleading error." + _buildVariantPromptAdd(sessionId) + corrections.buildPromptAdd(sessionId, project);
   // Phase C: deny the hosted claude.ai Google MCPs project-wide. They
   // bypass the canonical data.* layer + use a different identity, leading
   // the agent to flail when answers don't match what data.* would give.

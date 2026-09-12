@@ -881,6 +881,8 @@ app.post("/api/sessions/:id/reactivate", express.json(), (req, res) => {
       text: `📬 Reply received from ${from}` + (subject ? ` — *${subject}*` : "") + (snippet ? `\n\n> ${snippet}` : ""),
       body: emailBody || null,
       fromEmail: from, subject, messageId: req.body?.messageId || null,
+      threadId: s.gmailThreadId || null,
+      fromAccount: s.gmailAccount || null,
     });
   } catch (e) { console.error("[reactivate] saveMessage failed:", e.message); }
   res.json({ ok: true });
@@ -895,6 +897,8 @@ app.post("/api/sessions/:id/reactivate", express.json(), (req, res) => {
 
 // Decisions-framework API routes (see src/routes/decisions.js).
 require("./src/routes/decisions")(app);
+// Correction ledger API (H9 correction reflex, see src/routes/corrections.js).
+require("./src/routes/corrections")(app);
 const TTS_CACHE_DIR = path.join(DATA_DIR, "tts-cache");
 fs.mkdirSync(TTS_CACHE_DIR, { recursive: true });
 const TTS_MODEL = "tts-1";
@@ -1471,14 +1475,130 @@ require("./src/auth")(app);
 // safety checks; project just picks the From: identity.
 const { defaultFromAccountForProject: _defaultFromAccountForProject } = require("./src/email-draft");
 
-app.post("/api/email-draft/send", express.json(), (req, res) => {
-  const { sessionId, to, cc, subject, body, fromAccount, threadId, attachments, force, draftTs } = req.body || {};
+// A message reference is EITHER a Gmail API id (hex-ish token) OR an RFC 2822
+// Message-ID ('<...@mail.gmail.com>'). Agents that read a thread via the Gmail
+// API naturally pick up the latter; the send script resolves it via
+// 'rfc822msgid:' search. Previously the RFC form was silently dropped by the
+// hex-only regex and the send fell back to "newest inbound in thread" -- right
+// by luck on 2026-09-04, wrong the day Birta sends two messages in a row.
+const GMAIL_ID_RE = /^[A-Za-z0-9_-]+$/;
+const RFC_MSGID_RE = /^<?[^\s<>@]+@[^\s<>]+>?$/;
+function _validMessageRef(v) {
+  if (!v || typeof v !== "string") return "";
+  const t = v.trim();
+  if (t.length > 998) return "";
+  return (GMAIL_ID_RE.test(t) || RFC_MSGID_RE.test(t)) ? t : "";
+}
+
+// Operator timezone for Gmail-identical quoted timestamps ("On Thu, Sep 3,
+// 2026 at 11:07 PM ..." is rendered in the REPLIER's local tz by Gmail).
+// Source of truth: orchestrator location context (/api/context/now). Cached
+// 5 min; empty string on any failure (send script then keeps the header tz).
+let _senderTzCache = { tz: "", at: 0 };
+async function getSenderTz() {
+  if (Date.now() - _senderTzCache.at < 5 * 60 * 1000) return _senderTzCache.tz;
+  let tz = "";
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 2000);
+    const r = await fetch("http://127.0.0.1:8000/api/context/now", { signal: ctrl.signal });
+    clearTimeout(t);
+    if (r.ok) {
+      const j = await r.json();
+      const cand = String((j && j.location && j.location.timezone) || "").trim();
+      if (/^[A-Za-z_]+(?:\/[A-Za-z_+-]+){0,2}$/.test(cand)) tz = cand;
+    }
+  } catch (e) { /* fall through */ }
+  _senderTzCache = { tz, at: Date.now() };
+  return tz;
+}
+
+// ---- /api/email-draft/quote-preview ----
+// Read-only. Returns the exact quoted/forwarded block the send path will
+// append (plus canonical subject + derived recipients) so the draft card can
+// show David what Gmail will show. Spawns camoHero/scripts/preview_quote.py
+// WITHOUT the send token -- that script has no send capability at all.
+app.get("/api/email-draft/quote-preview", async (req, res) => {
+  const q = req.query || {};
+  const sessionId = String(q.sessionId || "");
+  const sessions = loadSessions();
+  const session = sessions.find(s => s.id === sessionId);
+  if (!session) return res.status(404).json({ ok: false, error: "session not found" });
+  const projectDefault = _defaultFromAccountForProject(session.project);
+  const fromAccount = String(q.fromAccount || "");
+  const account = (fromAccount && /^[a-z0-9_-]+$/.test(fromAccount)) ? fromAccount : projectDefault;
+  const inReplyTo = _validMessageRef(String(q.inReplyToMessageId || ""));
+  const fwd = _validMessageRef(String(q.forwardMessageId || ""));
+  const threadId = (q.threadId && GMAIL_ID_RE.test(String(q.threadId))) ? String(q.threadId) : "";
+  const replyMode = (q.replyMode === "reply_all" || q.replyMode === "reply") ? q.replyMode : "";
+  if (!inReplyTo && !fwd && !threadId) {
+    return res.json({ ok: false, error: "nothing to preview" });
+  }
+  const args = ["/home/claude-user/projects/camoHero/scripts/preview_quote.py", "--from", account];
+  if (fwd) { args.push("--forward-message-id", fwd); }
+  else {
+    if (inReplyTo) args.push("--in-reply-to-message-id", inReplyTo);
+    if (threadId) args.push("--thread-id", threadId);
+    if (replyMode) args.push("--reply-mode", replyMode);
+  }
+  const tz = await getSenderTz();
+  if (tz) args.push("--sender-tz", tz);
+  const proc = spawn("/usr/bin/python3", args, {
+    cwd: "/home/claude-user/projects/camoHero",
+    uid: 1000, gid: 1000,
+    env: { HOME: "/home/claude-user", PATH: process.env.PATH, LANG: "en_US.UTF-8", PYTHONDONTWRITEBYTECODE: "1" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "", stderr = "";
+  const killer = setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 25000);
+  proc.stdout.on("data", c => { stdout += c.toString(); });
+  proc.stderr.on("data", c => { stderr += c.toString(); });
+  proc.on("close", (code) => {
+    clearTimeout(killer);
+    const line = stdout.trim().split("\n").filter(Boolean).pop() || "";
+    try {
+      const j = JSON.parse(line);
+      return res.json(j);
+    } catch (e) {
+      return res.json({ ok: false, error: (stderr.trim().split("\n").pop() || `preview failed (exit ${code})`) });
+    }
+  });
+  proc.on("error", (e) => res.status(500).json({ ok: false, error: "spawn failed: " + e.message }));
+});
+
+app.post("/api/email-draft/send", express.json(), async (req, res) => {
+  const { sessionId, to, cc, subject, body, fromAccount, threadId, replyMode, inReplyToMessageId, forwardMode, forwardMessageId, attachments, force, draftTs } = req.body || {};
   if (!sessionId || !to || !subject || !body) {
     return res.status(400).json({ ok: false, error: "missing fields (sessionId, to, subject, body required)" });
   }
   const sessions = loadSessions();
   const session = sessions.find(s => s.id === sessionId);
   if (!session) return res.status(404).json({ ok: false, error: "session not found" });
+
+  // Idempotency: if the client already sent this draftTs successfully once, don't
+  // fire the send script again. Previous behaviour was to double-send when the
+  // client retried after a flaky network timeout. draftTs is stable per action
+  // card, so it's a natural idempotency key. Rows without draftTs bypass this
+  // (legacy) and take the send path unconditionally.
+  if (draftTs) {
+    try {
+      const existing = loadMessages(sessionId).find(m =>
+        m && m.role === "email_draft" && m.ts === draftTs && m.sent === true
+      );
+      if (existing) {
+        console.log(`[email-draft/send] dedup: draftTs=${draftTs} already sent as ${existing.message_id || "?"}`);
+        return res.json({
+          ok: true, cached: true,
+          message_id: existing.message_id || null,
+          thread_id: existing.thread_id || null,
+          account: existing.account || null,
+          output: "(this draft was already sent; returning cached result rather than re-sending)",
+        });
+      }
+    } catch (e) {
+      console.error("[email-draft/send] dedup check failed (non-fatal, proceeding to send):", e.message);
+    }
+  }
   const projectDefault = _defaultFromAccountForProject(session.project);
   const account = (fromAccount && /^[a-z0-9_-]+$/.test(fromAccount)) ? fromAccount : projectDefault;
   const args = [
@@ -1490,6 +1610,37 @@ app.post("/api/email-draft/send", express.json(), (req, res) => {
   ];
   if (cc) { args.push("--cc", cc); }
   if (threadId && /^[A-Za-z0-9_-]+$/.test(threadId)) { args.push("--thread-id", threadId); }
+  // Reply-mode + explicit in-reply-to id: forwarded to the send script so it can
+  // fetch the referenced message, set In-Reply-To/References headers, and append
+  // the Gmail-Web-identical "On DATE, FROM wrote:\n> ..." quoted block. Silently
+  // ignored (falls back to a bare threaded reply) if the caller left them blank.
+  if (replyMode && (replyMode === "reply" || replyMode === "reply_all")) {
+    args.push("--reply-mode", replyMode);
+  }
+  {
+    const ref = _validMessageRef(inReplyToMessageId);
+    if (ref) args.push("--in-reply-to-message-id", ref);
+    else if (inReplyToMessageId) console.warn("[email-draft/send] dropping malformed inReplyToMessageId:", String(inReplyToMessageId).slice(0, 120));
+  }
+  // Forward-mode + message id: forwarded to the send script so it can fetch
+  // the source message (body + attachments) and append Gmail's exact
+  // "---------- Forwarded message ---------" block plus re-attach every file.
+  // A forward starts a NEW thread — the send script refuses --forward-message-id
+  // combined with any reply flag (thread-id / in-reply-to / reply-mode), so we
+  // don't have to gate it here.
+  if (forwardMode && forwardMode === "forward") {
+    args.push("--forward-mode", "forward");
+  }
+  {
+    const ref = _validMessageRef(forwardMessageId);
+    if (ref) args.push("--forward-message-id", ref);
+    else if (forwardMessageId) console.warn("[email-draft/send] dropping malformed forwardMessageId:", String(forwardMessageId).slice(0, 120));
+  }
+  // Operator tz so quoted timestamps match what Gmail-Web would render.
+  {
+    const tz = await getSenderTz();
+    if (tz) args.push("--sender-tz", tz);
+  }
   // Attachments: identity-aware allowlist. crankwheel-account sends can attach
   // from crankHero/; camofiles-account sends from camoHero/. The session's own
   // project dir also always qualifies. Fixes the "PDF at crankHero/... from an
@@ -1589,6 +1740,37 @@ app.post("/api/email-draft/send", express.json(), (req, res) => {
   proc.on("error", (e) => {
     res.status(500).json({ ok: false, error: "spawn failed: " + e.message });
   });
+});
+
+// ---- /api/email-draft/status ----
+// Client uses this after a fetch timeout on /send to figure out whether the
+// send actually completed. Reads the message row identified by (sessionId,
+// draftTs); a successful send patches the row with sent=true, so this is the
+// authoritative "did it or didn't it?" answer without re-hitting Gmail.
+app.get("/api/email-draft/status", (req, res) => {
+  const sessionId = String(req.query.sessionId || "");
+  const draftTsRaw = String(req.query.draftTs || "");
+  const draftTs = Number(draftTsRaw);
+  if (!sessionId || !Number.isFinite(draftTs) || draftTs <= 0) {
+    return res.status(400).json({ ok: false, error: "sessionId + numeric draftTs required" });
+  }
+  try {
+    const row = loadMessages(sessionId).find(m =>
+      m && m.role === "email_draft" && m.ts === draftTs
+    );
+    if (!row) return res.status(404).json({ ok: false, error: "draft row not found" });
+    return res.json({
+      ok: true,
+      sent: row.sent === true,
+      sent_ts: row.sent_ts || null,
+      message_id: row.message_id || null,
+      account: row.account || null,
+      to: row.to, cc: row.cc || "", subject: row.subject,
+    });
+  } catch (e) {
+    console.error("[email-draft/status] failed:", e.message);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 // ---- /api/deferred-restart ----

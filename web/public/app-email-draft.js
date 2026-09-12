@@ -36,6 +36,9 @@ function addEmailDraft(msg){
   const initialBody = msg.body || "";
   const threadId = msg.thread_id || "";
   const replyMode = msg.reply_mode || "";
+  const inReplyToMessageId = msg.in_reply_to_message_id || "";
+  const forwardMode = msg.forward_mode || "";
+  const forwardMessageId = msg.forward_message_id || "";
   const threadParticipants = Array.isArray(msg.thread_participants) ? msg.thread_participants : [];
   const attachments = Array.isArray(msg.attachments) ? msg.attachments : [];
   // ts of the saved draft row — passed back on Send so the server can patch
@@ -58,7 +61,14 @@ function addEmailDraft(msg){
     const when = sentAt ? new Date(sentAt).toLocaleString() : "";
     label.textContent = "✓ Sent" + (when ? " — " + when : "");
   } else {
-    let base = threadId ? "↩ Reply (threads into existing conversation)" : "✉ New email";
+    let base;
+    if (forwardMode === "forward" || forwardMessageId) {
+      base = "→ Forward (new thread; source attachments re-attached)";
+    } else if (threadId) {
+      base = "↩ Reply (threads into existing conversation)";
+    } else {
+      base = "✉ New email";
+    }
     if (replyMode) base += "  ·  mode: " + replyMode;
     label.textContent = base;
   }
@@ -186,6 +196,99 @@ function addEmailDraft(msg){
     bodyEl.style.height = Math.min(bodyEl.scrollHeight + 4, cap) + "px";
   };
   bodyEl.addEventListener("input", autosizeBody);
+
+  // Quoted-history preview. The send path appends Gmail's REAL "On DATE, X
+  // wrote:" block (or the "---------- Forwarded message" block) fetched from
+  // the referenced message -- the agent's body must contain ONLY its own
+  // words. This block shows David exactly what Gmail will append, read-only,
+  // so the card == the email. Also aligns the subject to the thread's
+  // canonical subject (Gmail locks a reply's subject the same way).
+  let quoteEl = null;
+  const wantsQuotePreview = !wasSent && (inReplyToMessageId || threadId || forwardMessageId);
+  if (wantsQuotePreview) {
+    quoteEl = mk("div", "draft-quote-preview loading collapsed");
+    const qLabel = mk("div", "draft-quote-label");
+    const labelText = forwardMessageId ? "Forwarded message (appended by Gmail, not editable)"
+                                       : "Quoted history (appended by Gmail, not editable)";
+    qLabel.textContent = labelText;
+    quoteEl.appendChild(qLabel);
+    const qBody = mk("div", "draft-quote-body");
+    qBody.textContent = "Loading…";
+    quoteEl.appendChild(qBody);
+    const fromAcct = msg.default_from_account || msg.account || "";
+    const params = new URLSearchParams({
+      sessionId: (session && session.id) || "",
+      fromAccount: fromAcct,
+      inReplyToMessageId, threadId, forwardMessageId, replyMode,
+    });
+    fetch(apiUrl("/api/email-draft/quote-preview?" + params.toString()))
+      .then(r => r.json())
+      .then(p => {
+        quoteEl.classList.remove("loading");
+        if (!p || !p.ok) {
+          quoteEl.classList.remove("collapsed");
+          quoteEl.classList.add("failed");
+          qBody.textContent = "Could not load the quoted history (" + ((p && p.error) || "unknown error") + "). The send path will still append it.";
+          return;
+        }
+        const full = String(p.quoted_plain || "").replace(/^\n+/, "");
+        const lines = full.split("\n");
+        // Collapsed by default: David just needs to know it will be appended,
+        // not read it inline every time. Tap the label to expand.
+        let expanded = false;
+        const render = () => {
+          if (expanded) {
+            qBody.textContent = full;
+            quoteEl.classList.remove("collapsed");
+          } else {
+            qBody.textContent = "";
+            quoteEl.classList.add("collapsed");
+          }
+        };
+        render();
+        const tgl = mk("button", "draft-mini-btn draft-quote-toggle");
+        tgl.type = "button";
+        const collapsedLabel = "▸ Show (" + lines.length + " line" + (lines.length === 1 ? "" : "s") + ")";
+        const expandedLabel = "▾ Hide";
+        tgl.textContent = collapsedLabel;
+        tgl.onclick = (e) => {
+          e.preventDefault();
+          expanded = !expanded;
+          render();
+          tgl.textContent = expanded ? expandedLabel : collapsedLabel;
+          if (!expanded && typeof scrollToBottomIfSticky === "function") scrollToBottomIfSticky();
+        };
+        // Put the toggle on the same row as the label for compactness.
+        qLabel.appendChild(tgl);
+        if (typeof scrollToBottomIfSticky === "function") scrollToBottomIfSticky();
+        if (Array.isArray(p.attachments) && p.attachments.length) {
+          const al = mk("div", "draft-quote-note");
+          al.textContent = "📎 Re-attached from the original: " + p.attachments.map(a => a.filename).join(", ");
+          quoteEl.appendChild(al);
+        }
+        // Subject: the send path uses the thread's canonical subject. Reflect it
+        // on the card so what David reads is what goes out.
+        if (p.subject && subjectInput.value.trim() !== p.subject) {
+          const before = subjectInput.value;
+          subjectInput.value = p.subject;
+          const sn = mk("div", "draft-quote-note");
+          sn.textContent = "Subject aligned to the thread: " + p.subject + (before.trim() ? "  (was: " + before + ")" : "");
+          quoteEl.appendChild(sn);
+        }
+        // Reply with no explicit recipient: show what the send path derives.
+        if (!toInput.value.trim() && Array.isArray(p.derived_to) && p.derived_to.length) {
+          toInput.value = p.derived_to.join(", ");
+          if (!ccInput.value.trim() && Array.isArray(p.derived_cc) && p.derived_cc.length) ccInput.value = p.derived_cc.join(", ");
+        }
+      })
+      .catch(e => {
+        quoteEl.classList.remove("loading");
+        quoteEl.classList.remove("collapsed");
+        quoteEl.classList.add("failed");
+        qBody.textContent = "Could not load the quoted history (" + e.message + "). The send path will still append it.";
+        if (typeof scrollToBottomIfSticky === "function") scrollToBottomIfSticky();
+      });
+  }
 
   // Attachments (if any) — read-only display; sent via the Send button.
   let attachmentsEl = null;
@@ -337,6 +440,39 @@ function addEmailDraft(msg){
     window.location.href = url;
   };
 
+  // ── Send flow with timeout + status recovery ─────────────────────────
+  // Before this existed, a fetch that never resolved (mobile network blip,
+  // WebSocket wedge, whatever) left the button stuck on "Sending…" forever
+  // and there was no way to know whether the send had actually happened
+  // server-side or not. Fixed 2026-08-28 after David hit this on a real
+  // forward. We now:
+  //   (1) Give every /send POST a 90s AbortController timeout.
+  //   (2) On timeout, don't just give up -- fetch /status?draftTs to check
+  //       whether the send actually landed. If yes, flip to ✓ Sent. If no,
+  //       re-enable the button so the user can retry safely (the server
+  //       dedupes by draftTs, so a retry after a partial success is a no-op).
+  async function fetchWithTimeout(url, opts, ms) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(new Error("timeout")), ms);
+    try {
+      return await fetch(url, Object.assign({}, opts, { signal: ctrl.signal }));
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  async function checkSendStatus(ts) {
+    if (!ts) return { ok: false, sent: false };
+    try {
+      const url = apiUrl("/api/email-draft/status?sessionId=" +
+        encodeURIComponent((session && session.id) || "") +
+        "&draftTs=" + encodeURIComponent(String(ts)));
+      const r = await fetch(url);
+      return await r.json();
+    } catch {
+      return { ok: false, sent: false, unreachable: true };
+    }
+  }
+
   // Send button — renders in every session. The actual send always shells out
   // to camoHero/scripts/send_gmail_email.py (preserves all safety checks);
   // session.project just picks the From: identity by default.
@@ -372,14 +508,14 @@ function addEmailDraft(msg){
       sendBtn.classList.remove("armed");
       try {
         const c = current();
-        const r = await fetch(apiUrl("/api/email-draft/send"), {
+        const r = await fetchWithTimeout(apiUrl("/api/email-draft/send"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ sessionId: (session && session.id) || "", ...c, threadId, attachments, fromAccount, draftTs }),
-        });
+          body: JSON.stringify({ sessionId: (session && session.id) || "", ...c, threadId, replyMode, inReplyToMessageId, forwardMode, forwardMessageId, attachments, fromAccount, draftTs }),
+        }, 90000);
         const data = await r.json();
         if (data.ok) {
-          sendBtn.textContent = "✓ Sent";
+          sendBtn.textContent = data.cached ? "✓ Sent (already)" : "✓ Sent";
           sendBtn.classList.add("sent");
           errorEl.style.display = "none";
           freezeEditing();
@@ -399,9 +535,21 @@ function addEmailDraft(msg){
           }, 3000);
         }
       } catch (e) {
-        sendBtn.textContent = "✗ Network";
+        // Timeout or network error. Server may or may not have processed the
+        // send. Ask the status endpoint before letting the user retry — a
+        // silent retry when the first actually landed = double send.
+        sendBtn.textContent = "⏱ Timed out, checking…";
+        const status = await checkSendStatus(draftTs);
+        if (status && status.ok && status.sent) {
+          sendBtn.textContent = "✓ Sent (verified after timeout)";
+          sendBtn.classList.add("sent");
+          errorEl.style.display = "none";
+          freezeEditing();
+          return;
+        }
+        sendBtn.textContent = "✗ Send timed out — safe to retry";
         sendBtn.classList.add("failed");
-        sendBtn.title = e.message || "network error";
+        sendBtn.title = "Server confirms nothing was sent. Retry is idempotent.";
         setTimeout(() => {
           sending = false; armed = false;
           sendBtn.disabled = false;
@@ -432,14 +580,14 @@ function addEmailDraft(msg){
       forceBtn.classList.remove("armed");
       try {
         const c = current();
-        const r = await fetch(apiUrl("/api/email-draft/send"), {
+        const r = await fetchWithTimeout(apiUrl("/api/email-draft/send"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ sessionId: (session && session.id) || "", ...c, threadId, attachments, fromAccount, force: true, draftTs }),
-        });
+          body: JSON.stringify({ sessionId: (session && session.id) || "", ...c, threadId, replyMode, inReplyToMessageId, forwardMode, forwardMessageId, attachments, fromAccount, force: true, draftTs }),
+        }, 90000);
         const data = await r.json();
         if (data.ok) {
-          forceBtn.textContent = "✓ Sent (forced)";
+          forceBtn.textContent = data.cached ? "✓ Sent (already)" : "✓ Sent (forced)";
           forceBtn.classList.add("sent");
           sendBtn.style.display = "none";
           freezeEditing();
@@ -455,9 +603,18 @@ function addEmailDraft(msg){
           }, 6000);
         }
       } catch (e) {
-        forceBtn.textContent = "✗ Network";
+        forceBtn.textContent = "⏱ Timed out, checking…";
+        const status = await checkSendStatus(draftTs);
+        if (status && status.ok && status.sent) {
+          forceBtn.textContent = "✓ Sent (verified after timeout)";
+          forceBtn.classList.add("sent");
+          sendBtn.style.display = "none";
+          freezeEditing();
+          return;
+        }
+        forceBtn.textContent = "✗ Timed out — safe to retry";
         forceBtn.classList.add("failed");
-        forceBtn.title = e.message || "network error";
+        forceBtn.title = "Server confirms nothing was sent. Retry is idempotent.";
         setTimeout(() => {
           forceSending = false; forceArmed = false;
           forceBtn.disabled = false;
@@ -481,6 +638,7 @@ function addEmailDraft(msg){
   d.appendChild(hdr);
   if (participantsEl) d.appendChild(participantsEl);
   d.appendChild(bodyEl);
+  if (quoteEl) d.appendChild(quoteEl);
   if (attachmentsEl) d.appendChild(attachmentsEl);
   d.appendChild(actions);
 
@@ -505,9 +663,9 @@ function addEmailDraft(msg){
 
   chat.appendChild(d);
   // Initial sizing must happen after the textarea is in the DOM (scrollHeight
-  // needs layout).
-  setTimeout(autosizeBody, 0);
-  scrollToBottomForce();
+  // needs layout). Scroll AFTER autosize — otherwise the textarea grows post-scroll
+  // and the composer/actions visibly jump up out of view on mobile.
+  setTimeout(() => { autosizeBody(); scrollToBottomForce(); }, 0);
 }
 
 // ── Inbound email reply card ──
@@ -573,16 +731,91 @@ function addEmailReply(msg, opts) {
     }
   }
 
+  const threadId = (msg.threadId || "").trim();
+  const fromAccount = (msg.fromAccount || "").trim();
+
+  const actions = mk("div", "email-reply-actions");
+
+  // "↩ Draft reply" fires a WS prompt whose USER-VISIBLE text is short
+  // ("↩ Drafting reply to X…"), while the CLAUDE-BOUND promptText carries
+  // the full email body + threading directives — so the LLM has everything
+  // it needs to produce an email_draft card WITHOUT re-fetching anything
+  // (the email is already client-side; we just forward it). Server supports
+  // the split via msg.promptText override; downstream draft_email tool call
+  // renders the standard outbound draft card David edits + sends from.
+  const draftBtn = mk("button", "draft-btn reply");
+  draftBtn.type = "button";
+  draftBtn.textContent = "↩ Draft reply";
+  draftBtn.onclick = () => {
+    if (draftBtn.disabled) return;
+    draftBtn.disabled = true;
+    draftBtn.textContent = "↩ Drafting…";
+
+    const visibleText = "↩ Draft reply to " + (from || "the email above");
+    const parts = [];
+    parts.push("The user tapped the ↩ Draft reply button on the email-reply card above.");
+    parts.push("");
+    parts.push("Call the draft_email tool NOW to produce a reply. Everything you need is inline below — DO NOT re-fetch this email; the poller already delivered it.");
+    parts.push("");
+    parts.push("── Email being replied to ──");
+    if (from) parts.push("From: " + from);
+    if (subject) parts.push("Subject: " + subject);
+    parts.push("");
+    parts.push(fullBody || snippet || "(no body captured)");
+    parts.push("── end email ──");
+    parts.push("");
+    parts.push("Threading params for draft_email (use exactly):");
+    if (from) parts.push("- to: " + from);
+    parts.push("- reply_mode: reply");
+    if (threadId) parts.push("- thread_id: " + threadId);
+    if (messageId) parts.push("- in_reply_to_message_id: " + messageId);
+    parts.push("");
+    parts.push("BODY RULES (hard): `body` must contain ONLY your new words. Do NOT paste, paraphrase or quote the email above, do NOT write any 'On <date>, <name> wrote:' line or '>'-prefixed lines, and do NOT add a sign-off or your name. The send path appends Gmail's real quoted history from in_reply_to_message_id and adds the signature; anything you add is duplicated and the draft will be rejected.");
+    parts.push("");
+    if (fromAccount) parts.push("Send from account: " + fromAccount + " (this is the account the original outbound was sent from — keep the reply on that identity).");
+    parts.push("");
+    parts.push("Draft the reply body based on the chat context above (what we were trying to accomplish) and the incoming email content. Keep the tone consistent with how the user writes. Output the draft via draft_email — no preamble, no explanation.");
+
+    const claudePrompt = parts.join("\n");
+
+    try {
+      if (typeof ws !== "undefined" && ws && ws.readyState === 1) {
+        const clientId = (typeof genMsgId === "function") ? genMsgId() : ("msg-" + Date.now());
+        ws.send(JSON.stringify({
+          type: "prompt",
+          client_id: clientId,
+          text: visibleText,
+          promptText: claudePrompt,
+        }));
+        if (typeof addUser === "function") addUser(visibleText, [], clientId);
+        if (typeof setUserMsgState === "function") setUserMsgState(clientId, "sending");
+        if (typeof setBusy === "function") setBusy(true);
+      } else {
+        // No live WS — fall back to typing into composer so David can send manually.
+        if (typeof inp !== "undefined" && inp) {
+          inp.value = visibleText;
+          inp.focus();
+        }
+        draftBtn.disabled = false;
+        draftBtn.textContent = "↩ Draft reply";
+      }
+    } catch (e) {
+      console.error("[draft-reply] send failed:", e);
+      draftBtn.disabled = false;
+      draftBtn.textContent = "↩ Draft reply";
+    }
+  };
+  actions.appendChild(draftBtn);
+
   if (messageId) {
-    const actions = mk("div", "email-reply-actions");
     const openBtn = mk("a", "draft-btn open");
     openBtn.textContent = "Open in Gmail";
     openBtn.href = "https://mail.google.com/mail/u/0/#inbox/" + encodeURIComponent(messageId);
     openBtn.target = "_blank";
     openBtn.rel = "noopener noreferrer";
     actions.appendChild(openBtn);
-    d.appendChild(actions);
   }
+  d.appendChild(actions);
 
   chat.appendChild(d);
   if (!opts || !opts.suppressScroll) scrollToBottomForce();

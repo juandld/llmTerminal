@@ -145,13 +145,19 @@ function connect(project,sessionId){
         try{ws.send(JSON.stringify({type:"pong",ts:msg.ts}))}catch{}
         break;
       case "ack":
-        if(msg.client_id){outbox=outbox.filter(m=>m.id!==msg.client_id);saveOutbox()}
+        if(msg.client_id){
+          outbox=outbox.filter(m=>m.id!==msg.client_id);saveOutbox();
+          setUserMsgState(msg.client_id,"sent");
+        }
         break;
       case "ready":
         isSynced=true;
         setStatus("connected","active");
         flushOutbox();
         updateSendButton();
+        // Re-attempt any voice-note recordings that were persisted to IDB but
+        // never confirmed uploaded (tab died, signal dropped, etc.).
+        try { vnSweepPendingForCurrentSession(); } catch (e) { console.warn("[vn-sweep] failed:", e.message); }
         break;
       case "api_error":
         removeThinking();
@@ -167,6 +173,9 @@ function connect(project,sessionId){
         session=msg.session;
         lockedSessionId = session.id;
         currentVoiceNonce = msg.voiceNonce || null;
+        // Reload the per-session last_seen_ts so the unread chip evaluates
+        // against the RIGHT session's history, not whichever chat we opened last.
+        try { _loadLastSeen(); } catch {}
         localStorage.setItem("llmt_session", session.id);
         localStorage.setItem("llmt_project", session.project);
         location.hash = session.id;
@@ -175,6 +184,7 @@ function connect(project,sessionId){
         loadSessions();
         refreshPreviews(false);
         startBrowserPoll();
+        startWakeCountdownPoll();
         if (modelSel) { modelSel.value = session.model || ""; applyModelDirty(); }
         updateStarBtn();
         try { refreshDecisionsBadge(); } catch {}
@@ -204,7 +214,8 @@ function connect(project,sessionId){
         (msg.messages||[]).forEach(m=>{
           const ts=m.ts||0;
           if(m.role==="user"&&m.source==="voice-note") addVoiceNoteFromHistory(m);
-          else if(m.role==="user") addUser(m.text, null, m.client_id || null);
+          else if(m.role==="user"&&m.source==="wake") addWakePrompt(m);
+          else if(m.role==="user") addUser(m.text, (m.imageUrls||[]).map(u=>apiUrl(u)), m.client_id || null);
           else if(m.role==="question") addQuestion(m.text, m.decisionId ? { decisionId: m.decisionId, options: m.options || [], recommend: m.recommend || null, why: m.why || null } : null);
           else if(m.role==="permission_denied") addPermissionCardFromHistory({tool_name:m.tool_name,tool_input:m.tool_input,message:m.message});
           else if(m.role==="assistant") addAssistant(m.text, { source: m.source });
@@ -221,7 +232,11 @@ function connect(project,sessionId){
         lastRenderedTs=newestTs;
         // Server-authoritative: if a run is in flight for this session, show Stop button
         setBusy(!!msg.busy);
-        setTimeout(restoreChatScroll,0);
+        // Deterministic post-render scroll decision — default to newest, surface
+        // an "N new since last visit" chip if there is unread activity. Replaces
+        // the old setTimeout(restoreChatScroll,0) race that landed users mid-
+        // transcript whenever reflow changed the meaning of a persisted pixel.
+        resolveInitialScroll();
         break;
       case "history_prepend":
         const oldH=chat.scrollHeight;
@@ -248,6 +263,27 @@ function connect(project,sessionId){
           }
           if(m.role==="user"&&m.source==="voice-note"){
             frag.appendChild(buildVoiceNoteHistoryEl(m));
+            return;
+          }
+          if(m.role==="user"&&m.source==="wake"){
+            // Build a wake-chip fragment inline (same shape as addWakePrompt
+            // but returning DOM instead of appending). Keeps history-prepend
+            // and live paths visually identical.
+            const text = String(m.text || "");
+            const d = mk("div","msg user wake-prompt collapsed");
+            d.dataset.source = "wake";
+            const firstLine = text.split(/\n+/).find(l => l.trim().length > 0) || "(auto-loop tick)";
+            const summary = firstLine.length > 80 ? firstLine.slice(0, 77) + "…" : firstLine;
+            const chip = mk("div","wake-chip");
+            const icon = mk("span","wake-icon"); icon.textContent = "🔄";
+            const label = mk("span","wake-label"); label.textContent = "Auto-loop: ";
+            const summaryEl = mk("span","wake-summary"); summaryEl.textContent = summary;
+            const toggle = mk("span","wake-toggle"); toggle.textContent = "▸";
+            chip.appendChild(icon); chip.appendChild(label); chip.appendChild(summaryEl); chip.appendChild(toggle);
+            const full = mk("pre","wake-full"); full.textContent = text;
+            d.appendChild(chip); d.appendChild(full);
+            chip.onclick = () => { d.classList.toggle("collapsed"); toggle.textContent = d.classList.contains("collapsed") ? "▸" : "▾"; };
+            frag.appendChild(d);
             return;
           }
           const d=mk("div","msg "+(m.role==="user"?"user":m.role==="question"?"question":"assistant"));
@@ -298,6 +334,13 @@ function connect(project,sessionId){
       case "tool_result":
         // Optionally show tool results
         break;
+      case "subtask_update":
+        // Background Agent/Task calls still in flight for this session — see
+        // subtask-tracker.js. Only these two tool types are tracked (the ones
+        // that can genuinely outlive the per-message "running" spinner, which
+        // just settles on whatever tool started next, not on actual completion).
+        renderSubtaskIndicator(msg.running || []);
+        break;
       case "email_draft":
         removeThinking();
         addEmailDraft(msg);
@@ -308,6 +351,7 @@ function connect(project,sessionId){
         if (msg.client_id) {
           outbox = outbox.filter(x => x.id !== msg.client_id);
           saveOutbox();
+          setUserMsgState(msg.client_id,"sent"); // hand-off complete; server owns delivery now
           markUserMessageQueued(msg.client_id);
         }
         _serverQueueDepth = msg.queueDepth || 0;
@@ -355,6 +399,11 @@ function connect(project,sessionId){
               fired.dataset.ts = msg.ts;
               if (msg.ts > lastRenderedTs) lastRenderedTs = msg.ts;
             }
+          } else if (msg.source === "wake") {
+            // Wake-fire message — render as a collapsed chip so it doesn't
+            // dominate the chat feed and hide the previous agent reply.
+            const d = addWakePrompt(msg);
+            if (msg.ts) { d.dataset.ts = msg.ts; if (msg.ts > lastRenderedTs) lastRenderedTs = msg.ts; }
           } else if (msg.source === "voice-note") {
             // The recording device already shows a rich local bubble — claim the
             // matching untagged one instead of double-rendering. Render fresh only
@@ -378,7 +427,7 @@ function connect(project,sessionId){
               }
             }
           } else {
-            const d = addUser(msg.text || "", null, msg.client_id || null);
+            const d = addUser(msg.text || "", (msg.imageUrls||[]).map(u=>apiUrl(u)), msg.client_id || null);
             if (msg.ts) {
               d.dataset.ts = msg.ts;
               if (msg.ts > lastRenderedTs) lastRenderedTs = msg.ts;

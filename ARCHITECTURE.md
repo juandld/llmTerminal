@@ -105,10 +105,14 @@ middle-management and destroys legibility.
 
 ### Built vs missing — supervisor ≠ orchestrator  *(the keystone gap)*
 - **Built (the downward axis):** a **supervisor on every working agent** —
-  `spawnObserver` / `spawnDecisionExtractor` / `spawnContractCheck` watch each run,
-  mine its decisions, and verify it actually finished. This is per-worker
-  oversight (quality · decisions · done-ness) feeding the attention/decisions
-  framework. Valuable — but it's *supervision*, not *orchestration*.
+  `spawnObserver` / `spawnDecisionExtractor` / `spawnContractCheck` /
+  `spawnLoopCheck` watch each run, mine its decisions, verify it actually
+  finished, and (loop-check, 2026-08-23) catch a worker that spawned a subtask
+  and yielded the turn instead of waiting on it — auto-arming a resume wake so
+  the loop continues without the user polling. This is per-worker oversight
+  (quality · decisions · done-ness · loop-continuation) feeding the
+  attention/decisions framework. Valuable — but it's *supervision*, not
+  *orchestration*.
 - **Missing (the keystone):** the real **orchestrator** — the manager *above* all
   workers. orchestratorHero is the intended home, but the coordinating logic isn't
   built. The parallel-agent collision of 2026-06-10 is the symptom: with no

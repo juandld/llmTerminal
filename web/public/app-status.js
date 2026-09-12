@@ -312,4 +312,32 @@ function stopWakeCountdownPoll(){
   if(bar) bar.classList.add("hidden");
 }
 
+// ── Sub-task visibility (2026-08-23) — David: "I also need visibility if
+// there are sub tasks in execution." The per-message tool "running" spinner
+// (addTool() in app-msg-helpers.js) settles on whatever tool starts NEXT, not
+// on that specific tool's own completion — fine for sequential tools, wrong
+// for background Agent/Task calls, where several can be in flight and each
+// new one silently clears the previous one's spinner within seconds even
+// though the real subagent is still running. This indicator is driven by the
+// server's subtask-tracker.js instead, which watches for the actual
+// completion signal (a task-notification landing in the session's own
+// transcript file) — so it reflects what's really still running, not "what
+// tool call happened most recently." Out-of-flow (position:absolute, see
+// styles.css) so appearing/disappearing can never steal width from the
+// topbar's collapse budget — the exact bug the queue-count fix addressed
+// earlier this session.
+function renderSubtaskIndicator(running){
+  let el = document.getElementById("subtaskIndicator");
+  if(!el){
+    el = mk("span","subtask-indicator");
+    el.id = "subtaskIndicator";
+    document.querySelector(".topbar").appendChild(el);
+  }
+  const n = Array.isArray(running) ? running.length : 0;
+  el.classList.toggle("has-running", n > 0);
+  if(n === 0){ el.textContent = ""; el.title = ""; return; }
+  el.textContent = n + (n === 1 ? " agent running" : " agents running");
+  el.title = running.map(r => r.name + " — started " + new Date(r.startedAt).toLocaleTimeString()).join("\n");
+}
+
 // ── Overflow menu ──

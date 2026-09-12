@@ -107,10 +107,15 @@ function reconcile(pendingDrafts, sessionId, project, runPath) {
 }
 
 // Normalise a raw draft payload into the wire/DB shape. Returns null when the
-// payload is not a usable draft (missing recipient/subject/body).
+// payload is not a usable draft (missing subject/body, or missing `to` on a
+// draft that isn't a reply — the MCP tool intentionally allows `to` to be
+// omitted for reply_mode + in_reply_to_message_id, and the send path derives
+// recipients from the referenced message).
 function _normalise(payload, sessionId, project) {
   if (!payload || typeof payload !== "object") return null;
-  if (!payload.to || !payload.subject || !payload.body) return null;
+  if (!payload.subject || !payload.body) return null;
+  const isReplyWithDerivedRecipients = !!(payload.reply_mode || payload.in_reply_to_message_id);
+  if (!payload.to && !isReplyWithDerivedRecipients) return null;
   return {
     type: "email_draft",
     to: payload.to || "",
@@ -119,6 +124,9 @@ function _normalise(payload, sessionId, project) {
     body: payload.body || "",
     thread_id: payload.thread_id || "",
     reply_mode: payload.reply_mode || "",
+    in_reply_to_message_id: payload.in_reply_to_message_id || "",
+    forward_mode: payload.forward_mode || "",
+    forward_message_id: payload.forward_message_id || "",
     thread_participants: Array.isArray(payload.thread_participants) ? payload.thread_participants : [],
     attachments: Array.isArray(payload.attachments) ? payload.attachments : [],
     project,
@@ -232,13 +240,16 @@ function emitDraft(payload, sessionId, project) {
                     project: storeProject, caller_project: project, ts: draft.ts });
   // CRM comm-event: crankwheel-identity drafts with at least one EXTERNAL
   // recipient. Internal-only notes (Birta/Jói) are not deal state (QA 8).
-  if (draft.default_from_account === "crankwheel" && !_allRecipientsInternal(draft)) {
+  // Skip when `to` is empty (reply with server-derived recipients) — the send
+  // path notifies CRM with the resolved recipients.
+  if (draft.to && draft.default_from_account === "crankwheel" && !_allRecipientsInternal(draft)) {
     notifyCrmCommEvent({
       action: "draft", to: draft.to, cc: draft.cc, subject: draft.subject,
       thread_id: draft.thread_id, attachments: draft.attachments,
     });
   }
-  console.log(`[email_draft] captured for ${sessionId}: "${draft.subject.slice(0, 60)}" -> ${draft.to}`);
+  const toLabel = draft.to || `(reply: recipients derived from ${draft.in_reply_to_message_id || draft.reply_mode})`;
+  console.log(`[email_draft] captured for ${sessionId}: "${draft.subject.slice(0, 60)}" -> ${toLabel}`);
   return draft;
 }
 
@@ -282,6 +293,36 @@ function captureFences(text, sessionId, project) {
   return text.replace(FENCE_RE, "").trim();
 }
 
+// Find the most recent inbound email-reply card that hasn't been drafted yet.
+// Fixes the "re-drafted from scratch" complaint (chat_quality_audit session
+// 840270ca, 2026-09-12): the "↩ Draft reply" button already inlines the full
+// email into promptText so Claude never re-fetches, but a plain typed
+// "reply to that" bypassed the button entirely and Claude had nothing but the
+// short on-screen snippet — leading it to re-ask or re-fetch. Scanning back to
+// the last email_reply (stopping at any email_draft, which means it was
+// already handled) lets the same inline-context trick fire for free text too.
+function getPendingEmailReply(sessionId) {
+  const { loadMessages } = require("./store");
+  let messages;
+  try { messages = loadMessages(sessionId); } catch { return null; }
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role === "email_draft") return null;
+    if (m.role === "email_reply") {
+      if (!m.body) return null;
+      return {
+        fromEmail: m.fromEmail || "",
+        subject: m.subject || "",
+        body: m.body,
+        threadId: m.threadId || "",
+        messageId: m.messageId || "",
+        fromAccount: m.fromAccount || "",
+      };
+    }
+  }
+  return null;
+}
+
 module.exports = {
   DRAFT_TOOL,
   LEDGER,
@@ -293,4 +334,5 @@ module.exports = {
   captureToolResult,
   captureFences,
   notifyCrmCommEvent,
+  getPendingEmailReply,
 };

@@ -200,11 +200,48 @@ module.exports = function mountDecisions(app) {
     }
   });
 
+  // Pagination for the decisions timeline strip's "earlier history" lazy-load
+  // (2026-08-23, ported alongside dsh's TrajectoryTimeline earlier-history
+  // boundary). Default page = most recent DEFAULT_LIMIT decisions. `before`
+  // (a ts cutoff, exclusive) fetches an older page when the client scrolls/
+  // zooms to the left edge of what's loaded. `hasMore` tells the client
+  // whether to render the earlier-history boundary button at all.
+  const DECISIONS_PAGE_DEFAULT_LIMIT = 150;
+  const DECISIONS_PAGE_MAX_LIMIT = 500;
+  function _parsePageParams(query) {
+    let limit = parseInt(query.limit, 10);
+    if (!Number.isFinite(limit) || limit <= 0) limit = DECISIONS_PAGE_DEFAULT_LIMIT;
+    limit = Math.min(limit, DECISIONS_PAGE_MAX_LIMIT);
+    let before = parseInt(query.before, 10);
+    before = Number.isFinite(before) ? before : null;
+    return { limit, before };
+  }
+  // Rows come back oldest-first for the requested page (matches the
+  // existing "ORDER BY ts ASC" contract the client/timeline math expects),
+  // but the PAGE ITSELF must be the most-recent-N (or most-recent-N-before-
+  // cutoff) — so page in DESC order, then reverse before returning.
+  function _pageAndReverse(rows, limit) {
+    const page = rows.slice(-limit);
+    const hasMore = rows.length > limit;
+    return { page, hasMore };
+  }
+
   app.get("/api/sessions/:id/decisions", (req, res) => {
     if (!db) return res.status(503).json({ ok: false, error: "db unavailable" });
     try {
-      const rows = db.prepare("SELECT * FROM decisions WHERE session_id = ? ORDER BY ts ASC, id ASC").all(req.params.id);
-      res.json({ decisions: rows.map(_normalizeDecisionRow) });
+      const { limit, before } = _parsePageParams(req.query);
+      let rows;
+      if (before !== null) {
+        // Earlier-history page: everything strictly older than the cutoff,
+        // then take the most-recent `limit` of THOSE (i.e. the page
+        // immediately preceding what the client already has).
+        rows = db.prepare("SELECT * FROM decisions WHERE session_id = ? AND ts < ? ORDER BY ts ASC, id ASC")
+          .all(req.params.id, before);
+      } else {
+        rows = db.prepare("SELECT * FROM decisions WHERE session_id = ? ORDER BY ts ASC, id ASC").all(req.params.id);
+      }
+      const { page, hasMore } = _pageAndReverse(rows, limit);
+      res.json({ decisions: page.map(_normalizeDecisionRow), hasMore });
     } catch (e) {
       res.status(500).json({ ok: false, error: "query failed" });
     }
@@ -216,13 +253,22 @@ module.exports = function mountDecisions(app) {
       // Sessions belong to projects via sessions.json — get all session ids for this project,
       // then fetch their decisions ordered globally.
       const sessions = loadSessions().filter(s => s.project === req.params.name);
-      if (!sessions.length) return res.json({ decisions: [] });
+      if (!sessions.length) return res.json({ decisions: [], hasMore: false });
       const idList = sessions.map(s => s.id);
       const placeholders = idList.map(() => "?").join(",");
-      const rows = db
-        .prepare(`SELECT * FROM decisions WHERE session_id IN (${placeholders}) ORDER BY ts ASC, id ASC`)
-        .all(...idList);
-      res.json({ decisions: rows.map(_normalizeDecisionRow) });
+      const { limit, before } = _parsePageParams(req.query);
+      let rows;
+      if (before !== null) {
+        rows = db
+          .prepare(`SELECT * FROM decisions WHERE session_id IN (${placeholders}) AND ts < ? ORDER BY ts ASC, id ASC`)
+          .all(...idList, before);
+      } else {
+        rows = db
+          .prepare(`SELECT * FROM decisions WHERE session_id IN (${placeholders}) ORDER BY ts ASC, id ASC`)
+          .all(...idList);
+      }
+      const { page, hasMore } = _pageAndReverse(rows, limit);
+      res.json({ decisions: page.map(_normalizeDecisionRow), hasMore });
     } catch (e) {
       res.status(500).json({ ok: false, error: "query failed" });
     }

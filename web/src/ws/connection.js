@@ -12,7 +12,7 @@ const { runOpenAI } = require("../providers/openai");
 const { runGoogle } = require("../providers/google");
 const { activeProcBySession } = require("../proc-state");
 const { sessionPermissions, ensurePermissionsLoaded, savePermissions } = require("../permissions");
-const { spawnDecisionExtractor, spawnContractCheck, spawnLoopCheck, reconcileFileAttribution } = require("../supervisors");
+const { spawnDecisionExtractor, spawnContractCheck, spawnLoopCheck, spawnCorrectionExtractor, reconcileFileAttribution } = require("../supervisors");
 const { generateSessionTitle } = require("../session-title");
 const { issueVoiceNonce, revokeNoncesForWs } = require("../voice-nonce");
 const { queueAppend, queueLoad, queueSaveAll, broadcastQueueState } = require("../queue");
@@ -21,6 +21,7 @@ const { logFileAttribution } = require("../attribution");
 const { saveUploadedImage } = require("../uploads");
 const { noteClientConnection } = require("../geo-location");
 const governor = require("../governor");
+const subtaskTracker = require("../subtask-tracker");
 const attention = require("../attention");
 const emailDraft = require("../email-draft");
 const runReg = require("../run-registry");
@@ -109,7 +110,13 @@ getWss().on("connection", (ws, req) => {
   // questions even when the card itself is older than the 20-message window.
   // Client dedupes by `m.ts` so re-fetches of earlier ranges won't duplicate.
   const INITIAL_LIMIT = 20;
-  const STICKY_ROLES = new Set(["email_draft", "question"]);
+  // email_reply is sticky so an incoming email that arrived >20 messages ago
+  // still shows up when the operator scrolls to the top — otherwise the
+  // reply card silently drops out of history in busy chats and the only way
+  // to re-read the email is Gmail. Reason David hit this: mobile, one chat
+  // does many exchanges, reply card scrolled far above the initial window
+  // and never came back on reload.
+  const STICKY_ROLES = new Set(["email_draft", "question", "email_reply"]);
   const allMessages = loadMessages(session.id);
   const recentSlice = allMessages.slice(-INITIAL_LIMIT);
   const recentSet = new Set(recentSlice);
@@ -280,7 +287,8 @@ getWss().on("connection", (ws, req) => {
                   }
                   seenQuestionSig = sig;
                 }
-                wsSend(ws, "tool_use", { name: block.name, input: block.input });
+                subtaskTracker.registerStart(session.id, block.id, block.name, session.project, session.claudeSessionId, broadcastToSession);
+                wsSend(ws, "tool_use", { id: block.id, name: block.name, input: block.input });
                 if (block.name === "AskUserQuestion") {
                   const qText = block.input?.question || block.input?.text || JSON.stringify(block.input);
                   saveMessage(session.id, { role: "question", text: qText, ts: Date.now() });
@@ -378,6 +386,7 @@ getWss().on("connection", (ws, req) => {
           setTimeout(() => { try { spawnDecisionExtractor(session.id, session.project); } catch (e) { console.error("[decision-extractor] hook failed:", e.message); } }, 800);
           setTimeout(() => { try { spawnContractCheck(session.id, session.project); } catch (e) { console.error("[contract-check] hook failed:", e.message); } }, 1100);
           setTimeout(() => { try { spawnLoopCheck(session.id, session.project); } catch (e) { console.error("[loop-check] hook failed:", e.message); } }, 1400);
+          setTimeout(() => { try { spawnCorrectionExtractor(session.id, session.project); } catch (e) { console.error("[correction-extractor] hook failed:", e.message); } }, 1700);
           // File-attribution reconcile — runs FAST (synchronous filesystem walk),
           // fires immediately so unattributed files from this run get linked before
           // the user opens the drawer.
@@ -673,6 +682,15 @@ getWss().on("connection", (ws, req) => {
         // Process images UP FRONT so the queue (if we queue) carries the augmented
         // prompt — otherwise queued prompts would silently drop their images on drain.
         const text = (msg.text || "").trim();
+        // Optional client-supplied override: what gets sent to the model when it
+        // differs from what we persist/display. Used by the email-reply "Draft
+        // reply" button — visible text is a short "↩ Drafting reply…", while
+        // promptText carries the full email body + threading directives so the
+        // LLM has all context inline (no re-fetch) and produces a draft_email
+        // card. Falls back to `text` when not set (normal typing path).
+        const clientPromptOverride = (typeof msg.promptText === "string" && msg.promptText.trim())
+          ? msg.promptText
+          : "";
         const images = Array.isArray(msg.images) ? msg.images : [];
         const imagePaths = [];
         for (const img of images) {
@@ -690,10 +708,40 @@ getWss().on("connection", (ws, req) => {
         // on refresh / cross-device open (2026-08-12: pasted-image previews were
         // vanishing after any reconnect because only hasImages was persisted).
         const imageUrls = imagePaths.map(p => "/user-uploads/" + path.basename(p));
-        let prompt = text;
+        let prompt = clientPromptOverride || text;
+        // The "↩ Draft reply" button (app-email-draft.js) inlines the full
+        // email into promptText so the model never re-fetches. A plain typed
+        // reply bypasses that button, so it only ever saw the short on-screen
+        // snippet — Claude then re-fetched or re-asked instead of drafting
+        // (chat_quality_audit session 840270ca, 2026-09-12, 6 frustration
+        // hits). Mirror the same inline-context trick here whenever there's
+        // an undrafted email-reply card in this chat.
+        if (!clientPromptOverride) {
+          try {
+            const pending = emailDraft.getPendingEmailReply(session.id);
+            if (pending) {
+              const ctx = [
+                "",
+                "[Context: an email reply card is showing in this chat and has not been drafted yet.",
+                `From: ${pending.fromEmail}` + (pending.subject ? ` | Subject: ${pending.subject}` : ""),
+                "Full body:",
+                pending.body,
+                "If the message above is asking you to reply/respond to this email, call draft_email now using this content — do NOT re-fetch the email via Gmail tools or ask the user to repaste it.",
+                "Threading params: reply_mode: reply" +
+                  (pending.threadId ? `, thread_id: ${pending.threadId}` : "") +
+                  (pending.messageId ? `, in_reply_to_message_id: ${pending.messageId}` : "") +
+                  (pending.fromEmail ? `, to: ${pending.fromEmail}` : ""),
+                "If the message above is unrelated to this email, ignore this note.]",
+              ].join("\n");
+              prompt = prompt + "\n\n" + ctx;
+            }
+          } catch (e) {
+            console.error("[prompt] pending email-reply context injection failed:", e.message);
+          }
+        }
         if (imagePaths.length > 0) {
           const imageRefs = imagePaths.map((p, i) => `[Image ${i + 1}: ${p}]`).join(" ");
-          prompt = `${text}\n\nThe user attached ${imagePaths.length} image(s). Read them with the Read tool to see them: ${imageRefs}`;
+          prompt = `${prompt}\n\nThe user attached ${imagePaths.length} image(s). Read them with the Read tool to see them: ${imageRefs}`;
         }
         const _source = msg.source || "prompt";
         const _audioUrl = msg.audioUrl || null;
@@ -868,14 +916,34 @@ getWss().on("connection", (ws, req) => {
         break;
       }
       case "interrupt": {
-        if (activeProc) {
-          console.log("[interrupt] killing active claude for session", session.id);
-          const _p = activeProc;
-          activeProc = null;
-          try { process.kill(-_p.pid, "SIGINT"); } catch { try { _p.kill("SIGINT"); } catch {} }
-          setTimeout(() => { try { process.kill(-_p.pid, "SIGKILL"); } catch { try { _p.kill("SIGKILL"); } catch {} } }, 2000);
+        // Fall back to the session-level handle. If David reconnects (mobile
+        // WS drop + reconnect, or a second tab), the run kept going but the
+        // NEW WS has activeProc=null, so a bare `if (activeProc)` check let
+        // Stop silently no-op. delete_message already does this dual lookup;
+        // interrupt needs to match.
+        const liveProc = activeProc || activeProcBySession.get(session.id);
+        if (liveProc) {
+          console.log("[interrupt] killing active claude for session", session.id, "(per-ws=" + !!activeProc + ")");
+          if (activeProc === liveProc) activeProc = null;
+          activeProcBySession.delete(session.id);
+          try { process.kill(-liveProc.pid, "SIGINT"); } catch { try { liveProc.kill("SIGINT"); } catch {} }
+          setTimeout(() => { try { process.kill(-liveProc.pid, "SIGKILL"); } catch { try { liveProc.kill("SIGKILL"); } catch {} } }, 2000);
           saveMessage(session.id, { role: "interrupted", ts: Date.now() });
+        } else {
+          console.log("[interrupt] no active run for session", session.id, "— nothing to kill");
         }
+        // Drain the queue too — an interrupted run should NOT be followed by
+        // auto-firing whatever was queued up behind it (that was the
+        // "Stop can auto-retry killed prompt" bug per project memory). User
+        // pressing Stop means "halt everything," not "skip just this one."
+        try {
+          const pendingBefore = queueLoad(session.id).length;
+          if (pendingBefore) {
+            queueSaveAll(session.id, []);
+            console.log("[interrupt] cleared", pendingBefore, "queued prompt(s) for", session.id.slice(0, 8));
+            broadcastQueueState(session.id);
+          }
+        } catch (e) { console.warn("[interrupt] queue-clear failed:", e.message); }
         // Disarm any pending wake — user pressing Stop should halt the auto-loop
         // too, not just the current turn. Without this, a wake would re-fire
         // in 30min and the loop would restart itself against the user's intent.

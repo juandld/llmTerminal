@@ -141,6 +141,12 @@
   .queue-count{position:absolute;top:100%;right:8px;margin-top:4px;z-index:29;font-size:11px;color:var(--yellow)}
   .queue-count:empty{display:none}
   .queue-count.has-queue{background:rgba(255,211,105,.12);border:1px solid rgba(255,211,105,.4);border-radius:10px;padding:2px 8px;font-weight:600;animation:pulse 1.6s infinite;backdrop-filter:blur(2px)}
+  /* Sub-task ("N agents running") indicator — same out-of-flow treatment as
+     .queue-count and for the same reason (2026-08-23). Left-anchored so both
+     can be visible at once without overlapping. */
+  .subtask-indicator{position:absolute;top:100%;left:8px;margin-top:4px;z-index:29;font-size:11px;color:var(--accent)}
+  .subtask-indicator:empty{display:none}
+  .subtask-indicator.has-running{background:rgba(0,212,255,.10);border:1px solid rgba(0,212,255,.35);border-radius:10px;padding:2px 8px;font-weight:600;animation:pulse 1.6s infinite;backdrop-filter:blur(2px);cursor:default}
   /* Queued user message — typed/sent but waiting for the current Claude turn to finish.
      Dashed border + badge tells David at a glance: "this is parked, not in flight." */
   .msg.user.queued{opacity:.75;border:1px dashed var(--yellow);position:relative}
@@ -304,8 +310,9 @@
   .q-custom-toggle:hover{color:var(--accent);border-color:var(--accent)}
   .q-custom-input{width:100%;margin-top:6px;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:8px 10px;border-radius:8px;font-family:var(--mono);font-size:12px;resize:vertical;min-height:44px}
   .q-custom-input:focus{border-color:var(--accent);outline:none}
-  /* llmt_ask inline answer card (decisionId path) */
-  .q-context{font-size:11px;color:var(--dim);margin:6px 0 10px;line-height:1.4;font-style:italic}
+  /* llmt_ask inline answer card (decisionId path). The "why" context used to
+     render as unreadable 11px italic dim text here — it's now spoken via
+     .dec-speak-btn (reused from the Decisions drawer) instead. */
   .q-ask-opts{display:flex;flex-direction:column;gap:6px;margin-top:10px}
   .q-ask-btn{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:10px 14px;border-radius:8px;font-size:13px;cursor:pointer;font-family:var(--mono);text-align:left;transition:all .15s;min-height:44px}
   .q-ask-btn:hover{border-color:var(--yellow);color:var(--yellow)}
@@ -866,9 +873,12 @@
   .msg.email-reply .email-reply-body{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:10px;font-size:13px;line-height:1.5;max-width:100%}
   .msg.email-reply .email-reply-expand{padding:6px 12px;margin-bottom:10px;background:transparent;color:var(--accent);border:1px solid var(--accent);border-radius:8px;font-size:12px;font-family:var(--mono);cursor:pointer}
   .msg.email-reply .email-reply-expand:hover,.msg.email-reply .email-reply-expand:active{opacity:.85}
-  .msg.email-reply .email-reply-actions{display:flex;gap:8px;flex-wrap:wrap}
-  .msg.email-reply .draft-btn.open{padding:8px 14px;background:var(--accent);color:#000;border-radius:8px;font-size:12px;text-decoration:none;font-family:var(--mono);font-weight:600;min-height:36px;display:inline-flex;align-items:center}
-  .msg.email-reply .draft-btn.open:hover,.msg.email-reply .draft-btn.open:active{opacity:.85}
+  .msg.email-reply .email-reply-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .msg.email-reply .draft-btn.reply{padding:10px 16px;background:var(--accent);color:#000;border:none;border-radius:8px;font-size:13px;font-family:var(--mono);font-weight:600;cursor:pointer;min-height:44px;display:inline-flex;align-items:center;transition:opacity .15s}
+  .msg.email-reply .draft-btn.reply:hover,.msg.email-reply .draft-btn.reply:active{opacity:.85}
+  .msg.email-reply .draft-btn.open{padding:8px 14px;background:transparent;color:var(--accent);border:1px solid var(--accent);border-radius:8px;font-size:12px;text-decoration:none;font-family:var(--mono);font-weight:600;min-height:36px;display:inline-flex;align-items:center;box-sizing:border-box}
+  .msg.email-reply .draft-btn.open:hover,.msg.email-reply .draft-btn.open:active{background:var(--accent);color:#000}
+  .msg.email-reply .draft-btn.reply:disabled{opacity:.7;cursor:default}
   .msg.email-draft .draft-hdr{display:grid;grid-template-columns:64px 1fr;gap:6px 10px;font-size:12px;margin-bottom:10px;line-height:1.4;align-items:center}
   .msg.email-draft .draft-hdr .k{color:var(--dim);font-weight:600}
   .msg.email-draft .draft-hdr input.draft-input{background:var(--bg);border:1px solid var(--border);color:var(--text);font-family:var(--mono);font-size:12px;padding:7px 9px;border-radius:6px;width:100%;box-sizing:border-box;min-height:34px;outline:none;word-break:break-word}
@@ -889,6 +899,16 @@
   .msg.email-draft .draft-body{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px 12px;font-size:12px;line-height:1.6;white-space:pre-wrap;word-break:break-word;position:relative;margin-bottom:10px;color:var(--text);width:100%;box-sizing:border-box;display:block;font-family:var(--mono);min-height:120px;max-height:60vh;overflow:auto;resize:vertical;outline:none}
   .msg.email-draft .draft-body:focus{border-color:var(--accent)}
   .msg.email-draft .draft-body:disabled{opacity:.85;cursor:default;resize:none}
+  .msg.email-draft .draft-quote-preview{margin:-4px 0 10px;padding:4px 8px 4px 10px;border-left:2px solid rgb(204,204,204);color:var(--dim,#999);font-size:11px;line-height:1.4;font-family:var(--mono)}
+  .msg.email-draft .draft-quote-preview.loading{opacity:.6}
+  .msg.email-draft .draft-quote-preview.failed{border-left-color:#f0b400}
+  .msg.email-draft .draft-quote-preview.collapsed{padding-top:4px;padding-bottom:4px}
+  .msg.email-draft .draft-quote-preview.collapsed .draft-quote-body{display:none}
+  .msg.email-draft .draft-quote-label{font-size:10px;text-transform:uppercase;letter-spacing:.04em;opacity:.8;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .msg.email-draft .draft-quote-preview:not(.collapsed) .draft-quote-label{margin-bottom:6px}
+  .msg.email-draft .draft-quote-body{white-space:pre-wrap;word-break:break-word;color:var(--dim,#999)}
+  .msg.email-draft .draft-quote-toggle{margin:0;padding:2px 8px;min-height:22px;font-size:10px;text-transform:none;letter-spacing:0}
+  .msg.email-draft .draft-quote-note{margin-top:6px;font-style:italic;font-size:11px;color:var(--dim,#999)}
   .msg.email-draft .draft-actions{display:grid;grid-template-columns:1fr 1fr;gap:6px}
   .msg.email-draft .draft-btn{padding:12px;background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:8px;font-size:13px;font-family:var(--mono);cursor:pointer;min-height:44px;transition:all .15s}
   .msg.email-draft .draft-btn:hover,.msg.email-draft .draft-btn:active{background:var(--border)}
@@ -1559,10 +1579,30 @@
 .dec-empty{color:var(--dim);font-style:italic}
 .dec-meta{margin-top:6px;font-size:10px;color:var(--dim);font-family:var(--mono)}
 .dec-mined{background:#444;color:#bbb;padding:1px 6px;border-radius:6px;font-size:9px;margin-left:6px}
+
+/* Question-card expanded body: no small-gray-text tree — just the read-aloud
+   affordance and the tappable answer buttons. Padding matches the parent
+   .dec-detail so the border-left/gutter still lines up. */
+.dec-detail-question{padding:8px 10px 8px 32px}
+.dec-speak-btn{
+  display:flex;align-items:center;justify-content:center;gap:10px;
+  width:100%;min-height:52px;margin-bottom:12px;
+  background:var(--surface2);color:var(--text);
+  border:1px solid var(--border);border-radius:10px;
+  font-family:inherit;font-size:15px;font-weight:600;letter-spacing:.01em;
+  cursor:pointer;transition:border-color .12s,color .12s,background .12s;
+}
+.dec-speak-btn:hover,.dec-speak-btn:focus-visible{
+  border-color:var(--accent);color:var(--accent);outline:none;
+}
+.dec-speak-icon{font-size:20px;line-height:1}
+.dec-speak-label{line-height:1.2}
 @media(max-width:768px){
   .dec-row{padding:10px 6px;min-height:48px}
   .dec-title{font-size:14px}
   .dec-detail{padding-left:30px;font-size:13px}
+  .dec-detail-question{padding-left:14px;padding-right:14px}
+  .dec-speak-btn{min-height:56px;font-size:16px}
 }
 
   /* ── Model picker (added 2026-05-28, restyled to match dark/mono theme) ── */

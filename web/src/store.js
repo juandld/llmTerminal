@@ -40,6 +40,31 @@ try {
     );
     CREATE INDEX IF NOT EXISTS idx_decisions_session_ts ON decisions(session_id, ts, id);
     CREATE INDEX IF NOT EXISTS idx_decisions_parent ON decisions(parent_id);
+
+    -- Correction ledger (H9 correction reflex): one row per user turn that
+    -- redirected/negated/stopped/repeated an instruction. Written by
+    -- supervisors.spawnCorrectionExtractor; read back into the system prompt
+    -- by corrections.buildPromptAdd. user_ts dedups per user message.
+    CREATE TABLE IF NOT EXISTS corrections (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id      TEXT    NOT NULL,
+      project         TEXT,
+      ts              INTEGER NOT NULL,
+      user_ts         INTEGER NOT NULL,
+      class           TEXT    NOT NULL,
+      severity        TEXT    NOT NULL DEFAULT 'medium',
+      user_said       TEXT,
+      agent_did       TEXT,
+      user_meant      TEXT,
+      missing_context TEXT,
+      guard_candidate TEXT,
+      recovered       INTEGER NOT NULL DEFAULT 0,
+      interrupted     INTEGER NOT NULL DEFAULT 0,
+      status          TEXT    NOT NULL DEFAULT 'open',
+      artifact        TEXT
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_corrections_session_userts ON corrections(session_id, user_ts);
+    CREATE INDEX IF NOT EXISTS idx_corrections_project_ts ON corrections(project, ts);
   `);
   console.log("[sqlite] messages DB opened at", MESSAGES_DB_PATH);
   // One-time migration: import JSON files not yet in DB
@@ -233,6 +258,12 @@ function _persistSessionIfNew(session) {
   // prompt handler before saving the first user message.
   const sessions = loadSessions();
   if (sessions.find(s => s.id === session.id)) return;
+  // A/B variant stamp (HARNESS_PLAN #3). Fires here — on first-prompt
+  // promotion — so tab-open drift never lands in the log. Assign happens
+  // in-place on the session object, so it lands in the persisted record
+  // below.
+  try { require("./experiments").assignVariants(session); }
+  catch (e) { console.error("[experiments] variant assign failed:", e.message); }
   sessions.unshift(session);
   saveSessions(sessions);
 }

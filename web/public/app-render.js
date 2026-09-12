@@ -322,6 +322,23 @@ function addAssistant(text, opts){
 // decisionId is present — the llmt_ask path). Buttons POST to
 // /api/decisions/:id/answer; the answer route queues the response back as
 // a follow-up prompt that the agent picks up automatically.
+// Spoken narration for the inline question card — mirrors the Decisions
+// drawer's _decNarration (app-decisions.js): question, then why (unless it's
+// the MCP tool's generic fallback), then the option list. Kept in sync by
+// hand since the two cards read from differently-shaped data (opts here vs.
+// a decision record there).
+function _inlineQNarration(question, options, why){
+  const parts = [];
+  const q = (question || "").trim();
+  if (q) parts.push(q);
+  const w = (why || "").trim();
+  if (w && !/^blocking question/i.test(w)) parts.push(w);
+  if (options.length) {
+    const list = options.map(o => o.replace(/\.$/, "")).join(". Or, ");
+    parts.push("Your options are: " + list + ".");
+  }
+  return parts.join(" ");
+}
 function renderInlineAnswerCard(container, question, opts){
   const did = String(opts.decisionId);
   const options = Array.isArray(opts.options) ? opts.options.slice() : [];
@@ -335,11 +352,20 @@ function renderInlineAnswerCard(container, question, opts){
   const body = mk("div","q-text");
   body.innerHTML = fmt(question);
   container.appendChild(body);
-  if (opts.why) {
-    const ctx = mk("div","q-context");
-    ctx.textContent = opts.why;
-    container.appendChild(ctx);
-  }
+  // No small-gray-text "why" dump here (was unreadable at 11px italic dim).
+  // The full explanation — question + why + options — is one tap away via
+  // the speak button below, or by tapping anywhere on the card that isn't
+  // a button/input/link.
+  const narration = _inlineQNarration(question, options, opts.why);
+  const speakBtn = mk("button","dec-speak-btn");
+  speakBtn.setAttribute("aria-label","Read the question aloud");
+  speakBtn.innerHTML = '<span class="dec-speak-icon" aria-hidden="true">\u{1F50A}</span><span class="dec-speak-label">Read the question aloud</span>';
+  speakBtn.onclick = (e) => { e.stopPropagation(); try { playTts(narration); } catch (err) { console.warn("[q-speak] failed:", err); } };
+  container.appendChild(speakBtn);
+  container.addEventListener("click", (e) => {
+    if (e.target.closest("a") || e.target.closest("button") || e.target.closest("input")) return;
+    try { playTts(narration); } catch (err) { console.warn("[q-speak] failed:", err); }
+  });
   const optsWrap = mk("div","q-ask-opts");
   options.forEach((o, i) => {
     const btn = mk("button","q-ask-btn");

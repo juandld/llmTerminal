@@ -6,11 +6,11 @@
 // snapshots, minor variants) hides behind a "Show N more" row so the best
 // model is one glance away, not a scroll (David, 2026-07-11). Reset on every
 // menu open.
-const _provShowAll = { claude: false, openai: false, google: false };
+const _provShowAll = { claude: false, openai: false, google: false, deepseek: false };
 
 function _findModelMeta(id) {
   if (!_allModelsData) return null;
-  for (const prov of ["claude", "openai", "google"]) {
+  for (const prov of ["claude", "openai", "google", "deepseek"]) {
     const m = (_allModelsData[prov] || []).find(x => x.id === id);
     if (m) return { ...m, provider: prov };
   }
@@ -72,6 +72,7 @@ function renderModelMenu() {
     { key: "claude", label: "Claude (full tools)" },
     { key: "openai", label: "OpenAI (chat)" },
     { key: "google", label: "Google (chat)" },
+    { key: "deepseek", label: "DeepSeek (chat)" },
   ];
   for (const { key, label } of provs) {
     const models = _allModelsData[key] || [];
@@ -88,7 +89,7 @@ function renderModelMenu() {
     // For non-Claude providers, prepend an honest one-liner explaining what
     // they're useful for right now (chat-only fallback for when Claude rate-
     // limits) and that real tool parity is in flight.
-    if (key === "openai" || key === "google") {
+    if (key === "openai" || key === "google" || key === "deepseek") {
       const note = document.createElement("div");
       note.className = "win95-fallback-note";
       note.textContent = "Chat-only fallback for when Claude is rate-limited. Tool support is in development.";
