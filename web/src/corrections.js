@@ -57,7 +57,9 @@ function listCorrections(opts = {}) {
 }
 
 function summarizeByClass(opts = {}) {
-  const rows = listCorrections({ ...opts, limit: 1000 });
+  // Dismissed rows (false positives) are excluded unless a status is asked for
+  // explicitly, so the audit's by-class counts match what the ambient block shows.
+  const rows = listCorrections({ ...opts, limit: 1000 }).filter(r => opts.status || r.status !== "dismissed");
   const by = {};
   for (const r of rows) {
     const b = by[r.class] || (by[r.class] = { class: r.class, count: 0, high: 0, latest_ts: 0, projects: {} });
